@@ -1,0 +1,1 @@
+drive c: file="build/gemiboot.img" partition=1

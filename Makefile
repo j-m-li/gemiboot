@@ -179,6 +179,13 @@ run-uefi64: $(DISK_IMG)
 run-uefi32: $(DISK_IMG)
 	./run-qemu.sh --uefi32
 
+list: $(DISK_IMG)
+	@echo "=== Root Directory ==="
+	@mdir -i $(DISK_IMG)@@1M ::
+	@echo ""
+	@echo "=== /EFI/BOOT Directory ==="
+	@mdir -i $(DISK_IMG)@@1M ::/EFI/BOOT
+
 test: $(DISK_IMG)
 	./test-qemu.sh
 
