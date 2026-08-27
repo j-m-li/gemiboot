@@ -1,0 +1,8 @@
+build/
+tools/mkdisk
+*.o
+*.bin
+*.sys
+*.EFI
+*.elf
+*.img
