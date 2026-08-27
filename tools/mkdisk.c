@@ -420,7 +420,6 @@ int main(int argc, char *argv[]) {
     /* Copy EFI boot loaders */
     write_file_data(boot_clus, "BOOTIA32.EFI", ia32_data, ia32_sz);
     write_file_data(boot_clus, "BOOTX64.EFI", x64_data, x64_sz);
-    write_file_data(boot_clus, "GEMIOS.ELF", kernel_data, kernel_sz);
 
     printf("[MKDISK] Written files:\n");
     printf("  - MBR (Sector 0)\n");
@@ -429,7 +428,6 @@ int main(int argc, char *argv[]) {
     printf("  - /GEMIOS.ELF (%u bytes)\n", kernel_sz);
     printf("  - /EFI/BOOT/BOOTIA32.EFI (%u bytes)\n", ia32_sz);
     printf("  - /EFI/BOOT/BOOTX64.EFI (%u bytes)\n", x64_sz);
-    printf("  - /EFI/BOOT/GEMIOS.ELF (%u bytes)\n", kernel_sz);
 
     /* Write disk image */
     out_f = fopen(out_path, "wb");
