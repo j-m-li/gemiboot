@@ -241,6 +241,28 @@ static void convert_memory_map(EFI_MEMORY_DESCRIPTOR *mmap, uintptr_t mmap_size,
 
 static uint8_t uefi_mmap_buf[UEFI_MMAP_BUF_SIZE];
 
+static void *find_acpi_rsdp(EFI_SYSTEM_TABLE *st) {
+    static const efi_guid acpi20_guid = { 0x8868e871, 0xe4f1, 0x11d3, { 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81 } };
+    static const efi_guid acpi10_guid = { 0xeb9d2d30, 0x2d88, 0x11d3, { 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d } };
+    uintptr_t i;
+
+    if (!st || !st->ConfigurationTable) return NULL;
+
+    for (i = 0; i < st->NumberOfTableEntries; i++) {
+        if (memcmp(&st->ConfigurationTable[i].VendorGuid, &acpi20_guid, sizeof(efi_guid)) == 0) {
+            return st->ConfigurationTable[i].VendorTable;
+        }
+    }
+
+    for (i = 0; i < st->NumberOfTableEntries; i++) {
+        if (memcmp(&st->ConfigurationTable[i].VendorGuid, &acpi10_guid, sizeof(efi_guid)) == 0) {
+            return st->ConfigurationTable[i].VendorTable;
+        }
+    }
+
+    return NULL;
+}
+
 efi_status EFIAPI efi_main(efi_handle image_handle, EFI_SYSTEM_TABLE *system_table) {
     struct multiboot_info *mbi;
     uint8_t *kernel_temp = (uint8_t*)KERNEL_TEMP_ADDR;
@@ -251,6 +273,7 @@ efi_status EFIAPI efi_main(efi_handle image_handle, EFI_SYSTEM_TABLE *system_tab
     uintptr_t map_key = 0;
     uintptr_t desc_size = 0;
     uint32_t desc_ver = 0;
+    void *rsdp = NULL;
     efi_status status;
 
     g_st = system_table;
@@ -267,6 +290,12 @@ efi_status EFIAPI efi_main(efi_handle image_handle, EFI_SYSTEM_TABLE *system_tab
     strcpy((char*)(MULTIBOOT_INFO_ADDR + 256), "gemiboot 1.0 (UEFI 32-bit)");
     mbi->boot_loader_name = (uint32_t)(MULTIBOOT_INFO_ADDR + 256);
     mbi->flags |= MULTIBOOT_INFO_BOOT_LOADER_NAME;
+
+    rsdp = find_acpi_rsdp(system_table);
+    if (rsdp) {
+        mbi->config_table = (uint32_t)(uintptr_t)rsdp;
+        mbi->flags |= MULTIBOOT_INFO_CONFIG_TABLE;
+    }
 
     /* 1. Setup GOP */
     uefi_puts("[GEMIBOOT] Initializing Graphics Output Protocol (GOP)...\n");
