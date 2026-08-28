@@ -239,13 +239,14 @@ static void convert_memory_map(EFI_MEMORY_DESCRIPTOR *mmap, uintptr_t mmap_size,
     mbi->flags |= MULTIBOOT_INFO_MEMORY;
 }
 
-int efi_main(void *image_handle, EFI_SYSTEM_TABLE *system_table) {
+static uint8_t uefi_mmap_buf[UEFI_MMAP_BUF_SIZE];
+
+efi_status EFIAPI efi_main(efi_handle image_handle, EFI_SYSTEM_TABLE *system_table) {
     struct multiboot_info *mbi;
     uint8_t *kernel_temp = (uint8_t*)KERNEL_TEMP_ADDR;
     uintptr_t kernel_size = 0;
     uint32_t entry_point = 0;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
-    uint8_t uefi_mmap_buf[UEFI_MMAP_BUF_SIZE];
     uintptr_t mmap_size = sizeof(uefi_mmap_buf);
     uintptr_t map_key = 0;
     uintptr_t desc_size = 0;

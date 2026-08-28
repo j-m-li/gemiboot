@@ -58,6 +58,7 @@ boot_load:
 
     popl %edx           # BIOS drive ID
     popl %ebx           # LBA of IO.SYS
+    movb %dl, (bios_drive_id_stage1)
 
     addl $1, %ebx       # Next sector of IO.SYS
     movl %ebx, (iosys_sector)
@@ -153,6 +154,8 @@ iosys_sector:
     .long 0
 iosys_count:
     .long 0
+bios_drive_id_stage1:
+    .byte 0x80
 
 signature:
 .org _start + 510
@@ -168,6 +171,10 @@ second_stage:
     movw %ax, %es
     movw %ax, %fs
     movw %ax, %gs
+
+    # Copy BIOS drive ID from stage 1 to stage 2
+    movb (bios_drive_id_stage1 + STROFF - _start), %al
+    movb %al, (bios_drive_id + STROFF - _start)
 
     # Print banner
     movw $stage2_str + STROFF - _start, %si
@@ -245,7 +252,37 @@ init_video_mode:
     movw $0x1000, %ax
     movw %ax, %es
 
-    # Try VBE mode 0x4101 (640x480 256 colors with linear framebuffer)
+    # Try VBE mode 0x4112 (640x480 24/32-bit RGB with linear framebuffer)
+    movw $0x4F01, %ax
+    movw $0x4112, %cx
+    movw $vbe_mode_info + STROFF - _start, %di
+    int $0x10
+    cmpw $0x004F, %ax
+    jne try_16bpp
+
+    movw $0x4F02, %ax
+    movw $0x4112, %bx
+    int $0x10
+    cmpw $0x004F, %ax
+    je vbe_mode_set_ok
+
+try_16bpp:
+    # Try VBE mode 0x4111 (640x480 16-bit 5:6:5 with linear framebuffer)
+    movw $0x4F01, %ax
+    movw $0x4111, %cx
+    movw $vbe_mode_info + STROFF - _start, %di
+    int $0x10
+    cmpw $0x004F, %ax
+    jne try_256color
+
+    movw $0x4F02, %ax
+    movw $0x4111, %bx
+    int $0x10
+    cmpw $0x004F, %ax
+    je vbe_mode_set_ok
+
+try_256color:
+    # Try VBE mode 0x4101 (640x480 8-bit 256 colors with linear framebuffer)
     movw $0x4F01, %ax
     movw $0x4101, %cx
     movw $vbe_mode_info + STROFF - _start, %di
@@ -267,18 +304,34 @@ init_video_mode:
     movw $palette + STROFF - _start, %dx
     int $0x10
 
+vbe_mode_set_ok:
     # Store GFX info at physical address 0x00009000
     xorw %ax, %ax
     movw %ax, %es
-    movl $4, %es:0x9000                         # Mode: 4 (256 colors)
-    movzwl vbe_mode_info + STROFF - _start + 18, %eax
-    movl %eax, %es:0x9004                       # Width
-    movzwl vbe_mode_info + STROFF - _start + 20, %eax
-    movl %eax, %es:0x9008                       # Height
-    movzwl vbe_mode_info + STROFF - _start + 16, %eax
-    movl %eax, %es:0x900C                       # Pitch
-    movl vbe_mode_info + STROFF - _start + 40, %eax
-    movl %eax, %es:0x9010                       # Linear Framebuffer Base
+    movzbl vbe_mode_info + STROFF - _start + 25, %eax # BitsPerPixel (offset 25)
+    movl %eax, %es:0x9000
+    movzwl vbe_mode_info + STROFF - _start + 18, %eax # Width (offset 18)
+    movl %eax, %es:0x9004
+    movzwl vbe_mode_info + STROFF - _start + 20, %eax # Height (offset 20)
+    movl %eax, %es:0x9008
+    movzwl vbe_mode_info + STROFF - _start + 16, %eax # Pitch (offset 16)
+    movl %eax, %es:0x900C
+    movl vbe_mode_info + STROFF - _start + 40, %eax   # PhysBasePtr (offset 40)
+    movl %eax, %es:0x9010
+
+    # Color field positions and mask sizes
+    movb vbe_mode_info + STROFF - _start + 32, %al    # RedFieldPosition
+    movb %al, %es:0x9014
+    movb vbe_mode_info + STROFF - _start + 31, %al    # RedMaskSize
+    movb %al, %es:0x9015
+    movb vbe_mode_info + STROFF - _start + 34, %al    # GreenFieldPosition
+    movb %al, %es:0x9016
+    movb vbe_mode_info + STROFF - _start + 33, %al    # GreenMaskSize
+    movb %al, %es:0x9017
+    movb vbe_mode_info + STROFF - _start + 36, %al    # BlueFieldPosition
+    movb %al, %es:0x9018
+    movb vbe_mode_info + STROFF - _start + 35, %al    # BlueMaskSize
+    movb %al, %es:0x9019
 
     pop %es
     ret
@@ -289,7 +342,7 @@ vbe_fallback:
     int $0x10
     xorw %ax, %ax
     movw %ax, %es
-    movl $2, %es:0x9000                         # Mode: 2 (Text)
+    movl $0, %es:0x9000                         # Mode: 0 (Text)
     movl $80, %es:0x9004                        # Width
     movl $25, %es:0x9008                        # Height
     movl $160, %es:0x900C                       # Pitch
@@ -312,13 +365,15 @@ a20_ok:
 stage2_str:
     .asciz "[GEMIBOOT] Stage 2 starting...\r\n"
 
-# 32-bit GDT definition
+# 32-bit and 16-bit GDT definition
 .align 16
+.globl gdtp
 gdtp:
     .word gdt_end - gdt - 1
     .long gdt - _start + START_ADDRESS - 512
 
 .align 16
+.globl gdt
 gdt:
 gdt_null:
     .quad 0
@@ -336,11 +391,53 @@ gdt_data_segment:
     .byte 0b10010010
     .byte 0b11001111
     .byte 0x00
+gdt_code16_segment:
+    .word 0xffff
+    .word 0x0000
+    .byte 0x01
+    .byte 0b10011010
+    .byte 0b00000000
+    .byte 0x00
+gdt_data16_segment:
+    .word 0xffff
+    .word 0x0000
+    .byte 0x01
+    .byte 0b10010010
+    .byte 0b00000000
+    .byte 0x00
 gdt_end:
 
+.globl idt
 idt:
     .word 0
     .long 0
+
+.globl rm_idtr
+rm_idtr:
+    .word 0x03FF
+    .long 0x00000000
+
+.globl dap_packet
+.globl dap_size
+.globl dap_reserved
+.globl dap_sectors
+.globl dap_offset
+.globl dap_segment
+.globl dap_lba
+.globl bios_drive_id
+.globl saved_esp32
+
+.p2align 4, 0
+dap_packet:
+dap_size:     .byte 0x10
+dap_reserved: .byte 0x00
+dap_sectors:  .word 0x0001
+dap_offset:   .word 0x0000
+dap_segment:  .word 0x2000
+dap_lba:      .quad 0
+
+bios_drive_id: .byte 0x80
+saved_esp32:   .long 0
 
 palette:
     .byte 0x00, 0x00, 0x00 # black
@@ -364,6 +461,80 @@ vbe_mode_info:
     .rept 256
     .byte 0
     .endr
+
+# BIOS INT 0x13 Real Mode Thunk
+.code16
+.globl bios_int13_thunk16
+.globl bios_int13_thunk16_offset
+bios_int13_thunk16:
+    # Disable Protected Mode (CR0.PE = 0)
+    movl %cr0, %eax
+    andl $~1, %eax
+    movl %eax, %cr0
+
+    # Far jump to real mode (CS=0x1000)
+    ljmpw $0x1000, $(thunk16_real + STROFF - _start)
+
+bios_int13_thunk16_offset = bios_int13_thunk16 + STROFF - _start
+
+thunk16_real:
+    # Reload real mode segment registers
+    movw %cs, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+
+    # Setup low memory stack
+    xorw %ax, %ax
+    movw %ax, %ss
+    movw $0x7C00, %sp
+
+    # Load Real Mode IVT
+    lidtl (rm_idtr + STROFF - _start)
+
+    # Perform Extended Read (AH=0x42)
+    movb (bios_drive_id + STROFF - _start), %dl
+    cmpb $0x80, %dl
+    jae 1f
+    movb $0x80, %dl
+1:
+    movw $(dap_packet + STROFF - _start), %si
+    movw $3, %cx
+
+    sti
+try_thunk_int13:
+    pushw %cx
+    movb $0x42, %ah
+    int $0x13
+    popw %cx
+    jnc thunk_int13_ok
+
+    # Reset drive controller and retry
+    xorw %ax, %ax
+    int $0x13
+    loop try_thunk_int13
+
+    # Error
+    movl $1, %ebx
+    jmp thunk_return_pm32
+
+thunk_int13_ok:
+    xorl %ebx, %ebx
+
+thunk_return_pm32:
+    cli
+    # Reload 32-bit GDT & IDT
+    lgdtl (gdtp + STROFF - _start)
+    lidtl (idt + STROFF - _start)
+
+    # Enable Protected Mode (CR0.PE = 1)
+    movl %cr0, %eax
+    orl $1, %eax
+    movl %eax, %cr0
+
+    # Far jump back to 32-bit protected mode
+    ljmpl $0x08, $thunk_pm32_return
 
 .org _start + SIZE_16BIT_CODE - 1 + 512
     nop

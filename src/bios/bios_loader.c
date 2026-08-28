@@ -7,7 +7,7 @@
 #include "multiboot.h"
 #include "elf.h"
 #include "fat.h"
-#include "ata.h"
+#include "bios_disk.h"
 #include "io.h"
 
 extern void serial_init(void);
@@ -38,7 +38,7 @@ static uint32_t find_active_partition_lba(void) {
     struct mbr_part_entry *parts;
     int i;
 
-    if (ata_read_sectors(0, 1, mbr_buf) != 0) {
+    if (bios_read_sectors(0, 1, mbr_buf) != 0) {
         return 2048; /* Default fallback */
     }
 
@@ -73,14 +73,14 @@ void bios_loader_main(void) {
     serial_puts(" GEMIBOOT - Multiboot x86 Boot Loader for GEMIOS (BIOS)\n");
     serial_puts("=======================================================\n");
 
-    ata_init();
+    bios_disk_init();
 
     part_lba = find_active_partition_lba();
     serial_puts("[GEMIBOOT] Found active partition at LBA: ");
     serial_put_dec(part_lba);
     serial_puts("\n");
 
-    if (fat_init(&fs, part_lba, ata_read_sectors) != 0) {
+    if (fat_init(&fs, part_lba, bios_read_sectors) != 0) {
         serial_puts("[GEMIBOOT] ERROR: Failed to initialize FAT filesystem!\n");
         while (1) {
             __asm__ volatile ("hlt");
@@ -88,8 +88,8 @@ void bios_loader_main(void) {
     }
 
     serial_puts("[GEMIBOOT] Searching for gemios.elf...\n");
-    if (fat_find_file(&fs, ata_read_sectors, "gemios.elf", &first_clus, &file_size) != 0 &&
-        fat_find_file(&fs, ata_read_sectors, "GEMIOS.ELF", &first_clus, &file_size) != 0) {
+    if (fat_find_file(&fs, bios_read_sectors, "gemios.elf", &first_clus, &file_size) != 0 &&
+        fat_find_file(&fs, bios_read_sectors, "GEMIOS.ELF", &first_clus, &file_size) != 0) {
         serial_puts("[GEMIBOOT] ERROR: gemios.elf not found on disk!\n");
         while (1) {
             __asm__ volatile ("hlt");
@@ -100,7 +100,7 @@ void bios_loader_main(void) {
     serial_put_dec(file_size);
     serial_puts(" bytes. Loading into memory...\n");
 
-    if (fat_read_file(&fs, ata_read_sectors, first_clus, file_size, kernel_temp) != 0) {
+    if (fat_read_file(&fs, bios_read_sectors, first_clus, file_size, kernel_temp) != 0) {
         serial_puts("[GEMIBOOT] ERROR: Failed to read gemios.elf!\n");
         while (1) {
             __asm__ volatile ("hlt");
@@ -176,20 +176,29 @@ void bios_loader_main(void) {
     /* Fill Framebuffer info from video setup in real mode */
     {
         uint32_t *gfx_data = (uint32_t*)GFX_INFO_BUFFER_ADDR;
-        uint32_t gfx_mode = gfx_data[0];
+        uint32_t gfx_bpp = gfx_data[0];
         uint32_t gfx_width = gfx_data[1];
         uint32_t gfx_height = gfx_data[2];
         uint32_t gfx_pitch = gfx_data[3];
         uint32_t gfx_fb = gfx_data[4];
+        uint8_t *rgb_info = (uint8_t*)(GFX_INFO_BUFFER_ADDR + 0x14);
 
-        if (gfx_fb != 0 && gfx_width > 0 && gfx_height > 0) {
+        if (gfx_fb != 0 && gfx_width > 0 && gfx_height > 0 && gfx_bpp > 0) {
             mbi->framebuffer_addr_low = gfx_fb;
             mbi->framebuffer_addr_hi = 0;
             mbi->framebuffer_width = gfx_width;
             mbi->framebuffer_height = gfx_height;
             mbi->framebuffer_pitch = gfx_pitch;
-            mbi->framebuffer_bpp = (uint8_t)(gfx_mode == 1 ? 32 : (gfx_mode == 4 ? 8 : 4));
-            mbi->framebuffer_type = (uint8_t)(gfx_mode == 1 ? MULTIBOOT_FRAMEBUFFER_TYPE_RGB : MULTIBOOT_FRAMEBUFFER_TYPE_INDEXED);
+            mbi->framebuffer_bpp = (uint8_t)gfx_bpp;
+            mbi->framebuffer_type = (uint8_t)(gfx_bpp >= 15 ? MULTIBOOT_FRAMEBUFFER_TYPE_RGB : MULTIBOOT_FRAMEBUFFER_TYPE_INDEXED);
+            if (mbi->framebuffer_type == MULTIBOOT_FRAMEBUFFER_TYPE_RGB) {
+                mbi->framebuffer_red_field_position = rgb_info[0];
+                mbi->framebuffer_red_mask_size = rgb_info[1];
+                mbi->framebuffer_green_field_position = rgb_info[2];
+                mbi->framebuffer_green_mask_size = rgb_info[3];
+                mbi->framebuffer_blue_field_position = rgb_info[4];
+                mbi->framebuffer_blue_mask_size = rgb_info[5];
+            }
             mbi->flags |= MULTIBOOT_INFO_FRAMEBUFFER_INFO;
         } else {
             /* Standard VGA 80x25 text mode fallback */

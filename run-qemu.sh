@@ -58,11 +58,13 @@ if [ "$MODE" == "uefi64" ]; then
     fi
     exec qemu-system-x86_64 \
         -bios "$OVMF_X64" \
-        -drive file="$DISK_FILE",format=raw \
         -m 256M \
         $GRAPHICS_FLAG \
         -device qemu-xhci,id=xhci,p2=8,p3=8 \
-        -device usb-kbd,bus=xhci.0,port=1
+        -device usb-kbd,bus=xhci.0,port=1 \
+        -drive if=none,id=usbstick,format=raw,file=$DISK_FILE \
+        -device usb-storage,bus=xhci.0,port=3,drive=usbstick 
+ 
 elif [ "$MODE" == "uefi32" ]; then
     OVMF_IA32="/usr/share/edk2/ovmf-ia32/OVMF_CODE.fd"
     if [ ! -f "$OVMF_IA32" ]; then
@@ -70,12 +72,15 @@ elif [ "$MODE" == "uefi32" ]; then
     fi
     if [ -f "$OVMF_IA32" ]; then
         exec qemu-system-i386 \
-            -bios "$OVMF_IA32" \
-            -drive file="$DISK_FILE",format=raw \
+            -cpu max \
+            -machine q35 \
+            -drive if=pflash,format=raw,unit=0,readonly=on,file="$OVMF_IA32" \
             -m 256M \
             $GRAPHICS_FLAG \
             -device qemu-xhci,id=xhci,p2=8,p3=8 \
-            -device usb-kbd,bus=xhci.0,port=1
+            -device usb-kbd,bus=xhci.0,port=1 \
+            -drive if=none,id=usbstick,format=raw,file=$DISK_FILE \
+            -device usb-storage,bus=xhci.0,port=3,drive=usbstick 
     else
         echo "[*] 32-bit OVMF firmware not installed on host. Running 32-bit binary check..."
         file build/BOOTIA32.EFI
@@ -84,9 +89,10 @@ elif [ "$MODE" == "uefi32" ]; then
 else
     # Default: Old-fashioned BIOS boot
     exec qemu-system-i386 \
-        -drive file="$DISK_FILE",format=raw \
         -m 256M \
         $GRAPHICS_FLAG \
         -device qemu-xhci,id=xhci,p2=8,p3=8 \
-        -device usb-kbd,bus=xhci.0,port=1
+        -device usb-kbd,bus=xhci.0,port=1 \
+        -drive if=none,id=usbstick,format=raw,file=$DISK_FILE \
+        -device usb-storage,bus=xhci.0,port=3,drive=usbstick 
 fi

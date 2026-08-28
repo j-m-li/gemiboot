@@ -10,3 +10,5 @@ Load the gemios.elf kernel and jump to its entry point in 32 bit protected mode 
 
 Test is done using qemu for the three boot modes.
 
+https://kojipkgs.fedoraproject.org//packages/edk2/20250812/21.fc42/noarch/edk2-ovmf-ia32-20250812-21.fc42.noarch.rpm
+

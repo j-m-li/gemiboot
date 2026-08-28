@@ -84,7 +84,7 @@ $(BUILD_DIR)/bios_loader.o: src/bios/bios_loader.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS_32) -c $< -o $@
 
-$(BUILD_DIR)/ata.o: src/bios/ata.c
+$(BUILD_DIR)/bios_disk.o: src/bios/bios_disk.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS_32) -c $< -o $@
 
@@ -101,7 +101,7 @@ $(BUILD_DIR)/string_bios.o: src/common/string.c
 	$(CC) $(CFLAGS_32) -c $< -o $@
 
 BIOS_OBJS = $(BUILD_DIR)/io16.o $(BUILD_DIR)/io32.o $(BUILD_DIR)/bios_loader.o \
-            $(BUILD_DIR)/ata.o $(BUILD_DIR)/fat_bios.o $(BUILD_DIR)/elf_bios.o \
+            $(BUILD_DIR)/bios_disk.o $(BUILD_DIR)/fat_bios.o $(BUILD_DIR)/elf_bios.o \
             $(BUILD_DIR)/string_bios.o
 
 $(IOSYS_BIN): $(BIOS_OBJS) src/bios/io.ld

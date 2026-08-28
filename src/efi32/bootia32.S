@@ -8,6 +8,9 @@
 
 .global _load_gdt_and_jump
 .global load_gdt_and_jump
+# __chkstk / __chkstk_ms for 32-bit x86 Windows ABI:
+# Input: %eax = size of stack frame to allocate
+# Output: %esp adjusted, stack probed
 .global _chkstk
 .global __chkstk
 .global __chkstk_ms
@@ -15,6 +18,22 @@
 _chkstk:
 __chkstk:
 __chkstk_ms:
+    pushl   %ecx
+    leal    8(%esp), %ecx       # Address above return address + pushed ecx
+1:
+    cmpl    $4096, %eax
+    jb      2f
+    subl    $4096, %ecx
+    testl   %eax, (%ecx)        # Probe page
+    subl    $4096, %eax
+    jmp     1b
+2:
+    subl    %eax, %ecx
+    testl   %eax, (%ecx)        # Probe final page
+    movl    %esp, %eax          # Pointer to old stack frame
+    movl    %ecx, %esp          # Set new adjusted ESP
+    movl    0(%eax), %ecx       # Restore ECX
+    pushl   4(%eax)             # Put return address onto new stack
     ret
 
 # void load_gdt_and_jump(uint32_t entry_point, uint32_t magic, uint32_t mbi_addr);
