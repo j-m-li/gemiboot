@@ -1,13 +1,17 @@
 # GEMIBOOT - x86 Boot Loader for GEMIOS
 # Dedicated to the Public Domain (CC0)
 #
-# UEFI x86_64 low-level entry and 64-to-32 bit mode switch
+# UEFI x86_64 low-level entry and 64-to-32 bit trampoline mode switch
 
 .code64
 .text
 
 .global jump_to_32bit_kernel
 .global _jump_to_32bit_kernel
+.global trampoline_32_start
+.global trampoline_32_end
+.global gdt_table
+.global gdt_table_end
 .global __chkstk
 .global __chkstk_ms
 
@@ -15,46 +19,52 @@ __chkstk:
 __chkstk_ms:
     ret
 
-# void jump_to_32bit_kernel(uint64_t entry_point, uint64_t magic, uint64_t mbi_addr);
-# Windows x64 calling convention: RCX=entry_point, RDX=magic, R8=mbi_addr
+# void jump_to_32bit_kernel(uint64_t entry_point, uint64_t magic, uint64_t mbi_addr, uint64_t fb_base, uint64_t fb_pitch, uint64_t tramp_phys);
+# Windows x64 ABI: RCX=entry_point, RDX=magic, R8=mbi_addr, R9=fb_base, 40(%rsp)=fb_pitch, 48(%rsp)=tramp_phys
 _jump_to_32bit_kernel:
 jump_to_32bit_kernel:
     cli
 
-    # Save arguments into 32-bit registers
-    movl %ecx, %esi     # ESI = entry_point
-    movl %r8d, %ebx     # EBX = mbi_addr
+    # Save kernel arguments into non-volatile 32-bit registers
+    movl %ecx, %esi         # ESI = kernel entry point
+    movl %r8d, %ebx         # EBX = mbi_addr
+    movq 48(%rsp), %r15     # R15 = tramp_phys (guaranteed < 4GB)
 
-    # Load GDT with 32-bit and 64-bit descriptors
-    lgdtq gdtp(%rip)
+    # 1. Load GDT from descriptor at (tramp_phys + 0x800)
+    subq $16, %rsp
+    movw $(gdt_table_end - gdt_table - 1), (%rsp)
+    leaq 0x800(%r15), %rax
+    movq %rax, 2(%rsp)
+    lgdt (%rsp)
+    addq $16, %rsp
 
-    # Perform 64-bit to 32-bit far return into Code Segment 0x08
-    pushq $0x08
-    leaq compat32(%rip), %rax
-    pushq %rax
+    # 2. Far return to 32-bit Compatibility Mode at tramp_phys (< 4GB)
+    pushq $0x08                 # 32-bit Code Segment selector
+    pushq %r15                  # Target RIP = tramp_phys (< 4GB)
     lretq
 
+# -----------------------------------------------------------------------------
+# 32-bit Relocatable Trampoline Code (Copied to tramp_phys < 4GB)
+# -----------------------------------------------------------------------------
 .code32
-compat32:
-    # Now running in 32-bit Compatibility Mode
-
+.align 16
+trampoline_32_start:
     # 1. Disable Paging: clear CR0.PG (bit 31)
     movl %cr0, %eax
     btrl $31, %eax
     movl %eax, %cr0
 
-    # 2. Disable Long Mode: clear EFER.LME (bit 8)
+    # 2. Pipeline flush
+    jmp 1f
+1:
+
+    # 3. Disable Long Mode: clear IA32_EFER.LME (bit 8)
     movl $0xC0000080, %ecx
     rdmsr
     btrl $8, %eax
     wrmsr
 
-    # 3. Disable PAE: clear CR4.PAE (bit 5)
-    movl %cr4, %eax
-    btrl $5, %eax
-    movl %eax, %cr4
-
-    # 4. Reload flat 32-bit data segments
+    # 4. Reload 32-bit data segment selectors
     movw $0x10, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -66,57 +76,53 @@ compat32:
     movl $0x0007FFF0, %esp
     movl %esp, %ebp
 
-    # 6. Enable Fast A20 Gate
+    # 6. Load null IDT (limit=0, base=0) from stack
+    pushl $0
+    pushl $0
+    lidtl (%esp)
+    addl $8, %esp
+
+    # 7. Enable Fast A20 Gate
     inb $0x92, %al
     testb $0x02, %al
-    jnz 1f
+    jnz 3f
     orb $0x02, %al
     andb $0xFE, %al
     outb %al, $0x92
-1:
+3:
 
-    # 7. Set Multiboot Magic in EAX (0x2BADB002)
+    # 8. Reset EFLAGS
+    pushl $0
+    popfl
+
+    # 9. Set Multiboot Magic in EAX (0x2BADB002) and info ptr in EBX (0x00095000)
     movl $0x2BADB002, %eax
+    movl $0x00095000, %ebx
 
-    # 8. Jump to kernel entry point in pure 32-bit protected mode
+    # 10. Jump to kernel entry point (in ESI)
     jmpl *%esi
+trampoline_32_end:
+
+# -----------------------------------------------------------------------------
+# Global Descriptor Table (Read-Only)
+# -----------------------------------------------------------------------------
+.align 16
+gdt_table:
+    # 0x00: Null descriptor
+    .quad 0
+    # 0x08: 32-bit Code Segment (Base=0, Limit=4GB, Present, Ring 0, Code Exec/Read, 32-bit size, 4KB gran)
+    .word 0xffff, 0x0000
+    .byte 0x00, 0x9a, 0xcf, 0x00
+    # 0x10: 32-bit Data Segment (Base=0, Limit=4GB, Present, Ring 0, Data Read/Write, 32-bit size, 4KB gran)
+    .word 0xffff, 0x0000
+    .byte 0x00, 0x92, 0xcf, 0x00
+    # 0x18: 64-bit Code Segment
+    .word 0xffff, 0x0000
+    .byte 0x00, 0x9a, 0xaf, 0x00
+    # 0x20: 64-bit Data Segment
+    .word 0xffff, 0x0000
+    .byte 0x00, 0x92, 0xaf, 0x00
+gdt_table_end:
 
 .code64
-.align 16
-gdtp:
-    .word gdt_end - gdt - 1
-    .quad gdt
 
-.align 16
-gdt:
-gdt_null:
-    .quad 0
-gdt_code32:
-    .word 0xffff
-    .word 0x0000
-    .byte 0x00
-    .byte 0b10011010        # Present, Ring 0, Code, Exec/Read
-    .byte 0b11001111        # 4KB gran, 32-bit op size, L=0
-    .byte 0x00
-gdt_data32:
-    .word 0xffff
-    .word 0x0000
-    .byte 0x00
-    .byte 0b10010010        # Present, Ring 0, Data, Read/Write
-    .byte 0b11001111        # 4KB gran, 32-bit op size
-    .byte 0x00
-gdt_code64:
-    .word 0xffff
-    .word 0x0000
-    .byte 0x00
-    .byte 0b10011010
-    .byte 0b10101111        # 64-bit Code (L=1, D=0)
-    .byte 0x00
-gdt_data64:
-    .word 0xffff
-    .word 0x0000
-    .byte 0x00
-    .byte 0b10010010
-    .byte 0b10101111        # 64-bit Data
-    .byte 0x00
-gdt_end:

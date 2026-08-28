@@ -18,7 +18,7 @@ public_domain:
 .org 0x0B
     .word 512       # Bytes per sector
 .org 0x0D
-    .byte 1         # Sectors per cluster
+    .byte 4         # Sectors per cluster
 .org 0x0E
     .word 32        # Reserved sectors
 .org 0x10
@@ -69,121 +69,100 @@ public_domain:
 
 .org 0x5A
 bypass:
-    # Print 'V'
-    movb $0x0E, %ah
-    movb $'V', %al
-    int $0x10
+    # 1. Normalize CS:IP
+    ljmp $0x0000, $norm_vbr_cs
 
-    movw $0x7C00, %sp
-    xorw %ax, %ax
-    movw %ax, %ss
-    pushl %ebx          # Partition start LBA passed by MBR
-    pushl %edx          # Drive ID passed by MBR
-    movw %ax, %es
-    movw %ax, %ds
-
-move_vbr:
+norm_vbr_cs:
     cli
+    cld
+    xorw %ax, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw $0x7C00, %sp
+    sti
+
+    # Save drive ID (DL/EDX) and partition start LBA (EBX)
+    movb %dl, (0x7C00 + bios_drive_id - _start)
+    movl %ebx, (0x7C00 + partition_lba - _start)
+
+    # 2. Relocate VBR from 0x0000:7C00 to 0x0000:0600
     movw $0x7C00, %si
     movw $0x0600, %di
     movw $512, %cx
-    cld
     rep movsb
 
-    sti
-    movb $0x0E, %ah
-    movb $'B', %al
-    int $0x10
+    # 3. Jump to relocated VBR
+    ljmp $0x0000, $(0x0600 + after_vbr_reloc - _start)
 
-    movw $0, (0x7C00 + 510)
-    movw $0, (0x0600 + 510)
-
-    ljmp $0, $(0x0600 + after_move - _start)
-
-after_move:
-    movb $0x0E, %ah
-    movb $'R', %al
-    int $0x10
-    movb $' ', %al
-    call putc
-
-    popl %edx           # Drive ID
-    popl %ebx           # Partition start LBA
-
+after_vbr_reloc:
     # IO.SYS is placed in reserved sectors at PARTITION_START_LBA + 2
+    movl (0x0600 + partition_lba - _start), %ebx
     addl $2, %ebx
+    movl %ebx, (0x0600 + iosys_lba - _start)
 
-read_io_sys:
-    movw $0, (0x7C00 + 510)
-
+read_io_sys_loop:
     movb $0x10, (0x0600 + lba_packet_size - _start)
     movb $0x0, (0x0600 + lba_packet_reserved - _start)
     movw $1, (0x0600 + lba_packet_sectors - _start)
     movw $0x7C00, (0x0600 + lba_packet_offset - _start)
-    movw $0x0, (0x0600 + lba_packet_segment - _start)
-    movl %ebx, (0x0600 + lba_packet_lba - _start)
-    movl $0x0, (0x0600 + lba_packet_padding - _start)
+    movw $0x0000, (0x0600 + lba_packet_segment - _start)
+    movl (0x0600 + iosys_lba - _start), %eax
+    movl %eax, (0x0600 + lba_packet_lba - _start)
+    movl $0, (0x0600 + lba_packet_padding - _start)
 
     movw $3, %cx
-try_read_vbr:
+try_read_iosys:
+    pushw %cx
     movw $0, %ax
     movw %ax, %ds
+    movb (0x0600 + bios_drive_id - _start), %dl   # Reload drive ID
+    movw $(0x0600 + lba_packet - _start), %si    # Reload packet ptr
     movb $0x42, %ah
-    movw $(0x0600 + lba_packet - _start), %si
     int $0x13
-    jnc vbr_read_done
+    popw %cx
+    jnc iosys_sec_read_ok
 
-    movb $0, %ah
+    # Reset controller and retry
+    movb (0x0600 + bios_drive_id - _start), %dl
+    xorw %ax, %ax
     int $0x13
-    loop try_read_vbr
+    loop try_read_iosys
 
-cant_read_io:
+cant_read_iosys:
     movb $'#', %al
     call putc
-io_err:
+hang_vbr:
     hlt
-    jmp io_err
+    jmp hang_vbr
 
-vbr_read_done:
-    pushl %ebx
-    pushl %edx
-    movw (0x7C00 + 510), %ax
-    cmpw $0xAA55, %ax
-    jne try_next_sec
+iosys_sec_read_ok:
+    # Verify boot signature 0xAA55 at 0x7DFE
+    cmpw $0xAA55, 0x7DFE
+    jne check_next_sec
 
-    # Verify "gemi" identifier at offset 3
+    # Verify "gemi" identifier at 0x7C03
     cmpl $0x696D6567, 0x7C03
-    je io_found
+    je iosys_found
 
-try_next_sec:
-    popl %edx
-    popl %ebx
-    addl $1, %ebx
-    jmp read_io_sys
+check_next_sec:
+    incl (0x0600 + iosys_lba - _start)
+    jmp read_io_sys_loop
 
-io_found:
-    popl %edx
-    popl %ebx
+iosys_found:
+    # Pass IO.SYS start LBA in EBX and drive ID in DL/EDX to IO.SYS
+    movl (0x0600 + iosys_lba - _start), %ebx
+    movzbl (0x0600 + bios_drive_id - _start), %edx
 
-    movb $'L', %al
-    call putc
-    movb $'o', %al
-    call putc
-    movb $'a', %al
-    call putc
-    movb $'d', %al
-    call putc
-    movb $0x0D, %al
-    call putc
-    movb $0x0A, %al
-    call putc
-
-    # Jump to IO.SYS loaded at 0x7C00 with EBX=IO.SYS start LBA, EDX=Drive ID
+    # Jump to IO.SYS at 0x0000:7C00
     ljmp $0x0000, $0x7C00
 
 putc:
+    pusha
     movb $0x0E, %ah
+    xorw %bx, %bx
     int $0x10
+    popa
     ret
 
 .p2align 4, 0
@@ -197,11 +176,18 @@ lba_packet_sectors:
 lba_packet_offset:
     .word 0x7C00
 lba_packet_segment:
-    .word 0x0
+    .word 0x0000
 lba_packet_lba:
     .long 0
 lba_packet_padding:
     .long 0
+
+bios_drive_id:
+    .byte 0x80
+partition_lba:
+    .long 2048
+iosys_lba:
+    .long 2050
 
 .org 510
     .byte 0x55, 0xAA

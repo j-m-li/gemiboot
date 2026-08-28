@@ -20,12 +20,12 @@ typedef unsigned int   uint32_t;
 #endif
 
 #define SECTOR_SIZE         512
-#define DISK_SIZE_MB        64
+#define DISK_SIZE_MB        256
 #define TOTAL_SECTORS       ((uint32_t)DISK_SIZE_MB * 1024 * 1024 / SECTOR_SIZE)
 #define PARTITION_START_LBA 2048
 #define PARTITION_SECTORS   (TOTAL_SECTORS - PARTITION_START_LBA)
 
-#define SEC_PER_CLUS        1
+#define SEC_PER_CLUS        4
 #define RSVD_SEC_CNT        32
 #define NUM_FATS            2
 #define ROOT_CLUS           2
@@ -335,13 +335,27 @@ int main(int argc, char *argv[]) {
     }
 
     /* 1. Write MBR code to sector 0 */
-    memcpy(g_disk, mbr_data, mbr_sz < 446 ? mbr_sz : 446);
+    memcpy(g_disk, mbr_data, mbr_sz < 440 ? mbr_sz : 440);
+    *(uint32_t*)(g_disk + 440) = 0x544F4F42; /* Windows NT Disk Signature: "BOOT" */
+    *(uint16_t*)(g_disk + 444) = 0x0000;
     *(uint16_t*)(g_disk + 510) = 0xAA55;
 
     /* Write MBR partition table */
     mbr_part = (struct mbr_entry*)(g_disk + 446);
     mbr_part[0].status = 0x80; /* Active bootable */
-    mbr_part[0].type = 0xEF;   /* EFI System Partition / FAT32 */
+
+    /* CHS Start: Head 32, Sector 33, Cylinder 0 (LBA 2048) */
+    mbr_part[0].start_chs[0] = 32;
+    mbr_part[0].start_chs[1] = 33;
+    mbr_part[0].start_chs[2] = 0;
+
+    mbr_part[0].type = 0x0C;   /* FAT32 with LBA */
+
+    /* CHS End: Head 254, Sector 63, Cylinder 1023 */
+    mbr_part[0].end_chs[0] = 254;
+    mbr_part[0].end_chs[1] = 0xFF;
+    mbr_part[0].end_chs[2] = 0xFF;
+
     mbr_part[0].start_lba = PARTITION_START_LBA;
     mbr_part[0].length_lba = PARTITION_SECTORS;
 

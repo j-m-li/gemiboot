@@ -23,65 +23,47 @@ public_domain:
     .ascii "gemiboot"
 
 bypass:
-    movw $0x7C00, %sp
+    ljmp $0x0000, $(norm_io16_cs - _start + 0x7C00)
+norm_io16_cs:
+    cli
+    cld
     xorw %ax, %ax
-    movw %ax, %ss
-    pushl %ebx          # LBA of IO.SYS passed by VBR
-    pushl %edx          # BIOS disk drive ID (0x80)
-    movw %ax, %es
     movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw $0x7C00, %sp
+    sti
 
-    # Print 'I'
-    movb $0x0E, %ah
-    movb $'I', %al
-    int $0x10
+    # Save BIOS drive ID and LBA of IO.SYS
+    movb %dl, (bios_drive_id_stage1 - _start + 0x7C00)
+    movl %ebx, (iosys_sector - _start + 0x7C00)
 
-    ljmp $0, $updatecs - _start + 0x7C00
-
-updatecs:
-    # Print 'O'
-    movb $0x0E, %ah
-    movb $'O', %al
-    int $0x10
-
-boot_load:
-    movb $'.', %al
-    call putc
-    movb $'S', %al
-    call putc
-    movb $'Y', %al
-    call putc
-    movb $'S', %al
-    call putc
-    movb $' ', %al
-    call putc
-
-    popl %edx           # BIOS drive ID
-    popl %ebx           # LBA of IO.SYS
-    movb %dl, (bios_drive_id_stage1)
-
-    addl $1, %ebx       # Next sector of IO.SYS
-    movl %ebx, (iosys_sector)
-    movl $12, (iosys_count) # Load up to 384 KB (12 chunks of 64 sectors)
+    addl $1, (iosys_sector - _start + 0x7C00)
+    movl $12, (iosys_count - _start + 0x7C00) # Load up to 384 KB (12 chunks of 64 sectors)
 
 self_load:
-    movb $0x10, (lba_packet_size)
-    movb $0x0, (lba_packet_reserved)
-    movw $64, (lba_packet_sectors)
-    movw $0, (lba_packet_offset)
-    movw $0x1000, (lba_packet_segment)
-    movl %ebx, (lba_packet_lba)
-    movl $0x0, (lba_packet_padding)
+    movb $0x10, (lba_packet_size - _start + 0x7C00)
+    movb $0x0, (lba_packet_reserved - _start + 0x7C00)
+    movw $64, (lba_packet_sectors - _start + 0x7C00)
+    movw $0, (lba_packet_offset - _start + 0x7C00)
+    movw $0x1000, (lba_packet_segment - _start + 0x7C00)
+    movl (iosys_sector - _start + 0x7C00), %eax
+    movl %eax, (lba_packet_lba - _start + 0x7C00)
+    movl $0x0, (lba_packet_padding - _start + 0x7C00)
 
     movw $3, %cx
 try_read:
+    pushw %cx
     movw $0, %ax
     movw %ax, %ds
+    movb (bios_drive_id_stage1 - _start + 0x7C00), %dl   # Reload drive ID
+    movw $(lba_packet - _start + 0x7C00), %si           # Reload packet address
     movb $0x42, %ah     # Extended read sectors
-    movw $lba_packet, %si
     int $0x13
+    popw %cx
     jnc read_done
 
+    movb (bios_drive_id_stage1 - _start + 0x7C00), %dl
     movb $0, %ah        # Reset disk controller
     int $0x13
     loop try_read
@@ -94,44 +76,29 @@ halt_real:
     jmp halt_real
 
 read_done:
-    movb $'*', %al
-    call putc
-
-    movw (lba_packet_segment), %bx
+    movw (lba_packet_segment - _start + 0x7C00), %bx
     addw $(512 / 16 * 64), %bx
-    movw %bx, (lba_packet_segment)
+    movw %bx, (lba_packet_segment - _start + 0x7C00)
 
-    movl (iosys_sector), %ebx
-    addl $64, %ebx
-    movl %ebx, (iosys_sector)
-    movl %ebx, (lba_packet_lba)
-
-    movl (iosys_count), %ebx
-    subl $1, %ebx
-    movl %ebx, (iosys_count)
-    cmpl $0, %ebx
+    addl $64, (iosys_sector - _start + 0x7C00)
+    subl $1, (iosys_count - _start + 0x7C00)
+    cmpl $0, (iosys_count - _start + 0x7C00)
     je load_finished
 
-    movb $0x10, (lba_packet_size)
-    movb $0x0, (lba_packet_reserved)
-    movw $0, (lba_packet_offset)
-    movw $64, (lba_packet_sectors)
-    movl $0x0, (lba_packet_padding)
     movw $3, %cx
     jmp try_read
 
 load_finished:
-    movb $0x0D, %al
-    call putc
-    movb $0x0A, %al
-    call putc
-
-    # Jump to second stage at 0x1000:0000
+    movb (bios_drive_id_stage1 - _start + 0x7C00), %dl
+    # Jump to second stage at 0x1000:0000 with DL = drive ID
     ljmpw $0x1000, $0
 
 putc:
+    pusha
     movb $0x0E, %ah
+    xorw %bx, %bx
     int $0x10
+    popa
     ret
 
 .p2align 4, 0
@@ -172,9 +139,12 @@ second_stage:
     movw %ax, %fs
     movw %ax, %gs
 
-    # Copy BIOS drive ID from stage 1 to stage 2
-    movb (bios_drive_id_stage1 + STROFF - _start), %al
-    movb %al, (bios_drive_id + STROFF - _start)
+    # Store BIOS drive ID passed in DL
+    movb %dl, (bios_drive_id + STROFF - _start)
+    cmpb $0x80, %dl
+    jae 1f
+    movb $0x80, (bios_drive_id + STROFF - _start)
+1:
 
     # Print banner
     movw $stage2_str + STROFF - _start, %si
@@ -351,15 +321,90 @@ vbe_fallback:
     ret
 
 enable_a20:
-    # 1. Try Fast A20 (Port 0x92)
+    # Check if A20 is already enabled
+    call check_a20
+    testw %ax, %ax
+    jnz a20_ok
+
+    # Method 1: BIOS INT 0x15, AX=0x2401
+    movw $0x2401, %ax
+    int $0x15
+    call check_a20
+    testw %ax, %ax
+    jnz a20_ok
+
+    # Method 2: Fast A20 Gate (Port 0x92)
     inb $0x92, %al
     testb $0x02, %al
-    jnz a20_ok
+    jnz 1f
     orb $0x02, %al
     andb $0xFE, %al
     outb %al, $0x92
+1:
+    call check_a20
+    testw %ax, %ax
+    jnz a20_ok
+
+    # Method 3: Keyboard Controller A20 (Port 0x64/0x60)
+    cli
+    call a20_wait_kbc_in
+    movb $0xAD, %al
+    outb %al, $0x64
+    call a20_wait_kbc_in
+    movb $0xD0, %al
+    outb %al, $0x64
+    call a20_wait_kbc_out
+    inb $0x60, %al
+    pushl %eax
+    call a20_wait_kbc_in
+    movb $0xD1, %al
+    outb %al, $0x64
+    call a20_wait_kbc_in
+    popl %eax
+    orb $2, %al
+    outb %al, $0x60
+    call a20_wait_kbc_in
+    movb $0xAE, %al
+    outb %al, $0x64
+    sti
 
 a20_ok:
+    ret
+
+a20_wait_kbc_in:
+    inb $0x64, %al
+    testb $2, %al
+    jnz a20_wait_kbc_in
+    ret
+
+a20_wait_kbc_out:
+    inb $0x64, %al
+    testb $1, %al
+    jz a20_wait_kbc_out
+    ret
+
+check_a20:
+    pushw %ds
+    pushw %es
+    xorw %ax, %ax
+    movw %ax, %ds
+    decw %ax
+    movw %ax, %es
+    movw $0x7DFE, %si
+    movw $0x7E0E, %di
+    movw %ds:(%si), %cx
+    movw %es:(%di), %dx
+    movw $0x0000, %ds:(%si)
+    movw $0xFFFF, %es:(%di)
+    cmpw $0xFFFF, %ds:(%si)
+    movw %cx, %ds:(%si)
+    movw %dx, %es:(%di)
+    movw $1, %ax
+    jne 2f
+    xorw %ax, %ax
+2:
+    popw %es
+    popw %ds
     ret
 
 stage2_str:
@@ -505,12 +550,15 @@ thunk16_real:
     sti
 try_thunk_int13:
     pushw %cx
+    movb (bios_drive_id + STROFF - _start), %dl
+    movw $(dap_packet + STROFF - _start), %si
     movb $0x42, %ah
     int $0x13
     popw %cx
     jnc thunk_int13_ok
 
     # Reset drive controller and retry
+    movb (bios_drive_id + STROFF - _start), %dl
     xorw %ax, %ax
     int $0x13
     loop try_thunk_int13

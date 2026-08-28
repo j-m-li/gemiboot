@@ -43,7 +43,7 @@ qemu-system-i386 \
     -device usb-kbd,bus=xhci.0,port=1 &
 QEMU_PID=$!
 
-sleep 4
+sleep 9
 kill -9 $QEMU_PID 2>/dev/null || true
 
 if grep -q "GEMIBOOT - Multiboot x86 Boot Loader for GEMIOS (BIOS)" "$LOG_BIOS" && \
@@ -80,7 +80,7 @@ if [ -f "$OVMF_IA32" ]; then
         -device usb-kbd,bus=xhci.0,port=1 &
     QEMU_PID=$!
 
-    sleep 12
+    sleep 20
     kill -9 $QEMU_PID 2>/dev/null || true
 
     if grep -q "GEMIBOOT - Multiboot x86 Boot Loader (UEFI 32-bit)" "$LOG_UEFI32" && \
@@ -113,7 +113,7 @@ if [ -f "$OVMF_X64" ]; then
         -device usb-kbd,bus=xhci.0,port=1 &
     QEMU_PID=$!
 
-    sleep 12
+    sleep 20
     kill -9 $QEMU_PID 2>/dev/null || true
 
     if grep -q "GEMIBOOT - Multiboot x86 Boot Loader (UEFI 64-bit)" "$LOG_UEFI" && \

@@ -292,6 +292,22 @@ typedef efi_status (EFIAPI *EFI_EXIT_BOOT_SERVICES)(
     efi_handle ImageHandle,
     uintptr_t MapKey);
 
+typedef enum {
+    AllHandles,
+    ByRegisterNotify,
+    ByProtocol
+} EFI_LOCATE_SEARCH_TYPE;
+
+typedef efi_status (EFIAPI *EFI_LOCATE_HANDLE_BUFFER)(
+    EFI_LOCATE_SEARCH_TYPE SearchType,
+    const efi_guid *Protocol,
+    void *SearchKey,
+    uintptr_t *NoHandles,
+    efi_handle **Buffer);
+
+typedef efi_status (EFIAPI *EFI_STALL)(
+    uintptr_t Microseconds);
+
 typedef struct {
     EFI_TABLE_HEADER Hdr;
 
@@ -328,7 +344,7 @@ typedef struct {
     EFI_EXIT_BOOT_SERVICES ExitBootServices;
 
     void *GetNextMonotonicCount;
-    void *Stall;
+    EFI_STALL Stall;
     void *SetWatchdogTimer;
 
     void *ConnectController;
@@ -337,7 +353,7 @@ typedef struct {
     void *CloseProtocol;
     void *OpenProtocolInformation;
     void *ProtocolsPerHandle;
-    void *LocateHandleBuffer;
+    EFI_LOCATE_HANDLE_BUFFER LocateHandleBuffer;
     EFI_LOCATE_PROTOCOL LocateProtocol;
     void *InstallMultipleProtocolInterfaces;
     void *UninstallMultipleProtocolInterfaces;

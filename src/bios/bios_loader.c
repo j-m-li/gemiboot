@@ -57,6 +57,35 @@ static uint32_t find_active_partition_lba(void) {
     return 2048;
 }
 
+static uint8_t cmos_get_sec(void) {
+    outb(0x70, 0x0A);
+    while (inb(0x71) & 0x80) {
+        io_wait();
+    }
+    outb(0x70, 0x00);
+    return inb(0x71);
+}
+
+static void pause_seconds(int seconds) {
+    int s;
+    serial_puts("[GEMIBOOT] Pausing for ");
+    serial_put_dec(seconds);
+    serial_puts(" seconds before booting kernel...\n");
+
+    for (s = seconds; s > 0; s--) {
+        uint8_t start_sec = cmos_get_sec();
+        uint32_t timeout = 0;
+        serial_puts("[GEMIBOOT] Booting in ");
+        serial_put_dec(s);
+        serial_puts(" second(s)...\n");
+
+        while (cmos_get_sec() == start_sec && timeout < 2000000) {
+            io_wait();
+            timeout++;
+        }
+    }
+}
+
 void bios_loader_main(void) {
     fat_fs_t fs;
     uint32_t part_lba;
@@ -101,7 +130,7 @@ void bios_loader_main(void) {
     serial_puts(" bytes. Loading into memory...\n");
 
     if (fat_read_file(&fs, bios_read_sectors, first_clus, file_size, kernel_temp) != 0) {
-        serial_puts("[GEMIBOOT] ERROR: Failed to read gemios.elf!\n");
+        serial_puts("[GEMIBOOT] ERROR: Failed to read gemios.elf into memory!\n");
         while (1) {
             __asm__ volatile ("hlt");
         }
@@ -110,7 +139,7 @@ void bios_loader_main(void) {
     serial_puts("[GEMIBOOT] Parsing ELF32 and loading sections...\n");
     entry_point = elf32_load(kernel_temp, file_size);
     if (entry_point == 0) {
-        serial_puts("[GEMIBOOT] ERROR: Invalid ELF32 binary or load failed!\n");
+        serial_puts("[GEMIBOOT] ERROR: Failed to parse and load ELF32 kernel!\n");
         while (1) {
             __asm__ volatile ("hlt");
         }
@@ -120,33 +149,34 @@ void bios_loader_main(void) {
     serial_put_hex(entry_point);
     serial_puts("\n");
 
-    /* Assemble Multiboot 1 info structure */
+    /* Prepare Multiboot 1 information structure at MULTIBOOT_INFO_ADDR */
     mbi = (struct multiboot_info*)MULTIBOOT_INFO_ADDR;
     memset(mbi, 0, sizeof(struct multiboot_info));
 
+    /* Convert E820 memory map from real mode */
     e820_count = *(uint32_t*)MMAP_BUFFER_ADDR;
-    if (e820_count > 0 && e820_count < 128) {
+    if (e820_count > 0 && e820_count <= 128) {
         mmap_len = e820_count * 24;
         mbi->mmap_addr = MMAP_BUFFER_ADDR + 4;
         mbi->mmap_length = mmap_len;
         mbi->flags |= MULTIBOOT_INFO_MEM_MAP;
     } else {
-        /* Fallback: construct a simple 128MB RAM memory map */
+        /* Fallback memory map */
         struct multiboot_mmap_entry *entries = (struct multiboot_mmap_entry*)(MMAP_BUFFER_ADDR + 4);
-        
+
         /* 0x00000000 - 0x0009FC00 (639 KB Available) */
         entries[0].size = 20;
         entries[0].addr_low = 0x00000000;
         entries[0].addr_high = 0;
-        entries[0].len_low = 0x0009FC00;
+        entries[0].len_low = (639 * 1024);
         entries[0].len_high = 0;
         entries[0].type = MULTIBOOT_MEMORY_AVAILABLE;
 
-        /* 0x0009FC00 - 0x00100000 (385 KB Reserved) */
+        /* 0x0009FC00 - 0x00100000 (385 KB Reserved - BIOS/EBDA/Video) */
         entries[1].size = 20;
         entries[1].addr_low = 0x0009FC00;
         entries[1].addr_high = 0;
-        entries[1].len_low = 0x00060400;
+        entries[1].len_low = (385 * 1024);
         entries[1].len_high = 0;
         entries[1].type = MULTIBOOT_MEMORY_RESERVED;
 
@@ -212,6 +242,9 @@ void bios_loader_main(void) {
             mbi->flags |= MULTIBOOT_INFO_FRAMEBUFFER_INFO;
         }
     }
+
+    /* 5-second pause before jumping to kernel */
+    pause_seconds(5);
 
     serial_puts("[GEMIBOOT] Multiboot information prepared. Jumping to GEMIOS kernel...\n\n");
 
