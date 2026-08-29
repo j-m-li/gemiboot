@@ -33,7 +33,7 @@ BOOTX64_EFI = $(BUILD_DIR)/BOOTX64.EFI
 KERNEL_ELF = $(BUILD_DIR)/gemios.elf
 DISK_IMG = $(BUILD_DIR)/gemiboot.img
 
-.PHONY: all bios efi32 efi64 disk run-bios run-uefi64 run-uefi32 test clean
+.PHONY: all bios efi32 efi64 disk run-bios run-uefi64 run-uefi32 run-bochs test test-qemu test-bochs test-all list clean
 
 all: bios efi32 efi64 disk
 
@@ -179,6 +179,9 @@ run-uefi64: $(DISK_IMG)
 run-uefi32: $(DISK_IMG)
 	./run-qemu.sh --uefi32
 
+run-bochs: $(DISK_IMG)
+	./run-bochs.sh
+
 list: $(DISK_IMG)
 	@echo "=== Root Directory ==="
 	@mdir -i $(DISK_IMG)@@1M ::
@@ -186,8 +189,17 @@ list: $(DISK_IMG)
 	@echo "=== /EFI/BOOT Directory ==="
 	@mdir -i $(DISK_IMG)@@1M ::/EFI/BOOT
 
-test: $(DISK_IMG)
+test: test-all
+
+test-all: $(DISK_IMG)
 	./test-qemu.sh
+	./test-bochs.sh
+
+test-qemu: $(DISK_IMG)
+	./test-qemu.sh
+
+test-bochs: $(DISK_IMG)
+	./test-bochs.sh
 
 clean:
 	rm -rf $(BUILD_DIR) $(TOOLS_DIR)/mkdisk
