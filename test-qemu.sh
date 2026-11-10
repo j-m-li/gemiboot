@@ -43,15 +43,20 @@ qemu-system-i386 \
     -device usb-kbd,bus=xhci.0,port=1 &
 QEMU_PID=$!
 
-sleep 9
+for _ in $(seq 1 12); do
+    if [ -f "$LOG_BIOS" ] && grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_BIOS" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
 kill -9 $QEMU_PID 2>/dev/null || true
 
 if grep -q "GEMIBOOT - Multiboot x86 Boot Loader for GEMIOS (BIOS)" "$LOG_BIOS" && \
-   grep -q "GEMIOS - 32-bit x86 Preemptive Real-Time OS" "$LOG_BIOS" && \
-   grep -q "=== GEMIOS RTOS Interactive Console Ready ===" "$LOG_BIOS"; then
-    echo "[+] PASSED: BIOS Boot successfully loaded gemios.elf into 32-bit Protected Mode and launched RTOS shell."
+   grep -q "Oksinix x86 32-bit Kernel" "$LOG_BIOS" && \
+   grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_BIOS"; then
+    echo "[+] PASSED: BIOS Boot successfully loaded gemios.elf into 32-bit Protected Mode and launched shell."
 else
-    echo "[-] FAILED: BIOS Boot log did not contain expected GEMIOS banner!"
+    echo "[-] FAILED: BIOS Boot log did not contain expected Oksinix banner!"
     cat "$LOG_BIOS"
     exit 1
 fi
@@ -80,15 +85,20 @@ if [ -f "$OVMF_IA32" ]; then
         -device usb-kbd,bus=xhci.0,port=1 &
     QEMU_PID=$!
 
-    sleep 20
+    for _ in $(seq 1 20); do
+        if [ -f "$LOG_UEFI32" ] && grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_UEFI32" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
     kill -9 $QEMU_PID 2>/dev/null || true
 
     if grep -q "GEMIBOOT - Multiboot x86 Boot Loader (UEFI 32-bit)" "$LOG_UEFI32" && \
-       grep -q "GEMIOS - 32-bit x86 Preemptive Real-Time OS" "$LOG_UEFI32" && \
-       grep -q "=== GEMIOS RTOS Interactive Console Ready ===" "$LOG_UEFI32"; then
-        echo "[+] PASSED: UEFI 32-bit Boot successfully loaded gemios.elf, set GOP framebuffer, and launched RTOS shell."
+       grep -q "Oksinix x86 32-bit Kernel" "$LOG_UEFI32" && \
+       grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_UEFI32"; then
+        echo "[+] PASSED: UEFI 32-bit Boot successfully loaded gemios.elf, set GOP framebuffer, and launched shell."
     else
-        echo "[-] FAILED: UEFI 32-bit Boot log did not contain expected GEMIOS banner!"
+        echo "[-] FAILED: UEFI 32-bit Boot log did not contain expected Oksinix banner!"
         cat "$LOG_UEFI32"
         exit 1
     fi
@@ -113,15 +123,20 @@ if [ -f "$OVMF_X64" ]; then
         -device usb-kbd,bus=xhci.0,port=1 &
     QEMU_PID=$!
 
-    sleep 20
+    for _ in $(seq 1 20); do
+        if [ -f "$LOG_UEFI" ] && grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_UEFI" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
     kill -9 $QEMU_PID 2>/dev/null || true
 
     if grep -q "GEMIBOOT - Multiboot x86 Boot Loader (UEFI 64-bit)" "$LOG_UEFI" && \
-       grep -q "GEMIOS - 32-bit x86 Preemptive Real-Time OS" "$LOG_UEFI" && \
-       grep -q "=== GEMIOS RTOS Interactive Console Ready ===" "$LOG_UEFI"; then
-        echo "[+] PASSED: UEFI 64-bit Boot successfully loaded gemios.elf, set GOP framebuffer, and launched RTOS shell."
+       grep -q "Oksinix x86 32-bit Kernel" "$LOG_UEFI" && \
+       grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_UEFI"; then
+        echo "[+] PASSED: UEFI 64-bit Boot successfully loaded gemios.elf, set GOP framebuffer, and launched shell."
     else
-        echo "[-] FAILED: UEFI 64-bit Boot log did not contain expected GEMIOS banner!"
+        echo "[-] FAILED: UEFI 64-bit Boot log did not contain expected Oksinix banner!"
         cat "$LOG_UEFI"
         exit 1
     fi

@@ -81,22 +81,28 @@ BOCHS_EOF
 bochs -q -f "$BOCHSRC_TMP" &
 BOCHS_PID=$!
 
-# Wait for xHCI USB boot detection, boot countdown (5s), and RTOS startup
-sleep 16
+# Wait for xHCI USB boot detection, boot countdown (5s), and OS startup
+for _ in $(seq 1 16); do
+    if [ -f "$LOG_BOCHS" ] && grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_BOCHS" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
 kill -9 $BOCHS_PID 2>/dev/null || true
 wait $BOCHS_PID 2>/dev/null || true
 rm -f "$DISK_FILE.lock" "$BOCHSRC_TMP"
 
 if [ -f "$LOG_BOCHS" ] && \
    grep -q "GEMIBOOT - Multiboot x86 Boot Loader for GEMIOS (BIOS)" "$LOG_BOCHS" && \
-   grep -q "GEMIOS - 32-bit x86 Preemptive Real-Time OS" "$LOG_BOCHS" && \
-   grep -q "Found USB xHCI Controller" "$LOG_BOCHS" && \
-   grep -q "Bound USB Keyboard" "$LOG_BOCHS" && \
-   grep -q "Bound USB Mouse" "$LOG_BOCHS" && \
-   grep -q "=== GEMIOS RTOS Interactive Console Ready ===" "$LOG_BOCHS"; then
-    echo "[+] PASSED: Bochs xHCI USB Boot loaded gemios.elf and initialized USB Mass Storage, Keyboard, and Mouse on xHCI."
+   grep -q "Oksinix x86 32-bit Kernel" "$LOG_BOCHS" && \
+   grep -q "\[XHCI\] Host controller running" "$LOG_BOCHS" && \
+   grep -q "\[XHCI\] USB Mass Storage initialized" "$LOG_BOCHS" && \
+   grep -q "\[XHCI\] USB Keyboard initialized" "$LOG_BOCHS" && \
+   grep -q "\[XHCI\] USB Mouse initialized" "$LOG_BOCHS" && \
+   grep -q "\[/bin/sh\] Interactive shell ready" "$LOG_BOCHS"; then
+    echo "[+] PASSED: Bochs xHCI USB Boot loaded gemios.elf (Oksinix) and initialized USB Mass Storage, Keyboard, and Mouse on xHCI."
 else
-    echo "[-] FAILED: Bochs xHCI USB Boot log did not contain expected GEMIOS banner!"
+    echo "[-] FAILED: Bochs xHCI USB Boot log did not contain expected Oksinix banner!"
     if [ -f "$LOG_BOCHS" ]; then
         echo "=== Serial Output Log ==="
         cat "$LOG_BOCHS"

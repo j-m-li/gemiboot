@@ -448,7 +448,7 @@ gdt_data16_segment:
     .word 0x0000
     .byte 0x01
     .byte 0b10010010
-    .byte 0b00000000
+    .byte 0b10001111
     .byte 0x00
 gdt_end:
 

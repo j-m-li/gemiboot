@@ -165,6 +165,7 @@ efi64: $(BOOTX64_EFI)
 # Bootable Disk Image Target
 $(DISK_IMG): $(MKDISK) $(MBR_BIN) $(VBR_BIN) $(IOSYS_BIN) $(BOOTIA32_EFI) $(BOOTX64_EFI) $(KERNEL_ELF)
 	$(MKDISK) $(DISK_IMG) $(MBR_BIN) $(VBR_BIN) $(IOSYS_BIN) $(BOOTIA32_EFI) $(BOOTX64_EFI) $(KERNEL_ELF)
+	mcopy ./oksinix/user/linux_hello.elf -i build/gemiboot.img ::l.elf
 	@echo "[DISK] Created bootable image $(DISK_IMG)"
 
 disk: $(DISK_IMG)
@@ -174,7 +175,6 @@ run-bios: $(DISK_IMG)
 	./run-qemu.sh --bios
 
 run-uefi64: $(DISK_IMG)
-	mcopy ./oksinix/user/linux_hello.elf -i build/gemiboot.img ::l.elf
 	./run-qemu.sh --uefi64
 
 run-uefi32: $(DISK_IMG)
