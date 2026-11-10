@@ -43,10 +43,10 @@ $(MKDISK): tools/mkdisk.c
 	@echo "[HOST_CC] $< -> $@"
 
 # Kernel acquisition
-$(KERNEL_ELF):
+$(KERNEL_ELF): ./oksinix/oksinix.elf
 	@mkdir -p $(BUILD_DIR)
-	@if [ -f /home/jml/src/gemios/build/gemios.elf ]; then \
-		cp -f /home/jml/src/gemios/build/gemios.elf $(KERNEL_ELF); \
+	@if [ -f ./oksinix/oksinix.elf ]; then \
+		cp -f ./oksinix/oksinix.elf $(KERNEL_ELF); \
 	elif [ -d /home/jml/src/gemios ]; then \
 		make -C /home/jml/src/gemios; \
 		cp -f /home/jml/src/gemios/build/gemios.elf $(KERNEL_ELF); \
@@ -174,6 +174,7 @@ run-bios: $(DISK_IMG)
 	./run-qemu.sh --bios
 
 run-uefi64: $(DISK_IMG)
+	mcopy ./oksinix/user/linux_hello.elf -i build/gemiboot.img ::l.elf
 	./run-qemu.sh --uefi64
 
 run-uefi32: $(DISK_IMG)

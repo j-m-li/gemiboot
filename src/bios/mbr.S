@@ -10,6 +10,65 @@
 .global _start
 
 _start:
+    jmp bypass
+    nop
+.org 0x03
+oem_id:
+    .ascii "GEMIBOOT"
+.org 0x0B
+    .word 512       # Bytes per sector
+.org 0x0D
+    .byte 4         # Sectors per cluster
+.org 0x0E
+    .word 2080      # Reserved sectors (PARTITION_START_LBA + 32)
+.org 0x10
+    .byte 2         # Number of FATs
+.org 0x11
+    .word 0         # Root directory entries
+.org 0x13
+    .word 0         # Total sectors 16
+.org 0x15
+    .byte 0xF8      # Media descriptor
+.org 0x16
+    .word 0         # FAT size 16
+.org 0x18
+    .word 63        # Sectors per track
+.org 0x1A
+    .word 255       # Number of heads
+.org 0x1C
+    .long 0         # Hidden sectors
+.org 0x20
+    .long 0         # Total sectors 32
+
+.org 0x24
+    .long 0         # FAT size 32
+.org 0x28
+    .word 0         # Flags
+.org 0x2A
+    .word 0x0000    # FAT version
+.org 0x2C
+    .long 2         # Root directory cluster
+.org 0x30
+    .word 2049      # FSInfo sector
+.org 0x32
+    .word 6         # Backup boot sector
+.org 0x34
+    .long 0, 0, 0   # Reserved
+.org 0x40
+    .byte 0x80      # Drive number
+.org 0x41
+    .byte 0         # Reserved
+.org 0x42
+    .byte 0x29      # Extended boot signature
+.org 0x43
+    .long 0x12345678 # Volume serial number
+.org 0x47
+    .ascii "GEMIBOOT   " # Volume label
+.org 0x52
+    .ascii "FAT32   "    # System identifier
+
+.org 0x5A
+bypass:
     # 1. Normalize CS:IP to 0x0000:0x7C00
     ljmp $0x0000, $norm_cs
 

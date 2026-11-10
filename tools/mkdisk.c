@@ -190,14 +190,18 @@ static int add_dir_entry(uint32_t dir_clus, const char *name, uint8_t attr, uint
                 if ((uint8_t)entries[e].name[0] == 0x00 || (uint8_t)entries[e].name[0] == 0xE5) {
                     char o_name[8], o_ext[3];
                     format_83(name, o_name, o_ext);
+                    memset(&entries[e], 0, sizeof(struct fat_dir_entry));
                     memcpy(entries[e].name, o_name, 8);
                     memcpy(entries[e].ext, o_ext, 3);
                     entries[e].attr = attr;
                     entries[e].fst_clus_hi = (uint16_t)(first_clus >> 16);
                     entries[e].fst_clus_lo = (uint16_t)(first_clus & 0xFFFF);
                     entries[e].file_size = size;
-                    entries[e].wdate = 0x5821; /* 2024 */
-                    entries[e].wtime = 0x6000;
+                    entries[e].cdate = 0x5821; /* 2024-01-01 */
+                    entries[e].ctime = 0x6000; /* 12:00:00 */
+                    entries[e].adate = 0x5821;
+                    entries[e].wdate = 0x5821; /* 2024-01-01 */
+                    entries[e].wtime = 0x6000; /* 12:00:00 */
                     return 0;
                 }
             }
@@ -293,9 +297,11 @@ int main(int argc, char *argv[]) {
     uint32_t ia32_sz = 0, x64_sz = 0, kernel_sz = 0;
 
     struct mbr_entry *mbr_part;
+    struct fat32_bpb *mbr_bpb;
     struct fat32_bpb *bpb;
     struct fat32_fsinfo *fsinfo;
     uint32_t data_sectors;
+    uint32_t total_clusters;
     uint32_t efi_clus, boot_clus;
     FILE *out_f;
 
@@ -366,6 +372,39 @@ int main(int argc, char *argv[]) {
     /* Calculate FAT size in sectors */
     g_fat_size = ((data_sectors / SEC_PER_CLUS * 4) + SECTOR_SIZE - 1) / SECTOR_SIZE;
     g_data_start = g_fat_start + (NUM_FATS * g_fat_size);
+    total_clusters = (PARTITION_SECTORS - RSVD_SEC_CNT - (NUM_FATS * g_fat_size)) / SEC_PER_CLUS;
+
+    /* Populate hybrid FAT32 BPB in Sector 0 (MBR) for direct mtools (-i image.img) compatibility */
+    mbr_bpb = (struct fat32_bpb*)get_sector(0);
+    mbr_bpb->jmp_boot[0] = 0xEB;
+    mbr_bpb->jmp_boot[1] = 0x58;
+    mbr_bpb->jmp_boot[2] = 0x90;
+    memcpy(mbr_bpb->oem_name, "GEMIBOOT", 8);
+    mbr_bpb->bytes_per_sec = SECTOR_SIZE;
+    mbr_bpb->sec_per_clus = SEC_PER_CLUS;
+    mbr_bpb->rsvd_sec_cnt = (uint16_t)(PARTITION_START_LBA + RSVD_SEC_CNT);
+    mbr_bpb->num_fats = NUM_FATS;
+    mbr_bpb->root_ent_cnt = 0;
+    mbr_bpb->tot_sec_16 = 0;
+    mbr_bpb->media = 0xF8;
+    mbr_bpb->fat_sz_16 = 0;
+    mbr_bpb->sec_per_trk = 63;
+    mbr_bpb->num_heads = 255;
+    mbr_bpb->hidd_sec = 0;
+    mbr_bpb->tot_sec_32 = TOTAL_SECTORS;
+    mbr_bpb->fat_sz_32 = g_fat_size;
+    mbr_bpb->ext_flags = 0;
+    mbr_bpb->fs_ver = 0;
+    mbr_bpb->root_clus = ROOT_CLUS;
+    mbr_bpb->fs_info = (uint16_t)(PARTITION_START_LBA + 1);
+    mbr_bpb->bk_boot_sec = 6;
+    memset(mbr_bpb->reserved, 0, sizeof(mbr_bpb->reserved));
+    mbr_bpb->drv_num = 0x80;
+    mbr_bpb->reserved1 = 0;
+    mbr_bpb->boot_sig = 0x29;
+    mbr_bpb->vol_id = 0x12345678;
+    memcpy(mbr_bpb->vol_lab, "GEMIBOOT   ", 11);
+    memcpy(mbr_bpb->fil_sys_type, "FAT32   ", 8);
 
     /* Write VBR to PARTITION_START_LBA */
     memcpy(get_sector(PARTITION_START_LBA), vbr_data, vbr_sz < SECTOR_SIZE ? vbr_sz : SECTOR_SIZE);
@@ -385,10 +424,14 @@ int main(int argc, char *argv[]) {
     bpb->hidd_sec = PARTITION_START_LBA;
     bpb->tot_sec_32 = PARTITION_SECTORS;
     bpb->fat_sz_32 = g_fat_size;
+    bpb->ext_flags = 0;
+    bpb->fs_ver = 0;
     bpb->root_clus = ROOT_CLUS;
     bpb->fs_info = 1;
     bpb->bk_boot_sec = 6;
+    memset(bpb->reserved, 0, sizeof(bpb->reserved));
     bpb->drv_num = 0x80;
+    bpb->reserved1 = 0;
     bpb->boot_sig = 0x29;
     bpb->vol_id = 0x12345678;
     memcpy(bpb->vol_lab, "GEMIBOOT   ", 11);
@@ -403,15 +446,11 @@ int main(int argc, char *argv[]) {
     fsinfo->nxt_free = 0xFFFFFFFF;
     fsinfo->trail_sig = 0xAA550000;
 
-    /* Backup boot sector at sector 6 and FSInfo at sector 7 */
-    memcpy(get_sector(PARTITION_START_LBA + 6), get_sector(PARTITION_START_LBA), SECTOR_SIZE);
-    memcpy(get_sector(PARTITION_START_LBA + 7), get_sector(PARTITION_START_LBA + 1), SECTOR_SIZE);
-
-    /* Also copy IO.SYS right after VBR in the reserved sectors (LBA 2049 onwards) */
+    /* Copy IO.SYS into reserved sectors after backup boot/FSInfo sectors (sector 8 onwards) */
     {
         uint32_t io_sec_count = (io_sys_sz + SECTOR_SIZE - 1) / SECTOR_SIZE;
-        if (2 + io_sec_count < RSVD_SEC_CNT) {
-            memcpy(get_sector(PARTITION_START_LBA + 2), io_sys_data, io_sys_sz);
+        if (8 + io_sec_count <= RSVD_SEC_CNT) {
+            memcpy(get_sector(PARTITION_START_LBA + 8), io_sys_data, io_sys_sz);
         }
     }
 
@@ -421,6 +460,9 @@ int main(int argc, char *argv[]) {
     fat32_set_fat_entry(ROOT_CLUS, 0x0FFFFFFF); /* Root dir */
 
     /* 3. Populate FAT32 filesystem */
+    /* Add Volume Label entry to root directory */
+    add_dir_entry(ROOT_CLUS, "GEMIBOOT", ATTR_VOLUME_ID, 0, 0);
+
     /* Add IO.SYS to root directory */
     write_file_data(ROOT_CLUS, "IO.SYS", io_sys_data, io_sys_sz);
 
@@ -434,6 +476,16 @@ int main(int argc, char *argv[]) {
     /* Copy EFI boot loaders */
     write_file_data(boot_clus, "BOOTIA32.EFI", ia32_data, ia32_sz);
     write_file_data(boot_clus, "BOOTX64.EFI", x64_data, x64_sz);
+
+    /* Update FSInfo free cluster count and next free cluster */
+    fsinfo->free_count = total_clusters - (g_next_free_clus - ROOT_CLUS);
+    fsinfo->nxt_free = g_next_free_clus;
+
+    /* Backup boot sector at sector 6 and FSInfo at sector 7 */
+    memcpy(get_sector(6), get_sector(0), SECTOR_SIZE);
+    memcpy(get_sector(7), get_sector(PARTITION_START_LBA + 1), SECTOR_SIZE);
+    memcpy(get_sector(PARTITION_START_LBA + 6), get_sector(PARTITION_START_LBA), SECTOR_SIZE);
+    memcpy(get_sector(PARTITION_START_LBA + 7), get_sector(PARTITION_START_LBA + 1), SECTOR_SIZE);
 
     printf("[MKDISK] Written files:\n");
     printf("  - MBR (Sector 0)\n");

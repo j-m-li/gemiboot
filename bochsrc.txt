@@ -1,0 +1,31 @@
+# GEMIBOOT - Bochs Virtual Machine Configuration
+# Dedicated to the Public Domain (CC0)
+# Boot media: USB Drive attached to xHCI (USB 3.0 Extensible Host Controller)
+
+# Display library (GUI): x, term, or nogui
+display_library: x
+
+# BIOS and VGA ROM images (i440fx.bin with xHCI USB boot support)
+romimage: file=/usr/share/bochs/i440fx.bin, options=fastboot
+vgaromimage: file=/usr/share/bochs/VGABIOS-lgpl-latest.bin
+
+# CPU and Memory
+cpu: count=1, ips=50000000, reset_on_triple_fault=1
+memory: guest=256, host=256
+
+# PCI and Video Extensions
+pci: enabled=1, chipset=i440fx, slot1=usb_xhci
+vga: extension=vbe
+mouse: enabled=1
+clock: sync=none, time0=local
+
+# USB xHCI Controller with Bootable USB Drive, Keyboard, and Mouse
+plugin_ctrl: usb_xhci=1
+usb_xhci: enabled=1, model=uPD720202, n_ports=6, port1=disk, options1="speed:super, proto:bbb, path:build/gemiboot.img", port5=keyboard, port6=mouse
+
+# Boot from USB drive
+boot: usb
+
+# Serial COM1 output
+com1: enabled=1, mode=file, dev="build/bochs_com1.log"
+log: build/bochs.log

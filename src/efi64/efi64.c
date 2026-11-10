@@ -11,7 +11,7 @@
 
 #define MULTIBOOT_INFO_ADDR 0x00095000
 #define MMAP_BUFFER_ADDR    0x00008000
-#define KERNEL_TEMP_ADDR    0x00200000
+#define KERNEL_TEMP_ADDR    0x01000000
 #define UEFI_MMAP_BUF_SIZE  0x10000
 
 extern uint8_t trampoline_32_start[];

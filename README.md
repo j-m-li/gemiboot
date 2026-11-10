@@ -2,6 +2,9 @@
 
 agy
 
+![oksinix](screen.png)
+
+
 Public domain [CC0](LICENSE.txt) multiboot complient boot loader written in GNU x86 assembly and strict C90 complied by clang. 
 Supports UEFI 32 bit and 64 bit startup and old fashion BIOS.
 Provides multiboot 1 memory map (1) and framebuffer (12) information.

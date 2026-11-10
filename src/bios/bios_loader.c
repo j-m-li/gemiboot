@@ -28,7 +28,7 @@ struct mbr_part_entry {
 };
 #pragma pack(pop)
 
-#define KERNEL_LOAD_TEMP_ADDR 0x00200000
+#define KERNEL_LOAD_TEMP_ADDR 0x01000000
 #define MULTIBOOT_INFO_ADDR   0x00095000
 #define MMAP_BUFFER_ADDR      0x00008000
 #define GFX_INFO_BUFFER_ADDR  0x00009000
