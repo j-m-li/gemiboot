@@ -220,14 +220,16 @@ def main():
             wait_for_serial(serial_log_path, "fat32-write-ok")
             print("[PASS] 4/9 FAT32 file creation, 'cp', cluster allocation, write & readback ('/mnt/TEST.TXT', '/mnt/COPY.TXT') verified")
 
-            # 5. Test modal 'vi' editor: open '/mnt/VITEST.TXT', enter insert mode ('i'), type text, ESC, ':wq'
+            # 5. Test modal 'vi' editor: insert, visual 'v' + 'y' + 'p', join 'J', 'yy' + 'p', ':wq'
             send_keys_str(sock, "vi /mnt/VITEST.TXT\n")
             time.sleep(0.25)
-            send_keys_str(sock, "iEdited with Oksinix vi!\x1b:wq\n")
+            send_keys_str(sock, "iEdited with Oksinix vi!\nLine2\x1b0vlllyllllpkJyyp:wq\n")
             wait_for_serial(serial_log_path, '[VI] saved "/mnt/VITEST.TXT"')
             send_keys_str(sock, "cat /mnt/VITEST.TXT\n")
-            wait_for_serial(serial_log_path, "Edited with Oksinix vi!")
-            print("[PASS] 5/8 Modal 'vi' text editor (Normal -> Insert -> Command ':wq') saved to FAT32 '/mnt/VITEST.TXT'")
+            serial_out = wait_for_serial(serial_log_path, "Edited with Oksinix vi! Line2Line")
+            if serial_out.count("Edited with Oksinix vi! Line2Line") < 2:
+                raise RuntimeError("Expected 'yy' + 'p' to duplicate joined line in /mnt/VITEST.TXT")
+            print("[PASS] 5/11 Modal 'vi' editor (Insert, Visual 'v', 'y'/'yy', 'p', 'J', ':wq') verified on FAT32")
 
             # 6. Verify raw /dev/sda and /dev/sdb reading via xHCI USB Mass Storage (SCSI READ 10)
             send_keys_str(sock, "cat /dev/sda\n")

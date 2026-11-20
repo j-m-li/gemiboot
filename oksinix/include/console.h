@@ -9,8 +9,10 @@
 
 #include "types.h"
 
-#define CON_COLS 75
-#define CON_ROWS 33
+#define CON_COLS   80
+#define CON_ROWS   25
+#define CON_CELL_W 8
+#define CON_CELL_H 14
 
 void console_init(void);
 void console_clear(void);
@@ -20,6 +22,7 @@ void console_puts(const char *s);
 void console_set_cursor(int32_t col, int32_t row);
 void console_put_at(int32_t col, int32_t row, char c);
 void console_puts_at(int32_t col, int32_t row, const char *s);
+void console_set_highlight(int32_t col, int32_t row, bool_t highlight);
 void console_clear_row(int32_t row);
 void console_save_screen(void);
 void console_restore_screen(void);

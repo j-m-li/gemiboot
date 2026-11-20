@@ -15,7 +15,7 @@ A 32-bit x86 operating system kernel written in strict ISO C90 (`-std=c89 -pedan
   - 8254 Programmable Interval Timer (`pit.c`) running at 1000 Hz (`IRQ0`) with hardware-latched sub-millisecond `pit_udelay` / `pit_mdelay` delays
 - **VBE / UEFI GOP Linear Framebuffer & VGA Mode 12h 640x480 (`drivers/vga.c`, `drivers/console.c`)**:
   - Automatically detects Multiboot v1 VESA VBE / EFI GOP Linear Framebuffer (`32/24/16-bpp` RGB) when booted via GRUB on real GPUs/monitors, with seamless fallback to direct VGA Mode 12h (`640x480x16` 4-plane planar at `0xA0000`)
-  - Dirty-scanline double-buffered rendering (`vga_present`), 8x8 ASCII bitmap font, graphical console terminal (`75x33` character grid), and software mouse cursor sprite
+  - Dirty-scanline double-buffered rendering (`vga_present`), 8x8 ASCII bitmap font, graphical console terminal (`80x25` character grid), and software mouse cursor sprite
 - **8042 PS/2 Controller, Keyboard & Mouse (`drivers/ps2.c`, `drivers/keyboard.c`, `drivers/mouse.c`)**:
   - Dual-port 8042 PS/2 initialization with controller self-test (`0xAA`), configuration restoration, and bus-paced timeouts
   - IRQ1 PS/2 Keyboard driver with US QWERTY Scancode Set 1 translation, Shift/Ctrl/Alt/CapsLock tracking, and event ring buffer

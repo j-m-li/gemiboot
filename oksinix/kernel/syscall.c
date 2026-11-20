@@ -1869,8 +1869,8 @@ void syscall_dispatch(struct isr_regs *regs)
             struct linux_winsize *ws = (struct linux_winsize *)(uintptr_t)arg3;
             ws->ws_row    = CON_ROWS;
             ws->ws_col    = CON_COLS;
-            ws->ws_xpixel = (uint16_t)(CON_COLS * 8);
-            ws->ws_ypixel = (uint16_t)(CON_ROWS * 10);
+            ws->ws_xpixel = (uint16_t)(CON_COLS * CON_CELL_W);
+            ws->ws_ypixel = (uint16_t)(CON_ROWS * CON_CELL_H);
             ret = 0;
         } else if (req == LINUX_TCGETS && arg3 != 0) {
             memset((void *)(uintptr_t)arg3, 0, 36);

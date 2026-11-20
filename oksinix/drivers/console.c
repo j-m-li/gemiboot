@@ -12,6 +12,7 @@
 #include "string.h"
 
 static char     con_grid[CON_ROWS][CON_COLS + 1];
+static uint8_t  con_hl[CON_ROWS][CON_COLS];
 static char     con_saved_grid[CON_ROWS][CON_COLS + 1];
 static int32_t  con_col = 0;
 static int32_t  con_row = 0;
@@ -73,9 +74,11 @@ static void console_scroll(void)
     int32_t r;
     for (r = 0; r < CON_ROWS - 1; r++) {
         memcpy(con_grid[r], con_grid[r + 1], CON_COLS + 1);
+        memcpy(con_hl[r], con_hl[r + 1], CON_COLS);
     }
     memset(con_grid[CON_ROWS - 1], ' ', CON_COLS);
     con_grid[CON_ROWS - 1][CON_COLS] = '\0';
+    memset(con_hl[CON_ROWS - 1], 0, CON_COLS);
     con_row = CON_ROWS - 1;
 }
 
@@ -85,6 +88,7 @@ void console_clear(void)
     for (r = 0; r < CON_ROWS; r++) {
         memset(con_grid[r], ' ', CON_COLS);
         con_grid[r][CON_COLS] = '\0';
+        memset(con_hl[r], 0, CON_COLS);
     }
     con_col = 0;
     con_row = 0;
@@ -186,11 +190,19 @@ void console_puts_at(int32_t col, int32_t row, const char *s)
     }
 }
 
+void console_set_highlight(int32_t col, int32_t row, bool_t highlight)
+{
+    if (row >= 0 && row < CON_ROWS && col >= 0 && col < CON_COLS) {
+        con_hl[row][col] = highlight ? 1U : 0U;
+    }
+}
+
 void console_clear_row(int32_t row)
 {
     if (row >= 0 && row < CON_ROWS) {
         memset(con_grid[row], ' ', CON_COLS);
         con_grid[row][CON_COLS] = '\0';
+        memset(con_hl[row], 0, CON_COLS);
     }
 }
 
@@ -204,6 +216,7 @@ void console_save_screen(void)
 void console_restore_screen(void)
 {
     memcpy(con_grid, con_saved_grid, sizeof(con_grid));
+    memset(con_hl, 0, sizeof(con_hl));
     con_col = con_saved_col;
     con_row = con_saved_row;
 }
@@ -239,27 +252,30 @@ void console_refresh(void)
     vga_draw_string(10, 5, "OKSINIX x86-32 C90 Kernel (CC0) - VGA 640x480 Mode 12h",
                     COLOR_YELLOW, COLOR_DARK_GRAY, TRUE);
 
-    /* Terminal window (/dev/console - /bin/init & /bin/sh) */
-    vga_fill_rect(10, 24, 620, 366, COLOR_BLACK);
-    vga_draw_rect(10, 24, 620, 366, COLOR_LIGHT_CYAN);
-    vga_fill_rect(11, 25, 618, 14, COLOR_CYAN);
-    vga_draw_string(16, 28, "/dev/console - Virtual Filesystem (/dev, /bin/init, /bin/sh)",
-                    COLOR_BLACK, COLOR_CYAN, TRUE);
+    /* Borderless 80x25 console window (/dev/console - full 640px width) */
+    vga_fill_rect(0, 19, VGA_WIDTH, 377, COLOR_BLACK);
 
-    /* Render terminal character grid (75 cols x 33 rows) */
+    /* Render terminal character grid (80 cols x 25 rows) */
     for (r = 0; r < CON_ROWS; r++) {
-        int32_t py = 44 + r * 10;
+        int32_t py = 24 + r * CON_CELL_H;
         for (c = 0; c < CON_COLS; c++) {
+            int32_t px = c * CON_CELL_W;
             char ch = con_grid[r][c];
-            if (ch != ' ' && ch != '\0') {
-                vga_draw_char(16 + c * 8, py, ch, COLOR_LIGHT_GREEN, COLOR_BLACK, TRUE);
+            if (con_hl[r][c] != 0) {
+                vga_fill_rect(px, py, CON_CELL_W, 9, COLOR_LIGHT_GREEN);
+                if (ch != ' ' && ch != '\0') {
+                    vga_draw_char(px, py, ch, COLOR_BLACK, COLOR_LIGHT_GREEN, FALSE);
+                }
+            } else if (ch != ' ' && ch != '\0') {
+                vga_draw_char(px, py, ch, COLOR_LIGHT_GREEN, COLOR_BLACK, TRUE);
             }
         }
     }
 
     /* Terminal text cursor */
     if (con_row >= 0 && con_row < CON_ROWS && con_col >= 0 && con_col < CON_COLS) {
-        vga_fill_rect(16 + con_col * 8, 44 + con_row * 10 + 7, 7, 2, COLOR_LIGHT_GREEN);
+        vga_fill_rect(con_col * CON_CELL_W, 24 + con_row * CON_CELL_H + 8,
+                      CON_CELL_W - 1, 2, COLOR_LIGHT_GREEN);
     }
 
     /* Hardware & VFS Status Panel */
