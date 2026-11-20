@@ -199,17 +199,21 @@ def main():
             wait_for_serial(serial_log_path, "PIT ticks @ 1000 Hz)")
             print("[PASS] 2/9 xHCI USB Keyboard (Swiss French fr_CH QWERTZ keymap), 'lsusb', 'keymap' & 'uptime' in /bin/sh")
 
-            # 3. Verify FAT32 directory listing ('ls /mnt') and reading files ('cat /mnt/README.TXT', 'cat /mnt/DOCS/NOTES.TXT')
+            # 3. Verify FAT32 directory listing ('ls /mnt', 'ls /mnt/DOCS') and reading 8.3 & LFN files
             send_keys_str(sock, "ls /mnt\n")
             wait_for_serial(serial_log_path, "-rw-r--r--  README.TXT")
             wait_for_serial(serial_log_path, "drwxr-xr-x  DOCS/")
             send_keys_str(sock, "cat /mnt/README.TXT\n")
             wait_for_serial(serial_log_path, "Oksinix FAT32 filesystem on USB Mass Storage (/dev/sda1 -> /mnt)")
+            send_keys_str(sock, "ls /mnt/DOCS\n")
+            wait_for_serial(serial_log_path, "-rw-r--r--  Long_Filename_Example.txt")
             send_keys_str(sock, "cat /mnt/DOCS/NOTES.TXT\n")
             wait_for_serial(serial_log_path, "Subdirectory file inside FAT32 /mnt/DOCS/NOTES.TXT")
-            print("[PASS] 3/8 FAT32 directory traversal ('ls /mnt') & file reads ('/mnt/README.TXT', '/mnt/DOCS/NOTES.TXT')")
+            send_keys_str(sock, "cat /mnt/DOCS/Long_Filename_Example.txt\n")
+            wait_for_serial(serial_log_path, "FAT32 Long File Name (VFAT LFN) read test passed!")
+            print("[PASS] 3/11 FAT32 8.3 & VFAT LFN directory listing & file reads verified")
 
-            # 4. Verify FAT32 file creation, cluster allocation, 'cp' & write ('echo fat32-write-ok > /mnt/TEST.TXT')
+            # 4. Verify FAT32 file creation, LFN create/mkdir/write, cluster allocation, 'cp' & readback
             send_keys_str(sock, "echo fat32-write-ok > /mnt/TEST.TXT\n")
             time.sleep(0.2)
             send_keys_str(sock, "cat /mnt/TEST.TXT\n")
@@ -218,7 +222,15 @@ def main():
             time.sleep(0.2)
             send_keys_str(sock, "cat /mnt/COPY.TXT\n")
             wait_for_serial(serial_log_path, "fat32-write-ok")
-            print("[PASS] 4/9 FAT32 file creation, 'cp', cluster allocation, write & readback ('/mnt/TEST.TXT', '/mnt/COPY.TXT') verified")
+            send_keys_str(sock, "mkdir /mnt/LongDirectoryName\n")
+            time.sleep(0.2)
+            send_keys_str(sock, "echo lfn-write-ok > /mnt/LongDirectoryName/MyLongFileNameTest.txt\n")
+            time.sleep(0.2)
+            send_keys_str(sock, "ls /mnt/LongDirectoryName\n")
+            wait_for_serial(serial_log_path, "-rw-r--r--  MyLongFileNameTest.txt")
+            send_keys_str(sock, "cat /mnt/LongDirectoryName/MyLongFileNameTest.txt\n")
+            wait_for_serial(serial_log_path, "lfn-write-ok")
+            print("[PASS] 4/11 FAT32 8.3 & VFAT LFN file/directory creation, 'cp', write & readback verified")
 
             # 5. Test modal 'vi' editor: insert, visual 'v' + 'y' + 'p', join 'J', 'yy' + 'p', ':wq'
             send_keys_str(sock, "vi /mnt/VITEST.TXT\n")

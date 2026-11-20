@@ -9,8 +9,8 @@
 
 #include "types.h"
 
-#define VFS_MAX_NAME    32
-#define VFS_MAX_PATH    128
+#define VFS_MAX_NAME    128
+#define VFS_MAX_PATH    256
 #define VFS_MAX_NODES   64
 #define VFS_MAX_FDS     32
 #define VFS_MAX_FILE_SZ 512

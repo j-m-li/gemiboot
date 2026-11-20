@@ -18,6 +18,40 @@ def make_dirent_83(name83, attr, cluster, size):
     return entry
 
 
+def lfn_checksum(name83):
+    s = 0
+    for b in name83:
+        s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
+    return s
+
+
+def make_dirent_lfn(long_name, name83, attr, cluster, size):
+    chk = lfn_checksum(name83)
+    char_offs = (1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+    n_lfn = (len(long_name) + 12) // 13
+    out = bytearray()
+    for i in range(n_lfn):
+        seq = n_lfn - i
+        ent = bytearray(32)
+        ent[0] = seq | (0x40 if i == 0 else 0x00)
+        ent[11] = 0x0F
+        ent[12] = 0x00
+        ent[13] = chk
+        chunk_start = (seq - 1) * 13
+        for j, off in enumerate(char_offs):
+            idx = chunk_start + j
+            if idx < len(long_name):
+                code = ord(long_name[idx])
+            elif idx == len(long_name):
+                code = 0x0000
+            else:
+                code = 0xFFFF
+            struct.pack_into("<H", ent, off, code)
+        out.extend(ent)
+    out.extend(make_dirent_83(name83, attr, cluster, size))
+    return out
+
+
 def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", shlib_so_bytes=b""):
     part = bytearray(part_sectors * 512)
 
@@ -79,6 +113,7 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
         0x0FFFFFFF,  # Cluster 4: HELLO.TXT
         0x0FFFFFFF,  # Cluster 5: DOCS directory
         0x0FFFFFFF,  # Cluster 6: DOCS/NOTES.TXT
+        0x0FFFFFFF,  # Cluster 7: DOCS/Long_Filename_Example.txt
     ]
     def alloc_chain(blob):
         if not blob:
@@ -112,6 +147,7 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
     readme_bytes = b"Oksinix FAT32 filesystem on USB Mass Storage (/dev/sda1 -> /mnt)\n"
     hello_bytes = b"Hello from FAT32 on Oksinix!\n"
     notes_bytes = b"Subdirectory file inside FAT32 /mnt/DOCS/NOTES.TXT\n"
+    lfn_doc_bytes = b"FAT32 Long File Name (VFAT LFN) read test passed!\n"
 
     # Populate Cluster 2 (Root Directory)
     root_dir = bytearray(512)
@@ -142,10 +178,15 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
     docs_dir[0:32] = make_dirent_83(b".          ", 0x10, 5, 0)
     docs_dir[32:64] = make_dirent_83(b"..         ", 0x10, 0, 0)
     docs_dir[64:96] = make_dirent_83(b"NOTES   TXT", 0x20, 6, len(notes_bytes))
+    lfn_ents = make_dirent_lfn("Long_Filename_Example.txt", b"LONG_F~1TXT", 0x20, 7, len(lfn_doc_bytes))
+    docs_dir[96:96 + len(lfn_ents)] = lfn_ents
     part[clus_off(5):clus_off(5) + 512] = docs_dir
 
     # Populate Cluster 6 (DOCS/NOTES.TXT)
     part[clus_off(6):clus_off(6) + len(notes_bytes)] = notes_bytes
+
+    # Populate Cluster 7 (DOCS/Long_Filename_Example.txt)
+    part[clus_off(7):clus_off(7) + len(lfn_doc_bytes)] = lfn_doc_bytes
 
     # Populate Clusters for LINUX.ELF, DYN.ELF, and LIBTEST.SO
     if linux_elf_bytes:

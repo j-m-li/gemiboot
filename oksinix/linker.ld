@@ -17,12 +17,12 @@ SECTIONS
         *(.text*)
     }
 
-    .rodata : ALIGN(4K)
+    .rodata : ALIGN(16)
     {
         *(.rodata*)
     }
 
-    .data : ALIGN(4K)
+    .data : ALIGN(16)
     {
         *(.data*)
     }
