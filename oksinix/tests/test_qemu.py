@@ -157,6 +157,7 @@ def main():
             # 1. Verify boot, ACPI RSDP/RSDT & ACPI memory map, PIT timer, PS/2 self-test, VGA 640x480, PCI xHCI, USB Hub, and FAT32
             wait_for_serial(serial_log_path, "[BOOT] Multiboot v1 magic verified")
             wait_for_serial(serial_log_path, "[ACPI] RSDP")
+            wait_for_serial(serial_log_path, "[ACPI] S5 poweroff ready")
             wait_for_serial(serial_log_path, "[ACPI-MMAP] #0:")
             wait_for_serial(serial_log_path, "[ACPI-MMAP] Source: ACPI E820 (INT 15h)")
             wait_for_serial(serial_log_path, "[PIT] 8254 timer initialized at 1000 Hz")
@@ -262,16 +263,29 @@ def main():
             # 9. Dump rendered VGA 640x480 framebuffer from QEMU and verify dimensions & colors
             send_hmp_cmd(sock, f"screendump {ppm_path}", delay=0.25)
             w, h, num_colors = verify_ppm_screendump(ppm_path)
-            print(f"[PASS] 9/10 VGA Framebuffer screendump verified ({w}x{h}, {num_colors} active palette colors)")
+            print(f"[PASS] 9/11 VGA Framebuffer screendump verified ({w}x{h}, {num_colors} active palette colors)")
+
+            # 10. Test ACPI S5 'shutdown' command powers off the QEMU VM cleanly
+            send_keys_str(sock, "shutdown\n")
+            serial_out = wait_for_serial(serial_log_path, "[ACPI] Entering S5 soft-off")
+            rc = proc.wait(timeout=5)
+            if rc != 0:
+                raise RuntimeError(f"Expected QEMU exit code 0 after ACPI shutdown, got {rc}")
+            with open(serial_log_path, "r", errors="replace") as f:
+                serial_out = f.read()
+            if "[ACPI] ACPI S5 fallback poweroff" in serial_out:
+                raise RuntimeError("ACPI S5 fell back instead of powering off via FADT/DSDT _S5")
+            print("[PASS] 10/11 ACPI S5 'shutdown' command cleanly powered off VM (exit=0)")
 
             sock.close()
 
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
         # 9. Verify Multiboot v1 ELF boot (-kernel oksinix.elf) and Multiboot info parsing
         if os.path.exists(kernel_elf_path):

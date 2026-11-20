@@ -5,7 +5,9 @@
  */
 
 #include "acpi.h"
+#include "io.h"
 #include "multiboot.h"
+#include "pit.h"
 #include "serial.h"
 #include "string.h"
 
@@ -20,6 +22,15 @@ static char                   acpi_oem[7];
 static uint8_t                acpi_rev   = 0;
 static struct acpi_table_desc acpi_tables[ACPI_MAX_TABLES];
 static int                    num_acpi_tables = 0;
+
+/* ACPI Power Management (FADT + DSDT _S5) state */
+static uint32_t               acpi_smi_cmd    = 0;
+static uint8_t                acpi_enable_val = 0;
+static uint32_t               acpi_pm1a_cnt   = 0;
+static uint32_t               acpi_pm1b_cnt   = 0;
+static uint16_t               acpi_slp_typa   = 0;
+static uint16_t               acpi_slp_typb   = 0;
+static bool_t                 acpi_s5_valid   = FALSE;
 
 static struct acpi_mmap_entry mmap_table[ACPI_MAX_MMAP];
 static int                    num_mmap_entries = 0;
@@ -86,6 +97,135 @@ static void record_acpi_table(const char *sig4, uint32_t phys_addr, uint32_t len
     num_acpi_tables++;
 }
 
+static uint32_t parse_aml_integer(const uint8_t *p, const uint8_t *end, uint16_t *out_val)
+{
+    if (p >= end) {
+        return 0;
+    }
+    if (p[0] == 0x00U) {
+        *out_val = 0U;
+        return 1U;
+    }
+    if (p[0] == 0x01U) {
+        *out_val = 1U;
+        return 1U;
+    }
+    if (p[0] == 0x0AU) {
+        if (p + 2 > end) {
+            return 0;
+        }
+        *out_val = (uint16_t)p[1];
+        return 2U;
+    }
+    if (p[0] == 0x0BU) {
+        if (p + 3 > end) {
+            return 0;
+        }
+        *out_val = (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+        return 3U;
+    }
+    if (p[0] == 0x0CU) {
+        if (p + 5 > end) {
+            return 0;
+        }
+        *out_val = (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+        return 5U;
+    }
+    return 0;
+}
+
+static bool_t parse_s5_from_aml(const uint8_t *aml, uint32_t aml_len)
+{
+    const uint8_t *end;
+    uint32_t i;
+
+    if (aml == NULL || aml_len < 10U) {
+        return FALSE;
+    }
+    end = aml + aml_len;
+
+    for (i = 1U; i + 8U <= aml_len; i++) {
+        const uint8_t *p = aml + i;
+        const uint8_t *q;
+        uint32_t pkg_len_bytes;
+        uint8_t num_elems;
+        uint16_t typa = 0;
+        uint16_t typb = 0;
+        uint32_t consumed;
+        bool_t valid_prefix = FALSE;
+
+        if (p[0] != '_' || p[1] != 'S' || p[2] != '5' || p[3] != '_') {
+            continue;
+        }
+
+        /* Must be preceded by NameOp (0x08), optionally with root/parent prefix ('\' or '^') */
+        if (p[-1] == 0x08U) {
+            valid_prefix = TRUE;
+        } else if (i >= 2U && (p[-1] == '\\' || p[-1] == '^') && p[-2] == 0x08U) {
+            valid_prefix = TRUE;
+        }
+        if (!valid_prefix) {
+            continue;
+        }
+
+        /* Must be followed by PackageOp (0x12) */
+        q = p + 4;
+        if (q >= end || q[0] != 0x12U) {
+            continue;
+        }
+        q++;
+
+        if (q >= end) {
+            continue;
+        }
+        pkg_len_bytes = ((uint32_t)(q[0] >> 6) & 0x03U) + 1U;
+        if (q + pkg_len_bytes >= end) {
+            continue;
+        }
+        q += pkg_len_bytes;
+
+        num_elems = *q++;
+        if (num_elems < 1U) {
+            continue;
+        }
+
+        consumed = parse_aml_integer(q, end, &typa);
+        if (consumed == 0) {
+            continue;
+        }
+        q += consumed;
+
+        if (num_elems >= 2U) {
+            consumed = parse_aml_integer(q, end, &typb);
+            if (consumed == 0) {
+                typb = typa;
+            }
+        } else {
+            typb = typa;
+        }
+
+        acpi_slp_typa = typa;
+        acpi_slp_typb = typb;
+        acpi_s5_valid = TRUE;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void parse_s5_from_sdt(const struct acpi_sdt_header *sdt)
+{
+    const uint8_t *aml;
+    uint32_t aml_len;
+
+    if (acpi_s5_valid || sdt == NULL || sdt->length <= sizeof(struct acpi_sdt_header)) {
+        return;
+    }
+    aml     = (const uint8_t *)sdt + sizeof(struct acpi_sdt_header);
+    aml_len = sdt->length - (uint32_t)sizeof(struct acpi_sdt_header);
+    (void)parse_s5_from_aml(aml, aml_len);
+}
+
 static void discover_acpi_tables(void)
 {
     uint16_t ebda_seg;
@@ -143,11 +283,40 @@ static void discover_acpi_tables(void)
         }
         record_acpi_table(hdr->signature, tbl_phys, hdr->length, hdr->revision);
 
-        /* If this is the FADT ("FACP"), also locate FACS and DSDT physical tables */
+        /* If this is the FADT ("FACP"), extract PM1 registers and locate FACS and DSDT */
         if (memcmp(hdr->signature, "FACP", 4) == 0 && hdr->length >= 44U) {
             const uint8_t *fadt_bytes = (const uint8_t *)hdr;
             uint32_t facs_phys = read_le32_unaligned(&fadt_bytes[36]);
             uint32_t dsdt_phys = read_le32_unaligned(&fadt_bytes[40]);
+
+            if (hdr->length >= 72U) {
+                acpi_smi_cmd    = read_le32_unaligned(&fadt_bytes[48]);
+                acpi_enable_val = fadt_bytes[52];
+                acpi_pm1a_cnt   = read_le32_unaligned(&fadt_bytes[64]);
+                acpi_pm1b_cnt   = read_le32_unaligned(&fadt_bytes[68]);
+            }
+            if (dsdt_phys == 0 && hdr->length >= 148U) {
+                uint32_t x_dsdt_lo = read_le32_unaligned(&fadt_bytes[140]);
+                uint32_t x_dsdt_hi = read_le32_unaligned(&fadt_bytes[144]);
+                if (x_dsdt_hi == 0) {
+                    dsdt_phys = x_dsdt_lo;
+                }
+            }
+            if (acpi_pm1a_cnt == 0 && hdr->length >= 184U && fadt_bytes[172] == 1U) {
+                uint32_t x_pm1a_lo = read_le32_unaligned(&fadt_bytes[176]);
+                uint32_t x_pm1a_hi = read_le32_unaligned(&fadt_bytes[180]);
+                if (x_pm1a_hi == 0) {
+                    acpi_pm1a_cnt = x_pm1a_lo;
+                }
+            }
+            if (acpi_pm1b_cnt == 0 && hdr->length >= 196U && fadt_bytes[184] == 1U) {
+                uint32_t x_pm1b_lo = read_le32_unaligned(&fadt_bytes[188]);
+                uint32_t x_pm1b_hi = read_le32_unaligned(&fadt_bytes[192]);
+                if (x_pm1b_hi == 0) {
+                    acpi_pm1b_cnt = x_pm1b_lo;
+                }
+            }
+
             if (facs_phys != 0) {
                 const uint8_t *facs = (const uint8_t *)(uintptr_t)facs_phys;
                 uint32_t facs_len = read_le32_unaligned(&facs[4]);
@@ -161,8 +330,11 @@ static void discover_acpi_tables(void)
                 if (memcmp(dsdt->signature, "DSDT", 4) == 0 &&
                     dsdt->length >= sizeof(struct acpi_sdt_header)) {
                     record_acpi_table("DSDT", dsdt_phys, dsdt->length, dsdt->revision);
+                    parse_s5_from_sdt(dsdt);
                 }
             }
+        } else if (memcmp(hdr->signature, "SSDT", 4) == 0) {
+            parse_s5_from_sdt(hdr);
         }
     }
 }
@@ -268,6 +440,13 @@ void acpi_init(uint32_t mb_magic, uint32_t mbi_addr)
     num_mmap_entries   = 0;
     total_usable_bytes = 0;
     total_acpi_bytes   = 0;
+    acpi_smi_cmd       = 0;
+    acpi_enable_val    = 0;
+    acpi_pm1a_cnt      = 0;
+    acpi_pm1b_cnt      = 0;
+    acpi_slp_typa      = 0;
+    acpi_slp_typb      = 0;
+    acpi_s5_valid      = FALSE;
 
     /* 1. Discover ACPI RSDP, RSDT, FADT, DSDT, FACS, MADT tables in physical memory */
     discover_acpi_tables();
@@ -342,6 +521,11 @@ void acpi_init(uint32_t mb_magic, uint32_t mbi_addr)
             kprintf(" %s@0x%x", acpi_tables[i].signature, acpi_tables[i].phys_addr);
         }
         kprintf(")\n");
+        if (acpi_pm1a_cnt != 0 && acpi_s5_valid) {
+            kprintf("[ACPI] S5 poweroff ready (PM1a_CNT=0x%04x, PM1b_CNT=0x%04x, SLP_TYPa=%u, SLP_TYPb=%u)\n",
+                    acpi_pm1a_cnt, acpi_pm1b_cnt,
+                    (uint32_t)acpi_slp_typa, (uint32_t)acpi_slp_typb);
+        }
     } else {
         kprintf("[ACPI] RSDP not found; using %s memory map\n", src_name);
     }
@@ -459,4 +643,55 @@ bool_t acpi_is_usable_ram(uint32_t phys_addr, uint32_t size)
         }
     }
     return FALSE;
+}
+
+bool_t acpi_can_shutdown(void)
+{
+    return (acpi_pm1a_cnt != 0 && acpi_s5_valid) ? TRUE : FALSE;
+}
+
+void acpi_shutdown(void)
+{
+    if (acpi_pm1a_cnt != 0 && acpi_s5_valid) {
+        uint16_t pm1a_val = (uint16_t)(((acpi_slp_typa & 0x07U) << 10) | (1U << 13));
+        uint16_t pm1b_val = (uint16_t)(((acpi_slp_typb & 0x07U) << 10) | (1U << 13));
+
+        /* Enable ACPI mode via SMI_CMD if SCI_EN (bit 0 of PM1a_CNT) is not yet set */
+        if ((inw((uint16_t)acpi_pm1a_cnt) & 0x0001U) == 0 &&
+            acpi_smi_cmd != 0 && acpi_enable_val != 0) {
+            int wait_ms;
+            kprintf("[ACPI] Enabling ACPI mode (SMI_CMD=0x%04x, val=0x%02x)\n",
+                    acpi_smi_cmd, (uint32_t)acpi_enable_val);
+            outb((uint16_t)acpi_smi_cmd, acpi_enable_val);
+            for (wait_ms = 0; wait_ms < 300; wait_ms++) {
+                if ((inw((uint16_t)acpi_pm1a_cnt) & 0x0001U) != 0) {
+                    break;
+                }
+                pit_mdelay(1U);
+            }
+        }
+
+        kprintf("[ACPI] Entering S5 soft-off (PM1a_CNT=0x%04x val=0x%04x, PM1b_CNT=0x%04x val=0x%04x)\n",
+                acpi_pm1a_cnt, (uint32_t)pm1a_val,
+                acpi_pm1b_cnt, (uint32_t)pm1b_val);
+
+        cpu_cli();
+        outw((uint16_t)acpi_pm1a_cnt, pm1a_val);
+        if (acpi_pm1b_cnt != 0) {
+            outw((uint16_t)acpi_pm1b_cnt, pm1b_val);
+        }
+        pit_mdelay(100U);
+    }
+
+    /* Emulator fallbacks (QEMU PIIX4/ICH9, Bochs, VirtualBox) if firmware ACPI S5 did not power off */
+    kprintf("[ACPI] ACPI S5 fallback poweroff / CPU halt\n");
+    cpu_cli();
+    outw(0x0604U, 0x2000U);
+    outw(0xB004U, 0x2000U);
+    outw(0x4004U, 0x3400U);
+
+    for (;;) {
+        cpu_cli();
+        cpu_hlt();
+    }
 }

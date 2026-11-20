@@ -481,7 +481,11 @@ static void sh_execute_line(char *line)
     }
 
     if (strcmp(argv[0], "help") == 0) {
-        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount lsusb memmap acpi keymap ps uname uptime clear vi\n");
+        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount lsusb memmap acpi keymap ps uname uptime clear vi shutdown\n");
+    } else if (strcmp(argv[0], "shutdown") == 0 || strcmp(argv[0], "poweroff") == 0) {
+        sh_puts("Shutting down system via ACPI...\n");
+        console_refresh();
+        acpi_shutdown();
     } else if (strcmp(argv[0], "memmap") == 0 || strcmp(argv[0], "acpi") == 0) {
         cmd_memmap();
     } else if (strcmp(argv[0], "cp") == 0) {

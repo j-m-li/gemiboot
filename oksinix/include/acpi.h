@@ -71,5 +71,7 @@ const char *acpi_mmap_type_name(uint32_t type);
 uint32_t    acpi_get_total_usable_ram(void);
 uint32_t    acpi_find_usable_ram(uint32_t min_phys, uint32_t size, uint32_t align);
 bool_t      acpi_is_usable_ram(uint32_t phys_addr, uint32_t size);
+bool_t      acpi_can_shutdown(void);
+void        acpi_shutdown(void);
 
 #endif /* OKSINIX_ACPI_H */
