@@ -20,7 +20,7 @@ A 32-bit x86 operating system kernel written in strict ISO C90 (`-std=c89 -pedan
   - Dual-port 8042 PS/2 initialization with controller self-test (`0xAA`), configuration restoration, and bus-paced timeouts
   - IRQ1 PS/2 Keyboard driver with US QWERTY Scancode Set 1 translation, Shift/Ctrl/Alt/CapsLock tracking, and event ring buffer
   - IRQ12 PS/2 Mouse driver with ACK-checked initialization, 3-byte packet decoding, 9-bit signed delta movement, 640x480 coordinate clamping, and Left/Middle/Right button state
-- **PCI & xHCI USB 3.0 Stack (`drivers/pci.c`, `drivers/xhci.c`)**:
+- **PCI & xHCI USB 3.0 Stack (`drivers/pci.c`, `drivers/xhci.c`, `drivers/usbhub.c`, `drivers/usbhid.c`, `drivers/usbmsc.c`)**:
   - Full 256-bus PCI Configuration Space (#1) enumeration (`0xCF8`/`0xCFC`) with MMIO BAR0 setup, Bus Mastering, and Intel Panther Point / Lynx Point EHCI-to-xHCI port routing switchover
   - Real-hardware xHCI initialization: Extended Capability `USBLEGSUP` BIOS-to-OS SMM handoff, `HCSPARAMS2` 4 KiB-aligned Scratchpad Buffer Array allocation, RW1C-safe `PORTSC` port power/reset sequencing, Full-Speed 8-byte `bMaxPacketSize0` discovery with `EVALUATE_CONTEXT`, and DMA memory barriers
   - **USB Hub (`usb-hub`)**: Hub descriptor parsing (`0x29`/`0x2A`), `bPwrOn2PwrGood` power stabilization delay, xHCI Slot Context `Hub` bit + port count setup, polled downstream `PORT_RESET`, and recursive 20-bit xHCI Route String device enumeration

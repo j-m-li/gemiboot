@@ -31,6 +31,9 @@ C_SRCS   := arch/x86/gdt.c \
             drivers/keyboard.c \
             drivers/mouse.c \
             drivers/xhci.c \
+            drivers/usbhid.c \
+            drivers/usbmsc.c \
+            drivers/usbhub.c \
             drivers/vga.c \
             drivers/console.c \
             fs/vfs.c \
