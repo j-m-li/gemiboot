@@ -124,12 +124,20 @@ void usbmsc_init_device(struct xhci_usb_dev *dev)
     uint8_t max_lun = 0;
     struct xhci_msc_info info;
     int retry;
+    int disk_idx = -1;
+    int i;
 
     kprintf("[XHCI] USB Mass Storage initialized (slot %u, root_port %u, route 0x%x, IN=%u OUT=%u)\n",
             (uint32_t)dev->slot_id, (uint32_t)dev->root_port, dev->route_string,
             (uint32_t)dev->bulk_in_dci, (uint32_t)dev->bulk_out_dci);
 
-    if (num_msc_devs >= XHCI_MAX_MSC_DEVS) {
+    for (i = 0; i < XHCI_MAX_MSC_DEVS; i++) {
+        if (!msc_infos[i].present) {
+            disk_idx = i;
+            break;
+        }
+    }
+    if (disk_idx < 0) {
         return;
     }
     if (msc_cbw_buf == NULL) {
@@ -182,7 +190,6 @@ void usbmsc_init_device(struct xhci_usb_dev *dev)
         memset(cdb, 0, sizeof(cdb));
         cdb[0] = 0x25;
         if (usbmsc_bot_cmd(dev, cdb, 10, TRUE, cap, 8) == 0) {
-            int disk_idx = num_msc_devs;
             uint32_t last_lba = ((uint32_t)cap[0] << 24) |
                                 ((uint32_t)cap[1] << 16) |
                                 ((uint32_t)cap[2] << 8)  |
@@ -214,6 +221,24 @@ void usbmsc_init_device(struct xhci_usb_dev *dev)
     }
 }
 
+void usbmsc_remove_device(struct xhci_usb_dev *dev)
+{
+    int i;
+
+    for (i = 0; i < XHCI_MAX_MSC_DEVS; i++) {
+        if (msc_devs[i] == dev && msc_infos[i].present) {
+            kprintf("[XHCI-MSC] USB Mass Storage disconnected slot=%u (/dev/sd%c)\n",
+                    (uint32_t)dev->slot_id, (char)('a' + i));
+            msc_devs[i] = NULL;
+            memset(&msc_infos[i], 0, sizeof(msc_infos[i]));
+            if (num_msc_devs > 0) {
+                num_msc_devs--;
+            }
+            break;
+        }
+    }
+}
+
 int32_t xhci_msc_read_sector_idx(int disk_idx, uint32_t lba, uint8_t *buf512)
 {
     uint8_t cdb[16];
@@ -221,7 +246,7 @@ int32_t xhci_msc_read_sector_idx(int disk_idx, uint32_t lba, uint8_t *buf512)
     struct xhci_usb_dev *dev;
     int retry;
 
-    if (disk_idx < 0 || disk_idx >= num_msc_devs || !msc_infos[disk_idx].present || buf512 == NULL) {
+    if (disk_idx < 0 || disk_idx >= XHCI_MAX_MSC_DEVS || !msc_infos[disk_idx].present || buf512 == NULL) {
         return -1;
     }
     if (lba >= msc_infos[disk_idx].block_count) {
@@ -262,7 +287,7 @@ int32_t xhci_msc_write_sector_idx(int disk_idx, uint32_t lba, const uint8_t *buf
     struct xhci_usb_dev *dev;
     int retry;
 
-    if (disk_idx < 0 || disk_idx >= num_msc_devs || !msc_infos[disk_idx].present || buf512 == NULL) {
+    if (disk_idx < 0 || disk_idx >= XHCI_MAX_MSC_DEVS || !msc_infos[disk_idx].present || buf512 == NULL) {
         return -1;
     }
     if (lba >= msc_infos[disk_idx].block_count) {
@@ -302,7 +327,7 @@ int32_t xhci_msc_read_bytes_idx(int disk_idx, uint32_t offset, uint32_t size, ui
     uint32_t total_disk_bytes;
     uint32_t bytes_read = 0;
 
-    if (disk_idx < 0 || disk_idx >= num_msc_devs || !msc_infos[disk_idx].present) {
+    if (disk_idx < 0 || disk_idx >= XHCI_MAX_MSC_DEVS || !msc_infos[disk_idx].present) {
         return -1;
     }
     total_disk_bytes = msc_infos[disk_idx].block_count * 512U;
@@ -337,7 +362,7 @@ int32_t xhci_msc_write_bytes_idx(int disk_idx, uint32_t offset, uint32_t size, c
     uint32_t total_disk_bytes;
     uint32_t bytes_written = 0;
 
-    if (disk_idx < 0 || disk_idx >= num_msc_devs || !msc_infos[disk_idx].present) {
+    if (disk_idx < 0 || disk_idx >= XHCI_MAX_MSC_DEVS || !msc_infos[disk_idx].present) {
         return -1;
     }
     total_disk_bytes = msc_infos[disk_idx].block_count * 512U;
@@ -403,7 +428,7 @@ int xhci_get_msc_count(void)
 
 int xhci_get_msc_info_idx(int disk_idx, struct xhci_msc_info *out)
 {
-    if (disk_idx < 0 || disk_idx >= num_msc_devs || !msc_infos[disk_idx].present) {
+    if (disk_idx < 0 || disk_idx >= XHCI_MAX_MSC_DEVS || !msc_infos[disk_idx].present) {
         if (out != NULL) {
             memset(out, 0, sizeof(*out));
         }

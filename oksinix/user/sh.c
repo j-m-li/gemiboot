@@ -481,7 +481,7 @@ static void sh_execute_line(char *line)
     }
 
     if (strcmp(argv[0], "help") == 0) {
-        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount lsusb memmap acpi keymap ps uname uptime clear vi shutdown\n");
+        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb memmap acpi keymap ps uname uptime clear vi shutdown\n");
     } else if (strcmp(argv[0], "shutdown") == 0 || strcmp(argv[0], "poweroff") == 0) {
         sh_puts("Shutting down system via ACPI...\n");
         console_refresh();
@@ -531,22 +531,60 @@ static void sh_execute_line(char *line)
         sh_print_uint(ticks);
         sh_puts(" PIT ticks @ 1000 Hz)\n");
     } else if (strcmp(argv[0], "mount") == 0) {
-        sh_puts("rootfs on / type ramfs (rw)\n");
-        sh_puts("devfs on /dev type devfs (rw)\n");
-        if (fat32_is_mounted()) {
-            struct fat32_fs_info fi;
-            char dev_part[16];
-            fat32_get_info(&fi);
-            memcpy(dev_part, "/dev/sda1", 10);
-            dev_part[7] = (char)('a' + fi.disk_idx);
-            sh_puts(dev_part);
-            sh_puts(" on /mnt type fat32 (rw, label=");
-            sh_puts(fi.volume_label);
-            sh_puts(", lba=");
-            sh_print_uint(fi.part_lba);
-            sh_puts(", clusters=");
-            sh_print_uint(fi.total_clusters);
-            sh_puts(")\n");
+        devfs_sync_usb_storage();
+        if (argc == 2 && strcmp(argv[1], "-a") == 0) {
+            fat32_remount_all();
+        } else if (argc >= 3) {
+            int disk_idx = -1;
+            int mount_idx = -1;
+            int m;
+            if (strncmp(argv[1], "/dev/sd", 7) == 0 && argv[1][7] >= 'a' &&
+                argv[1][7] < (char)('a' + XHCI_MAX_MSC_DEVS)) {
+                disk_idx = (int)(argv[1][7] - 'a');
+            }
+            for (m = 0; m < FAT32_MAX_MOUNTS; m++) {
+                if (strcmp(argv[2], fat32_get_mount_point(m)) == 0) {
+                    mount_idx = m;
+                    break;
+                }
+            }
+            if (disk_idx < 0 || mount_idx < 0 || fat32_mount_disk(disk_idx, mount_idx) < 0) {
+                sh_puts("mount: failed to mount ");
+                sh_puts(argv[1]);
+                sh_puts(" on ");
+                sh_puts(argv[2]);
+                sh_putc('\n');
+            }
+        } else {
+            int m;
+            sh_puts("rootfs on / type ramfs (rw)\n");
+            sh_puts("devfs on /dev type devfs (rw)\n");
+            for (m = 0; m < FAT32_MAX_MOUNTS; m++) {
+                struct fat32_fs_info fi;
+                if (fat32_get_info_idx(m, &fi) == 0 && fi.mounted) {
+                    char dev_part[16];
+                    memcpy(dev_part, "/dev/sda1", 10);
+                    dev_part[7] = (char)('a' + fi.disk_idx);
+                    sh_puts(dev_part);
+                    sh_puts(" on ");
+                    sh_puts(fi.mount_point);
+                    sh_puts(" type fat32 (rw, label=");
+                    sh_puts(fi.volume_label);
+                    sh_puts(", lba=");
+                    sh_print_uint(fi.part_lba);
+                    sh_puts(", clusters=");
+                    sh_print_uint(fi.total_clusters);
+                    sh_puts(")\n");
+                }
+            }
+        }
+    } else if (strcmp(argv[0], "umount") == 0) {
+        if (argc < 2) {
+            sh_puts("usage: umount <mountpoint>\n");
+        } else if (fat32_umount_path(argv[1]) < 0) {
+            sh_puts("umount: ");
+            sh_puts(argv[1]);
+            sh_puts(": not mounted\n");
         }
     } else if (strcmp(argv[0], "lsusb") == 0) {
         if (!xhci_is_initialized()) {
@@ -554,10 +592,8 @@ static void sh_execute_line(char *line)
         } else {
             struct xhci_controller_info ci;
             struct xhci_hub_info hub;
-            int msc_cnt;
             int i;
             devfs_sync_usb_storage();
-            msc_cnt = xhci_get_msc_count();
             xhci_get_controller_info(&ci);
             xhci_get_hub_info(&hub);
             sh_puts("Bus 001: xHCI USB 3.0 Host Controller (ports=");
@@ -580,7 +616,7 @@ static void sh_execute_line(char *line)
             if (xhci_has_usb_mouse()) {
                 sh_puts("  - USB HID Boot Mouse (/dev/mouse)\n");
             }
-            for (i = 0; i < msc_cnt; i++) {
+            for (i = 0; i < XHCI_MAX_MSC_DEVS; i++) {
                 struct xhci_msc_info msc;
                 if (xhci_get_msc_info_idx(i, &msc) == 0 && msc.present) {
                     char sd_name[12];
@@ -643,6 +679,17 @@ static void sh_execute_line(char *line)
             vi_argv[1] = NULL;
         }
         (void)vfs_exec("/bin/vi", vi_argc, vi_argv);
+    } else if (strcmp(argv[0], "cc") == 0 || strcmp(argv[0], "/bin/cc") == 0) {
+        char path[VFS_MAX_PATH];
+        char *cc_argv[3];
+	if (argc > 1) {
+        	make_abs_path(argv[1], path, sizeof(path));
+		cc_argv[1] = path;
+		cc_argv[2] = NULL;
+        	(void)vfs_exec("/bin/cc", 2, cc_argv);
+	} else {
+                sh_puts("cc : error in args ");
+	}
     } else {
         char path[VFS_MAX_PATH];
         struct vfs_node *node;

@@ -18,6 +18,18 @@ void usbhid_reset(void)
     mouse_dev = NULL;
 }
 
+void usbhid_remove_device(struct xhci_usb_dev *dev)
+{
+    if (kbd_dev == dev) {
+        kbd_dev = NULL;
+        kprintf("[XHCI] USB Keyboard disconnected (slot %u)\n", (uint32_t)dev->slot_id);
+    }
+    if (mouse_dev == dev) {
+        mouse_dev = NULL;
+        kprintf("[XHCI] USB Mouse disconnected (slot %u)\n", (uint32_t)dev->slot_id);
+    }
+}
+
 static void usbhid_queue_int_trb(struct xhci_usb_dev *dev)
 {
     uint32_t len = (dev->dev_type == USB_DEV_KBD) ? 8U : 4U;

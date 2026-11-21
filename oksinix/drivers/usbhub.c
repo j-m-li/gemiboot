@@ -257,18 +257,31 @@ void usbhub_init_device(struct xhci_usb_dev *hub_dev, uint32_t tier, uint32_t pw
     }
 }
 
+void usbhub_remove_device(struct xhci_usb_dev *hub_dev)
+{
+    int d;
+    for (d = 0; d < num_hub_devs; d++) {
+        if (hub_devs[d] == hub_dev) {
+            hub_devs[d] = NULL;
+        }
+    }
+    if (hub_info.present && hub_info.slot_id == hub_dev->slot_id) {
+        memset(&hub_info, 0, sizeof(hub_info));
+    }
+}
+
 void usbhub_poll_ports(void)
 {
     int d;
 
-    for (d = 0; d < num_hub_devs && xhci_has_free_slot(); d++) {
+    for (d = 0; d < num_hub_devs; d++) {
         struct xhci_usb_dev *hdev = hub_devs[d];
         uint8_t hp;
 
-        if (hdev == NULL || hdev->hub_ports == 0) {
+        if (hdev == NULL || hdev->slot_id == 0 || hdev->hub_ports == 0) {
             continue;
         }
-        for (hp = 1; hp <= hdev->hub_ports && xhci_has_free_slot(); hp++) {
+        for (hp = 1; hp <= hdev->hub_ports; hp++) {
             uint8_t port_sts[4];
             uint16_t wPortStatus;
             uint32_t bit = (1U << (hp - 1U));
@@ -279,8 +292,15 @@ void usbhub_poll_ports(void)
             }
             wPortStatus = (uint16_t)((uint16_t)port_sts[0] | ((uint16_t)port_sts[1] << 8));
             if ((wPortStatus & 0x0001U) == 0) {
-                hdev->hub_port_conn_mask &= ~bit;
-            } else if ((hdev->hub_port_conn_mask & bit) == 0) {
+                if ((hdev->hub_port_conn_mask & bit) != 0) {
+                    hdev->hub_port_conn_mask &= ~bit;
+                    (void)xhci_control_transfer(hdev, 0x23U, 0x01U, HUB_FEAT_C_PORT_CONNECTION, hp, 0, NULL);
+                    xhci_disconnect_port(hdev->root_port, hdev->slot_id, hp);
+                    if (hub_info.downstream_devices > 0) {
+                        hub_info.downstream_devices--;
+                    }
+                }
+            } else if ((hdev->hub_port_conn_mask & bit) == 0 && xhci_has_free_slot()) {
                 hdev->hub_port_conn_mask |= bit;
                 if (usbhub_enumerate_port(hdev, hp) == 0) {
                     hub_info.downstream_devices++;

@@ -66,6 +66,7 @@ struct vfs_dirent {
 };
 
 void             vfs_init(void);
+void             vfs_invalidate_fat32_mount(int mount_idx);
 void             devfs_init(void);
 void             devfs_sync_usb_storage(void);
 

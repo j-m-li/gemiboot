@@ -7,10 +7,70 @@
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+
+
+def make_fat32_usb_image(out_path, label11, fname83, content_bytes, mbr_banner=None):
+    """Create a 128 KiB FAT32 USB disk image (with MBR partition at LBA 64)."""
+    total_sectors = 256
+    part_lba = 64
+    part_secs = total_sectors - part_lba
+    rsvd_sec = 32
+    num_fats = 2
+    fat_sz = 4
+    img = bytearray(total_sectors * 512)
+
+    # Sector 0: MBR with optional signature banner + FAT32 partition entry
+    if mbr_banner:
+        img[0:len(mbr_banner)] = mbr_banner
+    struct.pack_into("<BBBBBBBBII", img, 446, 0x00, 0, 1, 0, 0x0C, 0, 1, 0, part_lba, part_secs)
+    img[510] = 0x55
+    img[511] = 0xAA
+
+    # Partition sector 0: FAT32 VBR
+    p0 = part_lba * 512
+    img[p0:p0 + 3] = b"\xeb\x58\x90"
+    img[p0 + 3:p0 + 11] = b"OKSINIX "
+    struct.pack_into("<H", img, p0 + 0x0B, 512)
+    img[p0 + 0x0D] = 1
+    struct.pack_into("<H", img, p0 + 0x0E, rsvd_sec)
+    img[p0 + 0x10] = num_fats
+    img[p0 + 0x15] = 0xF8
+    struct.pack_into("<I", img, p0 + 0x1C, part_lba)
+    struct.pack_into("<I", img, p0 + 0x20, part_secs)
+    struct.pack_into("<I", img, p0 + 0x24, fat_sz)
+    struct.pack_into("<I", img, p0 + 0x2C, 2)
+    img[p0 + 0x42] = 0x29
+    img[p0 + 0x47:p0 + 0x52] = label11
+    img[p0 + 0x52:p0 + 0x5A] = b"FAT32   "
+    img[p0 + 510] = 0x55
+    img[p0 + 511] = 0xAA
+
+    # FAT1 & FAT2: cluster 2 (root dir), cluster 3 (file)
+    for f in range(num_fats):
+        foff = (part_lba + rsvd_sec + f * fat_sz) * 512
+        struct.pack_into("<IIII", img, foff, 0x0FFFFFF8, 0x0FFFFFFF, 0x0FFFFFFF, 0x0FFFFFFF)
+
+    data_lba = part_lba + rsvd_sec + num_fats * fat_sz
+    # Cluster 2 (root dir): volume label + 1 file entry
+    r_off = data_lba * 512
+    img[r_off:r_off + 11] = label11
+    img[r_off + 11] = 0x08
+    img[r_off + 32:r_off + 43] = fname83
+    img[r_off + 43] = 0x20
+    struct.pack_into("<H", img, r_off + 58, 3)
+    struct.pack_into("<I", img, r_off + 60, len(content_bytes))
+
+    # Cluster 3 (file data)
+    f_off = (data_lba + 1) * 512
+    img[f_off:f_off + len(content_bytes)] = content_bytes
+
+    with open(out_path, "wb") as fp:
+        fp.write(img)
 
 
 def send_hmp_cmd(sock, cmd, delay=0.06):
@@ -121,14 +181,27 @@ def main():
         ppm_path = os.path.join(tmpdir, "vga_dump.ppm")
         usb_disk_path = os.path.join(tmpdir, "usb_disk_test.img")
         usb_disk2_path = os.path.join(tmpdir, "usb_disk2_test.img")
+        usb_disk3_path = os.path.join(tmpdir, "usb_disk3_test.img")
+        usb_disk4_path = os.path.join(tmpdir, "usb_disk4_test.img")
 
         # Copy usb_disk.img into temporary test working copy so writes don't dirty repo image
         shutil.copyfile(base_disk_path, usb_disk_path)
-        with open(usb_disk2_path, "wb") as f2:
-            f2.write(b"OKSINIX_SECOND_USB_DISK_SDB_OK\n\0" + b"\x00" * (65536 - 32))
+        make_fat32_usb_image(
+            usb_disk2_path, b"MEDIA1     ", b"DISK1   TXT",
+            b"Hello from USB Mass Storage /media1!\n",
+            mbr_banner=b"OKSINIX_SECOND_USB_DISK_SDB_OK\n\0",
+        )
+        make_fat32_usb_image(
+            usb_disk3_path, b"MEDIA2     ", b"DISK2   TXT",
+            b"Hello from USB Mass Storage /media2!\n",
+        )
+        make_fat32_usb_image(
+            usb_disk4_path, b"MEDIA3     ", b"DISK3   TXT",
+            b"Hello from USB Mass Storage /media3!\n",
+        )
 
         # Boot directly from the BIOS MBR bootable disk image (oksinix.img)
-        # and attach usb-hub + usb-kbd + usb-mouse + 2x usb-storage (/dev/sda, /dev/sdb) on xHCI!
+        # and attach usb-hub + usb-kbd + usb-mouse + 4x usb-storage (/dev/sda..sdd -> /mnt, /media1..3) on xHCI!
         qemu_cmd = [
             "qemu-system-i386",
             "-drive", f"file={boot_img_path},format=raw",
@@ -139,9 +212,13 @@ def main():
             "-device", "usb-kbd,bus=xhci.0,port=1.1",
             "-device", "usb-mouse,bus=xhci.0,port=1.2",
             "-drive", f"file={usb_disk_path},if=none,format=raw,id=usbdisk",
-            "-device", "usb-storage,bus=xhci.0,port=1.3,drive=usbdisk",
+            "-device", "usb-storage,id=usbdev0,bus=xhci.0,port=1.3,drive=usbdisk",
             "-drive", f"file={usb_disk2_path},if=none,format=raw,id=usbdisk2",
-            "-device", "usb-storage,bus=xhci.0,port=1.4,drive=usbdisk2",
+            "-device", "usb-storage,id=usbdev1,bus=xhci.0,port=1.4,drive=usbdisk2",
+            "-drive", f"file={usb_disk3_path},if=none,format=raw,id=usbdisk3",
+            "-device", "usb-storage,id=usbdev2,bus=xhci.0,port=1.5,drive=usbdisk3",
+            "-drive", f"file={usb_disk4_path},if=none,format=raw,id=usbdisk4",
+            "-device", "usb-storage,id=usbdev3,bus=xhci.0,port=1.6,drive=usbdisk4",
             "-serial", f"file:{serial_log_path}",
             "-monitor", f"unix:{mon_sock_path},server,nowait",
             "-no-reboot",
@@ -174,11 +251,19 @@ def main():
             wait_for_serial(serial_log_path, "[XHCI-MSC] USB Mass Storage")
             wait_for_serial(serial_log_path, "[DEVFS] Registered block device /dev/sda (8,0)")
             wait_for_serial(serial_log_path, "[DEVFS] Registered block device /dev/sdb (8,16)")
+            wait_for_serial(serial_log_path, "[DEVFS] Registered block device /dev/sdc (8,32)")
+            wait_for_serial(serial_log_path, "[DEVFS] Registered block device /dev/sdd (8,48)")
             wait_for_serial(serial_log_path, "[FAT32] Mounted volume \"OKSINIXFAT \" at /mnt")
-            wait_for_serial(serial_log_path, "[/bin/init] xHCI USB bus active (usb-hub usb-kbd usb-mouse usb-storage:/dev/sda,/dev/sdb)")
+            wait_for_serial(serial_log_path, "[FAT32] Mounted volume \"MEDIA1     \" at /media1")
+            wait_for_serial(serial_log_path, "[FAT32] Mounted volume \"MEDIA2     \" at /media2")
+            wait_for_serial(serial_log_path, "[FAT32] Mounted volume \"MEDIA3     \" at /media3")
+            wait_for_serial(serial_log_path, "[/bin/init] xHCI USB bus active (usb-hub usb-kbd usb-mouse usb-storage:/dev/sda,/dev/sdb,/dev/sdc,/dev/sdd)")
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /mnt")
+            wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media1")
+            wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media2")
+            wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media3")
             wait_for_serial(serial_log_path, "oksinix:/# ")
-            print("[PASS] 1/9 Boot, VGA 640x480, PCI xHCI, USB Hub, /dev/sda + /dev/sdb & FAT32 mount on /mnt")
+            print("[PASS] 1/12 Boot, VGA 640x480, PCI xHCI, USB Hub, 4x USB storage auto-mounted (/mnt, /media1..3)")
 
             # Connect to QEMU HMP monitor socket
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -188,8 +273,8 @@ def main():
 
             # 2. Type 'lsusb' and 'uptime' via xHCI USB Keyboard (behind USB Hub port 1.1)
             send_keys_str(sock, "lsusb\n")
-            serial_out = wait_for_serial(serial_log_path, "-> /dev/sdb")
-            if "USB Hub (slot 1, 8 ports, 4 downstream)" not in serial_out:
+            serial_out = wait_for_serial(serial_log_path, "-> /dev/sdd")
+            if "USB Hub (slot 1, 8 ports, 6 downstream)" not in serial_out:
                 raise RuntimeError("Expected USB Hub info in lsusb output")
             if "[USB-KBD] key press" not in serial_out:
                 raise RuntimeError("Expected key events to arrive via xHCI USB Keyboard ([USB-KBD])")
@@ -243,12 +328,32 @@ def main():
                 raise RuntimeError("Expected 'yy' + 'p' to duplicate joined line in /mnt/VITEST.TXT")
             print("[PASS] 5/11 Modal 'vi' editor (Insert, Visual 'v', 'y'/'yy', 'p', 'J', ':wq') verified on FAT32")
 
-            # 6. Verify raw /dev/sda and /dev/sdb reading via xHCI USB Mass Storage (SCSI READ 10)
+            # 6. Verify 4x USB Mass Storage mounts (/mnt, /media1..3), raw /dev/sda..sdb, manual umount/mount, and hot-unplug auto-umount + hot-replug auto-mount
             send_keys_str(sock, "cat /dev/sda\n")
             wait_for_serial(serial_log_path, "OKSINIX_USB_STORAGE_OK")
             send_keys_str(sock, "cat /dev/sdb\n")
             wait_for_serial(serial_log_path, "OKSINIX_SECOND_USB_DISK_SDB_OK")
-            print("[PASS] 6/10 Multiple xHCI USB Mass Storage drives (/dev/sda & /dev/sdb) raw block device reads verified")
+            send_keys_str(sock, "cat /media1/DISK1.TXT\n")
+            wait_for_serial(serial_log_path, "Hello from USB Mass Storage /media1!")
+            send_keys_str(sock, "cat /media2/DISK2.TXT\n")
+            wait_for_serial(serial_log_path, "Hello from USB Mass Storage /media2!")
+            send_keys_str(sock, "cat /media3/DISK3.TXT\n")
+            wait_for_serial(serial_log_path, "Hello from USB Mass Storage /media3!")
+            send_keys_str(sock, "umount /media3\n")
+            wait_for_serial(serial_log_path, "[FAT32] Unmounted /media3 (/dev/sdd)")
+            send_keys_str(sock, "mount /dev/sdd /media3\n")
+            time.sleep(0.2)
+            # Hot-unplug 4th USB drive via QEMU HMP and verify automatic umount + devfs unregister
+            send_hmp_cmd(sock, "device_del usbdev3", delay=0.5)
+            wait_for_serial(serial_log_path, "[XHCI-MSC] USB Mass Storage disconnected")
+            wait_for_serial(serial_log_path, "[DEVFS] Unregistered block device /dev/sdd")
+            # Hot-replug 4th USB drive and verify automatic mount back to /media3
+            send_hmp_cmd(sock, "device_add usb-storage,id=usbdev3,bus=xhci.0,port=1.6,drive=usbdisk4", delay=0.6)
+            send_keys_str(sock, "echo hotplug-ok > /media3/REPLUG.TXT\n")
+            time.sleep(0.3)
+            send_keys_str(sock, "cat /media3/REPLUG.TXT\n")
+            wait_for_serial(serial_log_path, "hotplug-ok")
+            print("[PASS] 6/12 4x USB Mass Storage (/mnt, /media1..3), manual umount/mount, hot-unplug auto-umount & hot-replug auto-mount verified")
 
             # 7. Execute 32-bit Linux x86 (i386) static & dynamically linked ELF binaries
             send_keys_str(sock, "/mnt/LINUX.ELF\n")

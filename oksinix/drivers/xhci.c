@@ -116,7 +116,11 @@ void *xhci_dma_alloc(uint32_t size, uint32_t align)
 
 static void ring_init(struct xhci_ring *r)
 {
-    r->trbs = (volatile struct xhci_trb *)xhci_dma_alloc(XHCI_RING_TRBS * sizeof(struct xhci_trb), 64);
+    if (r->trbs == NULL) {
+        r->trbs = (volatile struct xhci_trb *)xhci_dma_alloc(XHCI_RING_TRBS * sizeof(struct xhci_trb), 64);
+    } else {
+        memset((void *)(uintptr_t)r->trbs, 0, XHCI_RING_TRBS * sizeof(struct xhci_trb));
+    }
     r->enq_idx = 0;
     r->ccs = 1;
 
@@ -272,14 +276,21 @@ void xhci_poll(void)
         hotplug_pending   = FALSE;
         last_hotplug_tick = now_ticks;
 
-        for (port = 1; port <= max_ports && port <= 32U && num_usb_devs < XHCI_MAX_SLOTS; port++) {
+        for (port = 1; port <= max_ports && port <= 32U; port++) {
             uint32_t port_off = 0x400U + (port - 1U) * 0x10U;
             uint32_t portsc   = mmio_read32(op_base, port_off);
             uint32_t bit      = (1U << (port - 1U));
 
             if ((portsc & 1U) == 0) {
-                root_port_conn_mask &= ~bit;
-            } else if ((root_port_conn_mask & bit) == 0) {
+                if ((root_port_conn_mask & bit) != 0) {
+                    root_port_conn_mask &= ~bit;
+                    if ((portsc & (0x7FU << 17)) != 0) {
+                        mmio_write32(op_base, port_off, (portsc & ~PORTSC_RW1C_MASK) | (0x7FU << 17));
+                    }
+                    xhci_disconnect_port((uint8_t)port, 0U, 0U);
+                    ctrl_info.num_devices = (uint32_t)num_usb_devs;
+                }
+            } else if ((root_port_conn_mask & bit) == 0 && num_usb_devs < XHCI_MAX_SLOTS) {
                 root_port_conn_mask |= bit;
                 pit_mdelay(30U);
                 xhci_enumerate_root_port(port);
@@ -483,14 +494,71 @@ static void xhci_setup_ep_ctx(uint8_t *ep_ctx, uint32_t ep_type, uint16_t mps,
     dw[4] = avg_trb_len | (esit << 16);
 }
 
+static void xhci_release_dev(struct xhci_usb_dev *dev)
+{
+    struct xhci_trb ev;
+    uint8_t slot_id = dev->slot_id;
+
+    if (slot_id != 0) {
+        (void)xhci_send_command(0, 0,
+                                (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24),
+                                &ev);
+        dcbaa[slot_id * 2U] = 0;
+        dev->slot_id = 0;
+        dev->dev_type = USB_DEV_NONE;
+        if (num_usb_devs > 0) {
+            num_usb_devs--;
+        }
+    }
+}
+
+void xhci_disconnect_port(uint8_t root_port, uint8_t parent_hub_slot, uint8_t parent_port)
+{
+    int i;
+
+    for (i = 0; i < XHCI_MAX_SLOTS; i++) {
+        struct xhci_usb_dev *dev = &usb_devs[i];
+        if (dev->slot_id == 0) {
+            continue;
+        }
+        if (dev->root_port == root_port &&
+            dev->parent_hub_slot == parent_hub_slot &&
+            dev->parent_port == parent_port) {
+            uint8_t hub_slot = dev->slot_id;
+            if (dev->dev_type == USB_DEV_HUB) {
+                int j;
+                for (j = 0; j < XHCI_MAX_SLOTS; j++) {
+                    if (usb_devs[j].slot_id != 0 && usb_devs[j].parent_hub_slot == hub_slot) {
+                        xhci_disconnect_port(usb_devs[j].root_port, hub_slot, usb_devs[j].parent_port);
+                    }
+                }
+                usbhub_remove_device(dev);
+            } else if (dev->dev_type == USB_DEV_STORAGE) {
+                usbmsc_remove_device(dev);
+            } else if (dev->dev_type == USB_DEV_KBD || dev->dev_type == USB_DEV_MOUSE) {
+                usbhid_remove_device(dev);
+            }
+            xhci_release_dev(dev);
+        }
+    }
+}
+
 int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                           uint32_t tier, uint8_t speed,
                           uint8_t parent_hub_slot, uint8_t parent_port)
 {
     struct xhci_trb ev;
     uint8_t slot_id;
-    int dev_idx;
+    int dev_idx = -1;
+    int i;
     struct xhci_usb_dev *dev;
+    uint8_t *saved_out_ctx;
+    uint8_t *saved_in_ctx;
+    uint8_t *saved_hid_buf;
+    volatile struct xhci_trb *saved_ep0;
+    volatile struct xhci_trb *saved_int;
+    volatile struct xhci_trb *saved_bin;
+    volatile struct xhci_trb *saved_bout;
     uint32_t *in_ctrl_dw;
     uint32_t *slot_dw;
     uint8_t dev_desc[18];
@@ -500,7 +568,13 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
     uint8_t max_dci = 1;
     uint32_t add_flags = (1U << 0);
 
-    if (num_usb_devs >= XHCI_MAX_SLOTS) {
+    for (i = 0; i < XHCI_MAX_SLOTS; i++) {
+        if (usb_devs[i].slot_id == 0) {
+            dev_idx = i;
+            break;
+        }
+    }
+    if (dev_idx < 0) {
         return -1;
     }
 
@@ -512,9 +586,23 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
     }
     slot_id = (uint8_t)((ev.control >> 24) & 0xFFU);
 
-    dev_idx = num_usb_devs++;
+    num_usb_devs++;
     dev = &usb_devs[dev_idx];
+    saved_out_ctx = dev->out_ctx;
+    saved_in_ctx  = dev->in_ctx;
+    saved_hid_buf = dev->hid_buf;
+    saved_ep0     = dev->ep0_ring.trbs;
+    saved_int     = dev->int_in_ring.trbs;
+    saved_bin     = dev->bulk_in_ring.trbs;
+    saved_bout    = dev->bulk_out_ring.trbs;
     memset(dev, 0, sizeof(struct xhci_usb_dev));
+    dev->out_ctx            = saved_out_ctx;
+    dev->in_ctx             = saved_in_ctx;
+    dev->hid_buf            = saved_hid_buf;
+    dev->ep0_ring.trbs      = saved_ep0;
+    dev->int_in_ring.trbs   = saved_int;
+    dev->bulk_in_ring.trbs  = saved_bin;
+    dev->bulk_out_ring.trbs = saved_bout;
 
     dev->slot_id         = slot_id;
     dev->root_port       = root_port;
@@ -532,8 +620,16 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
         dev->ep0_mps = 64;
     }
 
-    dev->out_ctx = (uint8_t *)xhci_dma_alloc(32U * ctx_size, 64);
-    dev->in_ctx  = (uint8_t *)xhci_dma_alloc(33U * ctx_size, 64);
+    if (dev->out_ctx == NULL) {
+        dev->out_ctx = (uint8_t *)xhci_dma_alloc(32U * ctx_size, 64);
+    } else {
+        memset(dev->out_ctx, 0, 32U * ctx_size);
+    }
+    if (dev->in_ctx == NULL) {
+        dev->in_ctx = (uint8_t *)xhci_dma_alloc(33U * ctx_size, 64);
+    } else {
+        memset(dev->in_ctx, 0, 33U * ctx_size);
+    }
     ring_init(&dev->ep0_ring);
 
     dcbaa[slot_id * 2U]      = (uint32_t)(uintptr_t)dev->out_ctx;
@@ -561,11 +657,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                               (TRB_TYPE_ADDRESS_DEVICE << 10) | (1U << 9) | ((uint32_t)slot_id << 24),
                               &ev) < 0) {
             kprintf("[XHCI] Address Device failed on slot %u\n", (uint32_t)slot_id);
-            (void)xhci_send_command(0, 0,
-                                    (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24),
-                                    &ev);
-            dcbaa[slot_id * 2U] = 0;
-            num_usb_devs--;
+            xhci_release_dev(dev);
             return -1;
         }
         memset(dev_desc, 0, sizeof(dev_desc));
@@ -578,11 +670,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                               (TRB_TYPE_ADDRESS_DEVICE << 10) | ((uint32_t)slot_id << 24),
                               &ev) < 0) {
             kprintf("[XHCI] Address Device (post-BSR) failed on slot %u\n", (uint32_t)slot_id);
-            (void)xhci_send_command(0, 0,
-                                    (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24),
-                                    &ev);
-            dcbaa[slot_id * 2U] = 0;
-            num_usb_devs--;
+            xhci_release_dev(dev);
             return -1;
         }
     }
@@ -615,11 +703,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
     memset(dev_desc, 0, sizeof(dev_desc));
     if (xhci_control_transfer(dev, 0x80U, 0x06U, 0x0100U, 0, 18U, dev_desc) < 0) {
         kprintf("[XHCI] Failed to read Device Descriptor on slot %u\n", (uint32_t)slot_id);
-        (void)xhci_send_command(0, 0,
-                                (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24),
-                                &ev);
-        dcbaa[slot_id * 2U] = 0;
-        num_usb_devs--;
+        xhci_release_dev(dev);
         return -1;
     }
 
@@ -630,11 +714,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
     /* 4. Read Configuration Descriptor */
     memset(cfg_desc, 0, sizeof(cfg_desc));
     if (xhci_control_transfer(dev, 0x80U, 0x06U, 0x0200U, 0, 9U, cfg_desc) < 0) {
-        (void)xhci_send_command(0, 0,
-                                (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24),
-                                &ev);
-        dcbaa[slot_id * 2U] = 0;
-        num_usb_devs--;
+        xhci_release_dev(dev);
         return -1;
     }
     total_len = (uint16_t)((uint16_t)cfg_desc[2] | ((uint16_t)cfg_desc[3] << 8));
@@ -642,11 +722,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
         total_len = sizeof(cfg_desc);
     }
     if (xhci_control_transfer(dev, 0x80U, 0x06U, 0x0200U, 0, total_len, cfg_desc) < 0) {
-        (void)xhci_send_command(0, 0,
-                                (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24),
-                                &ev);
-        dcbaa[slot_id * 2U] = 0;
-        num_usb_devs--;
+        xhci_release_dev(dev);
         return -1;
     }
 
@@ -773,11 +849,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
     }
 
     if (dev->dev_type == USB_DEV_NONE) {
-        (void)xhci_send_command(0, 0,
-                                (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24),
-                                &ev);
-        dcbaa[slot_id * 2U] = 0;
-        num_usb_devs--;
+        xhci_release_dev(dev);
         return -1;
     }
 
@@ -833,6 +905,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                               (TRB_TYPE_CONFIGURE_EP << 10) | ((uint32_t)slot_id << 24),
                               &ev) < 0) {
             kprintf("[XHCI] Configure Endpoint failed on slot %u\n", (uint32_t)slot_id);
+            xhci_release_dev(dev);
             return -1;
         }
 
@@ -1053,6 +1126,7 @@ static int xhci_init_controller(const struct pci_device *pci_dev)
     xhci_ready          = FALSE;
     xhci_dma_off        = 0;
     num_usb_devs        = 0;
+    memset(usb_devs, 0, sizeof(usb_devs));
     root_port_conn_mask = 0;
     hotplug_pending     = FALSE;
 

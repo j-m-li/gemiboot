@@ -145,7 +145,7 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
         return (data_sec_start + (c - 2) * sec_per_clus) * 512
 
     readme_bytes = b"Oksinix FAT32 filesystem on USB Mass Storage (/dev/sda1 -> /mnt)\n"
-    hello_bytes = b"Hello from FAT32 on Oksinix!\n"
+    hello_bytes = b"int main() {return 0;}\n"
     notes_bytes = b"Subdirectory file inside FAT32 /mnt/DOCS/NOTES.TXT\n"
     lfn_doc_bytes = b"FAT32 Long File Name (VFAT LFN) read test passed!\n"
 
@@ -153,7 +153,7 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
     root_dir = bytearray(512)
     root_dir[0:32] = make_dirent_83(b"OKSINIXFAT ", 0x08, 0, 0)
     root_dir[32:64] = make_dirent_83(b"README  TXT", 0x20, 3, len(readme_bytes))
-    root_dir[64:96] = make_dirent_83(b"HELLO   TXT", 0x20, 4, len(hello_bytes))
+    root_dir[64:96] = make_dirent_83(b"HELLO   C  ", 0x20, 4, len(hello_bytes))
     root_dir[96:128] = make_dirent_83(b"DOCS       ", 0x10, 5, 0)
     dir_pos = 128
     if linux_elf_bytes:

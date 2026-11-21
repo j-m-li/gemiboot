@@ -13,6 +13,7 @@
 struct vfs_fd {
     bool_t           used;
     bool_t           is_fat32;
+    int              fat32_mount_idx;
     char             fat32_rel[VFS_MAX_PATH];
     struct vfs_node *node;
     uint32_t         offset;
@@ -33,20 +34,20 @@ static void copy_name(char *dst, const char *src, size_t max_len)
     dst[i] = '\0';
 }
 
-static bool_t is_fat32_path(const char *path, const char **out_rel)
+void vfs_invalidate_fat32_mount(int mount_idx)
 {
-    if (!fat32_is_mounted() || path == NULL) {
-        return FALSE;
+    int fd;
+    for (fd = 0; fd < VFS_MAX_FDS; fd++) {
+        if (fd_table[fd].used && fd_table[fd].is_fat32 &&
+            fd_table[fd].fat32_mount_idx == mount_idx) {
+            fd_table[fd].used            = FALSE;
+            fd_table[fd].is_fat32        = FALSE;
+            fd_table[fd].fat32_mount_idx = -1;
+            fd_table[fd].node            = NULL;
+            fd_table[fd].offset          = 0;
+            fd_table[fd].flags           = 0;
+        }
     }
-    if (strcmp(path, "/mnt") == 0) {
-        *out_rel = "";
-        return TRUE;
-    }
-    if (strncmp(path, "/mnt/", 5) == 0) {
-        *out_rel = &path[5];
-        return TRUE;
-    }
-    return FALSE;
 }
 
 static int32_t ramfile_read(struct vfs_node *node, uint32_t offset, uint32_t size, uint8_t *buf)
@@ -202,11 +203,13 @@ static int split_parent_and_name(const char *path, int32_t *out_parent, char *ou
 struct vfs_node *vfs_lookup(const char *path)
 {
     const char *rel;
+    int mount_idx;
     int32_t idx;
 
-    if (is_fat32_path(path, &rel) && rel[0] != '\0') {
+    mount_idx = fat32_match_mount(path, &rel);
+    if (mount_idx >= 0 && rel[0] != '\0') {
         struct vfs_dirent de;
-        if (fat32_stat_path(rel, &de) < 0) {
+        if (fat32_stat_path_idx(mount_idx, rel, &de) < 0) {
             return NULL;
         }
         memset(&fat32_proxy_node, 0, sizeof(fat32_proxy_node));
@@ -215,7 +218,7 @@ struct vfs_node *vfs_lookup(const char *path)
         fat32_proxy_node.type       = de.type;
         fat32_proxy_node.mode       = (de.type == VFS_TYPE_DIR) ? 0755U : 0644U;
         fat32_proxy_node.size       = de.size;
-        fat32_proxy_node.parent_idx = resolve_path_idx("/mnt");
+        fat32_proxy_node.parent_idx = resolve_path_idx(fat32_get_mount_point(mount_idx));
         return &fat32_proxy_node;
     }
 
@@ -229,12 +232,14 @@ struct vfs_node *vfs_lookup(const char *path)
 int vfs_mkdir(const char *path)
 {
     const char *rel;
+    int mount_idx;
     int32_t parent_idx;
     char name[VFS_MAX_NAME];
     int32_t idx;
 
-    if (is_fat32_path(path, &rel) && rel[0] != '\0') {
-        return fat32_create_path(rel, TRUE);
+    mount_idx = fat32_match_mount(path, &rel);
+    if (mount_idx >= 0 && rel[0] != '\0') {
+        return fat32_create_path_idx(mount_idx, rel, TRUE);
     }
 
     if (vfs_lookup(path) != NULL) {
@@ -254,17 +259,19 @@ int vfs_mkdir(const char *path)
 int vfs_create_file(const char *path, const char *content, uint32_t size)
 {
     const char *rel;
+    int mount_idx;
     int32_t parent_idx;
     char name[VFS_MAX_NAME];
     int32_t idx;
     struct vfs_node *existing;
 
-    if (is_fat32_path(path, &rel) && rel[0] != '\0') {
-        if (fat32_create_path(rel, FALSE) < 0) {
+    mount_idx = fat32_match_mount(path, &rel);
+    if (mount_idx >= 0 && rel[0] != '\0') {
+        if (fat32_create_path_idx(mount_idx, rel, FALSE) < 0) {
             return -1;
         }
         if (content != NULL && size > 0) {
-            if (fat32_write_path(rel, 0, size, (const uint8_t *)content, TRUE) < 0) {
+            if (fat32_write_path_idx(mount_idx, rel, 0, size, (const uint8_t *)content, TRUE) < 0) {
                 return -1;
             }
         }
@@ -381,32 +388,35 @@ int vfs_register_exec(const char *path, vfs_exec_fn exec_op, const char *desc)
 int vfs_open(const char *path, uint32_t flags)
 {
     const char *rel;
+    int mount_idx;
     struct vfs_node *node;
     int fd;
 
-    if (is_fat32_path(path, &rel) && rel[0] != '\0') {
+    mount_idx = fat32_match_mount(path, &rel);
+    if (mount_idx >= 0 && rel[0] != '\0') {
         struct vfs_dirent de;
-        if (fat32_stat_path(rel, &de) < 0) {
+        if (fat32_stat_path_idx(mount_idx, rel, &de) < 0) {
             if ((flags & VFS_O_CREAT) == 0) {
                 return -1;
             }
-            if (fat32_create_path(rel, FALSE) < 0 ||
-                fat32_stat_path(rel, &de) < 0) {
+            if (fat32_create_path_idx(mount_idx, rel, FALSE) < 0 ||
+                fat32_stat_path_idx(mount_idx, rel, &de) < 0) {
                 return -1;
             }
         }
         if (de.type == VFS_TYPE_FILE && (flags & VFS_O_TRUNC) != 0) {
-            (void)fat32_write_path(rel, 0, 0, NULL, TRUE);
+            (void)fat32_write_path_idx(mount_idx, rel, 0, 0, NULL, TRUE);
             de.size = 0;
         }
         for (fd = 0; fd < VFS_MAX_FDS; fd++) {
             if (!fd_table[fd].used) {
-                fd_table[fd].used     = TRUE;
-                fd_table[fd].is_fat32 = TRUE;
+                fd_table[fd].used            = TRUE;
+                fd_table[fd].is_fat32        = TRUE;
+                fd_table[fd].fat32_mount_idx = mount_idx;
                 copy_name(fd_table[fd].fat32_rel, rel, VFS_MAX_PATH);
-                fd_table[fd].node     = NULL;
-                fd_table[fd].flags    = flags;
-                fd_table[fd].offset   = ((flags & VFS_O_APPEND) != 0) ? de.size : 0U;
+                fd_table[fd].node            = NULL;
+                fd_table[fd].flags           = flags;
+                fd_table[fd].offset          = ((flags & VFS_O_APPEND) != 0) ? de.size : 0U;
                 return fd;
             }
         }
@@ -430,11 +440,12 @@ int vfs_open(const char *path, uint32_t flags)
 
     for (fd = 0; fd < VFS_MAX_FDS; fd++) {
         if (!fd_table[fd].used) {
-            fd_table[fd].used     = TRUE;
-            fd_table[fd].is_fat32 = FALSE;
-            fd_table[fd].node     = node;
-            fd_table[fd].flags    = flags;
-            fd_table[fd].offset   = ((flags & VFS_O_APPEND) != 0) ? node->size : 0U;
+            fd_table[fd].used            = TRUE;
+            fd_table[fd].is_fat32        = FALSE;
+            fd_table[fd].fat32_mount_idx = -1;
+            fd_table[fd].node            = node;
+            fd_table[fd].flags           = flags;
+            fd_table[fd].offset          = ((flags & VFS_O_APPEND) != 0) ? node->size : 0U;
             return fd;
         }
     }
@@ -450,7 +461,8 @@ int32_t vfs_read(int fd, void *buf, uint32_t count)
         return -1;
     }
     if (fd_table[fd].is_fat32) {
-        n = fat32_read_path(fd_table[fd].fat32_rel, fd_table[fd].offset, count, (uint8_t *)buf);
+        n = fat32_read_path_idx(fd_table[fd].fat32_mount_idx, fd_table[fd].fat32_rel,
+                                fd_table[fd].offset, count, (uint8_t *)buf);
         if (n > 0) {
             fd_table[fd].offset += (uint32_t)n;
         }
@@ -476,8 +488,8 @@ int32_t vfs_write(int fd, const void *buf, uint32_t count)
         return -1;
     }
     if (fd_table[fd].is_fat32) {
-        n = fat32_write_path(fd_table[fd].fat32_rel, fd_table[fd].offset, count,
-                             (const uint8_t *)buf, FALSE);
+        n = fat32_write_path_idx(fd_table[fd].fat32_mount_idx, fd_table[fd].fat32_rel,
+                                 fd_table[fd].offset, count, (const uint8_t *)buf, FALSE);
         if (n > 0) {
             fd_table[fd].offset += (uint32_t)n;
         }
@@ -499,11 +511,12 @@ int vfs_close(int fd)
     if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used) {
         return -1;
     }
-    fd_table[fd].used     = FALSE;
-    fd_table[fd].is_fat32 = FALSE;
-    fd_table[fd].node     = NULL;
-    fd_table[fd].offset   = 0;
-    fd_table[fd].flags    = 0;
+    fd_table[fd].used            = FALSE;
+    fd_table[fd].is_fat32        = FALSE;
+    fd_table[fd].fat32_mount_idx = -1;
+    fd_table[fd].node            = NULL;
+    fd_table[fd].offset          = 0;
+    fd_table[fd].flags           = 0;
     return 0;
 }
 
@@ -522,7 +535,7 @@ int32_t vfs_lseek(int fd, int32_t offset, int whence)
     } else if (whence == VFS_SEEK_END) {
         if (fd_table[fd].is_fat32) {
             struct vfs_dirent de;
-            if (fat32_stat_path(fd_table[fd].fat32_rel, &de) < 0) {
+            if (fat32_stat_path_idx(fd_table[fd].fat32_mount_idx, fd_table[fd].fat32_rel, &de) < 0) {
                 return -1;
             }
             base = (int32_t)de.size;
@@ -607,7 +620,7 @@ int vfs_ftruncate(int fd, uint32_t length)
         return -1;
     }
     if (fd_table[fd].is_fat32) {
-        return fat32_truncate_path(fd_table[fd].fat32_rel, length);
+        return fat32_truncate_path_idx(fd_table[fd].fat32_mount_idx, fd_table[fd].fat32_rel, length);
     }
     if (fd_table[fd].node == NULL || fd_table[fd].node->type != VFS_TYPE_FILE) {
         return -1;
@@ -626,11 +639,13 @@ int vfs_ftruncate(int fd, uint32_t length)
 int vfs_unlink(const char *path)
 {
     const char *rel;
+    int mount_idx;
     int32_t idx;
     int32_t i;
 
-    if (is_fat32_path(path, &rel) && rel[0] != '\0') {
-        return fat32_unlink_path(rel);
+    mount_idx = fat32_match_mount(path, &rel);
+    if (mount_idx >= 0 && rel[0] != '\0') {
+        return fat32_unlink_path_idx(mount_idx, rel);
     }
     idx = resolve_path_idx(path);
     if (idx <= 0) {
@@ -650,13 +665,15 @@ int vfs_unlink(const char *path)
 int vfs_stat(const char *path, struct vfs_dirent *out)
 {
     const char *rel;
+    int mount_idx;
     struct vfs_node *node;
 
     if (out == NULL || path == NULL) {
         return -1;
     }
-    if (is_fat32_path(path, &rel) && rel[0] != '\0') {
-        return fat32_stat_path(rel, out);
+    mount_idx = fat32_match_mount(path, &rel);
+    if (mount_idx >= 0 && rel[0] != '\0') {
+        return fat32_stat_path_idx(mount_idx, rel, out);
     }
     node = vfs_lookup(path);
     if (node == NULL) {
@@ -679,7 +696,7 @@ int vfs_fstat(int fd, struct vfs_dirent *out)
         return -1;
     }
     if (fd_table[fd].is_fat32) {
-        return fat32_stat_path(fd_table[fd].fat32_rel, out);
+        return fat32_stat_path_idx(fd_table[fd].fat32_mount_idx, fd_table[fd].fat32_rel, out);
     }
     node = fd_table[fd].node;
     if (node == NULL) {
@@ -708,6 +725,7 @@ bool_t vfs_is_chardev(int fd)
 int vfs_readdir(const char *dir_path, uint32_t index, struct vfs_dirent *out)
 {
     const char *rel;
+    int mount_idx;
     int32_t dir_idx;
     uint32_t cur = 0;
     int32_t i;
@@ -715,8 +733,9 @@ int vfs_readdir(const char *dir_path, uint32_t index, struct vfs_dirent *out)
     if (out == NULL) {
         return -1;
     }
-    if (is_fat32_path(dir_path, &rel)) {
-        return fat32_readdir_path(rel, index, out);
+    mount_idx = fat32_match_mount(dir_path, &rel);
+    if (mount_idx >= 0) {
+        return fat32_readdir_path_idx(mount_idx, rel, index, out);
     }
 
     dir_idx = resolve_path_idx(dir_path);
@@ -767,12 +786,15 @@ void vfs_init(void)
     (void)alloc_node("/", VFS_TYPE_DIR, -1);
     nodes[0].mode = 0755U;
 
-    /* Create standard root directories */
+    /* Create standard root directories and USB mass storage mountpoints */
     (void)vfs_mkdir("/dev");
     (void)vfs_mkdir("/bin");
     (void)vfs_mkdir("/lib");
     (void)vfs_mkdir("/etc");
     (void)vfs_mkdir("/mnt");
+    (void)vfs_mkdir("/media1");
+    (void)vfs_mkdir("/media2");
+    (void)vfs_mkdir("/media3");
     (void)vfs_mkdir("/tmp");
 
     /* Populate /etc configuration files */
@@ -781,5 +803,5 @@ void vfs_init(void)
     (void)vfs_create_file("/etc/inittab", inittab, (uint32_t)strlen(inittab));
     (void)vfs_create_file("/etc/keymap", keymap, (uint32_t)strlen(keymap));
 
-    kprintf("[VFS] Root filesystem initialized (/, /dev, /bin, /lib, /etc, /mnt, /tmp)\n");
+    kprintf("[VFS] Root filesystem initialized (/, /dev, /bin, /lib, /etc, /mnt, /media1..3, /tmp)\n");
 }

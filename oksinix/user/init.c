@@ -124,24 +124,37 @@ int bin_init_main(int argc, char **argv)
             fd_puts(fd_out, "usb-mouse ");
         }
         if (xhci_has_usb_storage()) {
-            int msc_cnt = xhci_get_msc_count();
             int i;
+            int printed = 0;
             fd_puts(fd_out, "usb-storage:");
-            for (i = 0; i < msc_cnt; i++) {
+            for (i = 0; i < XHCI_MAX_MSC_DEVS; i++) {
+                struct xhci_msc_info msc;
                 char sd_name[12];
-                if (i > 0) {
+                if (xhci_get_msc_info_idx(i, &msc) != 0 || !msc.present) {
+                    continue;
+                }
+                if (printed > 0) {
                     fd_puts(fd_out, ",");
                 }
                 memcpy(sd_name, "/dev/sda", 9);
                 sd_name[7] = (char)('a' + i);
                 fd_puts(fd_out, sd_name);
+                printed++;
             }
         }
         fd_puts(fd_out, ")\n");
     }
 
-    if (fat32_is_mounted()) {
-        fd_puts(fd_out, "[/bin/init] Mounted FAT32 filesystem on /mnt\n");
+    {
+        int m;
+        for (m = 0; m < FAT32_MAX_MOUNTS; m++) {
+            struct fat32_fs_info fi;
+            if (fat32_get_info_idx(m, &fi) == 0 && fi.mounted) {
+                fd_puts(fd_out, "[/bin/init] Mounted FAT32 filesystem on ");
+                fd_puts(fd_out, fi.mount_point);
+                fd_puts(fd_out, "\n");
+            }
+        }
     }
 
     console_refresh();
@@ -161,5 +174,6 @@ void user_programs_init(void)
     (void)vfs_register_exec("/bin/init", bin_init_main, "Oksinix PID 1 init");
     (void)vfs_register_exec("/bin/sh",   bin_sh_main,   "Oksinix interactive shell");
     (void)vfs_register_exec("/bin/vi",   bin_vi_main,   "Oksinix modal vi editor");
+    (void)vfs_register_exec("/bin/cc",   bin_cc_main,   "c compiler");
     kprintf("[VFS] Registered executables: /bin/init, /bin/sh, /bin/vi\n");
 }

@@ -10,7 +10,7 @@ QEMU    := qemu-system-i386
 CFLAGS  := -m32 -std=c89 -pedantic -Wall -Wextra -Werror \
            -ffreestanding -fno-builtin -fno-stack-protector \
            -fno-pic -fno-pie -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float \
-           -O2 -Iinclude
+           -Os -Iinclude
 
 ASFLAGS := -m32
 
@@ -42,6 +42,7 @@ C_SRCS   := arch/x86/gdt.c \
             user/init.c \
             user/sh.c \
             user/vi.c \
+            user/cc.c \
             lib/string.c \
             kernel/syscall.c \
             kernel/main.c

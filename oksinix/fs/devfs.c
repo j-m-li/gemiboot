@@ -186,37 +186,43 @@ static int32_t dev_sd_write(struct vfs_node *node, uint32_t offset, uint32_t siz
 
 static int devfs_register_usb_disks(void)
 {
-    int msc_count = xhci_get_msc_count();
     int i;
-    int added = 0;
+    int changed = 0;
 
-    for (i = 0; i < msc_count; i++) {
+    for (i = 0; i < XHCI_MAX_MSC_DEVS; i++) {
         struct xhci_msc_info msc;
+        struct vfs_node *existing;
         char dev_path[16];
         uint16_t minor = (uint16_t)(i * 16);
 
         memcpy(dev_path, "/dev/sda", 9);
         dev_path[7] = (char)('a' + i);
-        if (vfs_lookup(dev_path) != NULL) {
-            continue;
-        }
+        existing = vfs_lookup(dev_path);
+
         if (xhci_get_msc_info_idx(i, &msc) == 0 && msc.present) {
-            (void)vfs_register_blockdev(dev_path, 8, minor,
-                                        msc.block_count * msc.block_size,
-                                        dev_sd_read, dev_sd_write);
-            kprintf("[DEVFS] Registered block device %s (8,%u) size=%u bytes\n",
-                    dev_path, (uint32_t)minor, msc.block_count * msc.block_size);
-            added = 1;
+            if (existing == NULL) {
+                (void)vfs_register_blockdev(dev_path, 8, minor,
+                                            msc.block_count * msc.block_size,
+                                            dev_sd_read, dev_sd_write);
+                kprintf("[DEVFS] Registered block device %s (8,%u) size=%u bytes\n",
+                        dev_path, (uint32_t)minor, msc.block_count * msc.block_size);
+                changed = 1;
+            } else {
+                existing->size = msc.block_count * msc.block_size;
+            }
+        } else if (existing != NULL) {
+            (void)vfs_unlink(dev_path);
+            kprintf("[DEVFS] Unregistered block device %s\n", dev_path);
+            changed = 1;
         }
     }
-    return added;
+    return changed;
 }
 
 void devfs_sync_usb_storage(void)
 {
-    if (devfs_register_usb_disks() > 0 && !fat32_is_mounted()) {
-        (void)fat32_init();
-    }
+    (void)devfs_register_usb_disks();
+    fat32_sync_mounts();
 }
 
 void devfs_init(void)

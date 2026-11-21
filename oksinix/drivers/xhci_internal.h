@@ -83,21 +83,25 @@ bool_t xhci_has_free_slot(void);
 int    xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                              uint32_t tier, uint8_t speed,
                              uint8_t parent_hub_slot, uint8_t parent_port);
+void   xhci_disconnect_port(uint8_t root_port, uint8_t parent_hub_slot, uint8_t parent_port);
 
 /* USB HID Boot Keyboard & Mouse class driver (drivers/usbhid.c) */
 void   usbhid_reset(void);
 void   usbhid_init_kbd(struct xhci_usb_dev *dev);
 void   usbhid_init_mouse(struct xhci_usb_dev *dev);
+void   usbhid_remove_device(struct xhci_usb_dev *dev);
 bool_t usbhid_handle_transfer_event(uint8_t slot_id);
 
 /* USB Mass Storage BOT/SCSI class driver (drivers/usbmsc.c) */
 void   usbmsc_reset(void);
 void   usbmsc_init_device(struct xhci_usb_dev *dev);
+void   usbmsc_remove_device(struct xhci_usb_dev *dev);
 
 /* USB Hub class driver (drivers/usbhub.c) */
 void     usbhub_reset(void);
 uint32_t usbhub_read_descriptor(struct xhci_usb_dev *hub_dev, uint32_t tier);
 void     usbhub_init_device(struct xhci_usb_dev *hub_dev, uint32_t tier, uint32_t pwr_delay_ms);
+void     usbhub_remove_device(struct xhci_usb_dev *hub_dev);
 void     usbhub_poll_ports(void);
 
 #endif /* OKSINIX_XHCI_INTERNAL_H */
