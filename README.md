@@ -1,4 +1,4 @@
-# GEMIBOOT x86 boot loader for GEMIOS
+# GEMIBOOT x86 boot loader for GEMIOS or OksiniX
 
 agy
 
