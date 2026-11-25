@@ -7,6 +7,7 @@
 #include "net.h"
 #include "xhci.h"
 #include "pit.h"
+#include "io.h"
 #include "serial.h"
 #include "string.h"
 
@@ -28,7 +29,12 @@
 
 #define NET_SOCK_RX_SLOTS 16U
 #define NET_SOCK_RX_MAX   1500U
-#define NET_ARP_CACHE_SZ  4U
+#define NET_ARP_CACHE_SZ  8U
+#define NET_ARP_TTL_TICKS 60000U /* 60s at 1000 Hz PIT */
+#define NET_REASM_SLOTS   2U
+#define NET_REASM_MAX     2048U  /* 256 * 8-byte fragment blocks */
+#define NET_REASM_TTL     5000U  /* 5s fragment reassembly timeout */
+#define TCP_RCV_WIN       4096U
 
 #define TCP_STATE_CLOSED      0U
 #define TCP_STATE_SYN_SENT    1U
@@ -76,15 +82,35 @@ struct net_arp_entry {
     bool_t   valid;
     uint32_t ip;            /* network byte order */
     uint8_t  mac[6];
+    uint32_t expires_tick;
+    uint32_t last_used_tick;
 };
 
-static struct net_sock      sock_table[NET_MAX_SOCKETS];
-static struct net_arp_entry arp_cache[NET_ARP_CACHE_SZ];
-static uint32_t             local_ip_be   = 0;
-static uint32_t             netmask_be    = 0;
-static uint32_t             gateway_ip_be = 0;
-static uint32_t             dns_ip_be     = 0;
-static bool_t               dhcp_zero_src = FALSE;
+struct net_ipv4_reasm {
+    bool_t   used;
+    bool_t   have_last;
+    uint8_t  proto;
+    uint16_t ip_id;
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint32_t expires_tick;
+    uint32_t total_len;
+    uint8_t  block_map[NET_REASM_MAX / 64U]; /* 1 bit per 8-byte fragment block */
+    uint8_t  data[NET_REASM_MAX];
+};
+
+static struct net_sock       sock_table[NET_MAX_SOCKETS];
+static struct net_arp_entry  arp_cache[NET_ARP_CACHE_SZ];
+static struct net_ipv4_reasm reasm_table[NET_REASM_SLOTS];
+static uint8_t               reasm_deliver_buf[NET_REASM_MAX];
+static uint32_t             arp_pending_ip = 0UL;
+static uint32_t             local_ip_be    = 0;
+static uint32_t             netmask_be     = 0;
+static uint32_t             gateway_ip_be  = 0;
+static uint32_t             dns_ip_be      = 0;
+static bool_t               dhcp_zero_src  = FALSE;
+static bool_t               dhcp_active    = FALSE;
+static uint32_t             tcp_isn_secret = 0x9E3779B9UL;
 static uint16_t             next_ephemeral_port = 49152U;
 static uint16_t             ipv4_ident = 1U;
 static uint16_t             dns_txid   = 1U;
@@ -263,33 +289,141 @@ static int tcp_send_segment(struct net_sock *sk, uint8_t flags,
     return net_send_ipv4(sk->peer_ip, IPPROTO_TCP, tcp_tx_buf, seg_len);
 }
 
+static uint32_t tcp_mix32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x85EBCA6BUL;
+    x ^= x >> 13;
+    x *= 0xC2B2AE35UL;
+    x ^= x >> 16;
+    return x;
+}
+
+/* RFC 6528-style hardened ISN: monotonic clock + keyed 4-tuple hash + PIT jitter */
+static uint32_t tcp_generate_isn(uint32_t loc_ip, uint16_t loc_port,
+                                 uint32_t rem_ip, uint16_t rem_port)
+{
+    struct xhci_net_info ni;
+    uint32_t ticks = pit_get_ticks();
+    uint32_t pit_cnt;
+    uint32_t h;
+    uint8_t lo, hi;
+
+    outb(0x43U, 0x00U); /* Latch PIT channel 0 current count for sub-ms jitter */
+    lo = inb(0x40U);
+    hi = inb(0x40U);
+    pit_cnt = ((uint32_t)hi << 8) | (uint32_t)lo;
+
+    tcp_isn_secret = tcp_mix32(tcp_isn_secret ^ ticks ^ (pit_cnt << 16) ^ 0xA5A55A5AUL);
+    if (xhci_has_usb_net()) {
+        xhci_get_net_info(&ni);
+        tcp_isn_secret = tcp_mix32(tcp_isn_secret ^ read_be32(&ni.mac[2]));
+    }
+
+    h = tcp_isn_secret;
+    h = tcp_mix32(h ^ loc_ip);
+    h = tcp_mix32(h ^ rem_ip);
+    h = tcp_mix32(h ^ (((uint32_t)loc_port << 16) | (uint32_t)rem_port));
+    return h + (ticks * 250UL);
+}
+
+static bool_t arp_valid_unicast_mac(const uint8_t mac[6])
+{
+    int i;
+    uint8_t or_all = 0U;
+
+    /* Reject multicast/broadcast MACs (bit 0 of first octet set) */
+    if ((mac[0] & 0x01U) != 0U) {
+        return FALSE;
+    }
+    /* Reject all-zero MAC */
+    for (i = 0; i < 6; i++) {
+        or_all |= mac[i];
+    }
+    return (or_all != 0U) ? TRUE : FALSE;
+}
+
+static bool_t arp_valid_sender_ip(uint32_t ip_be)
+{
+    uint8_t first = (uint8_t)(ip_be & 0xFFU);
+    if (ip_be == 0UL || ip_be == 0xFFFFFFFFUL || ip_be == local_ip_be) {
+        return FALSE;
+    }
+    /* Reject loopback (127/8), multicast (224..239), and reserved (240..255) */
+    if (first == 0U || first == 127U || first >= 224U) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static bool_t arp_cache_has_ip(uint32_t ip_be)
+{
+    uint32_t now = pit_get_ticks();
+    uint32_t i;
+    for (i = 0; i < NET_ARP_CACHE_SZ; i++) {
+        if (arp_cache[i].valid && arp_cache[i].ip == ip_be &&
+            (int32_t)(now - arp_cache[i].expires_tick) < 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static void arp_cache_put(uint32_t ip_be, const uint8_t mac[6])
 {
+    uint32_t now = pit_get_ticks();
     uint32_t i;
+    uint32_t victim = 0U;
+    bool_t found_free = FALSE;
+
+    if (!arp_valid_sender_ip(ip_be) || !arp_valid_unicast_mac(mac)) {
+        return;
+    }
+
     for (i = 0; i < NET_ARP_CACHE_SZ; i++) {
         if (arp_cache[i].valid && arp_cache[i].ip == ip_be) {
             memcpy(arp_cache[i].mac, mac, 6U);
+            arp_cache[i].expires_tick   = now + NET_ARP_TTL_TICKS;
+            arp_cache[i].last_used_tick = now;
             return;
         }
     }
     for (i = 0; i < NET_ARP_CACHE_SZ; i++) {
-        if (!arp_cache[i].valid) {
-            arp_cache[i].valid = TRUE;
-            arp_cache[i].ip    = ip_be;
-            memcpy(arp_cache[i].mac, mac, 6U);
-            return;
+        if (!arp_cache[i].valid || (int32_t)(now - arp_cache[i].expires_tick) >= 0) {
+            victim = i;
+            found_free = TRUE;
+            break;
         }
     }
-    arp_cache[0].valid = TRUE;
-    arp_cache[0].ip    = ip_be;
-    memcpy(arp_cache[0].mac, mac, 6U);
+    if (!found_free) {
+        /* LRU eviction: replace least-recently-used entry */
+        uint32_t oldest_age = 0U;
+        for (i = 0; i < NET_ARP_CACHE_SZ; i++) {
+            uint32_t age = now - arp_cache[i].last_used_tick;
+            if (age >= oldest_age) {
+                oldest_age = age;
+                victim = i;
+            }
+        }
+    }
+    arp_cache[victim].valid          = TRUE;
+    arp_cache[victim].ip             = ip_be;
+    arp_cache[victim].expires_tick   = now + NET_ARP_TTL_TICKS;
+    arp_cache[victim].last_used_tick = now;
+    memcpy(arp_cache[victim].mac, mac, 6U);
 }
 
 static bool_t arp_cache_lookup(uint32_t ip_be, uint8_t out_mac[6])
 {
+    uint32_t now = pit_get_ticks();
     uint32_t i;
     for (i = 0; i < NET_ARP_CACHE_SZ; i++) {
         if (arp_cache[i].valid && arp_cache[i].ip == ip_be) {
+            if ((int32_t)(now - arp_cache[i].expires_tick) >= 0) {
+                arp_cache[i].valid = FALSE;
+                return FALSE;
+            }
+            arp_cache[i].last_used_tick = now;
             memcpy(out_mac, arp_cache[i].mac, 6U);
             return TRUE;
         }
@@ -329,158 +463,375 @@ static void arp_send_packet(uint16_t oper, const uint8_t dst_mac[6],
     (void)xhci_net_send(pkt, 42U);
 }
 
+static void net_process_ipv4_payload(uint32_t src_ip, uint32_t dst_ip,
+                                     bool_t is_local_dst, bool_t is_bcast_dst,
+                                     uint8_t proto, const uint8_t *payload,
+                                     uint32_t payload_len)
+{
+    int i;
+
+    if (proto == IPPROTO_UDP && payload_len >= 8U) {
+        const uint8_t *udp = payload;
+        uint16_t src_port, dst_port, udp_len;
+        memcpy(&src_port, &udp[0], 2U);
+        memcpy(&dst_port, &udp[2], 2U);
+        udp_len = (uint16_t)(((uint16_t)udp[4] << 8) | (uint16_t)udp[5]);
+        if (udp_len < 8U || udp_len > payload_len) {
+            return;
+        }
+        if (!is_local_dst && !is_bcast_dst &&
+            !(dhcp_active && net_ntohs(dst_port) == 68U)) {
+            return;
+        }
+        for (i = 0; i < NET_MAX_SOCKETS; i++) {
+            struct net_sock *sk = &sock_table[i];
+            if (sk->used && sk->type == SOCK_DGRAM && sk->bound && sk->local_port == dst_port) {
+                if (!sk->connected ||
+                    ((sk->peer_ip == 0U || sk->peer_ip == src_ip) &&
+                     (sk->peer_port == 0U || sk->peer_port == src_port))) {
+                    sock_enqueue_rx(sk, src_ip, src_port, &udp[8], (uint32_t)udp_len - 8U);
+                }
+            }
+        }
+    } else if (proto == IPPROTO_TCP && payload_len >= 20U) {
+        const uint8_t *tcp = payload;
+        uint16_t src_port, dst_port;
+        uint32_t seq, ack, data_off, tcp_data_len;
+        uint8_t flags;
+
+        /* TCP must be unicast to our local IP and pass TCP checksum */
+        if (!is_local_dst || net_tcp_checksum(src_ip, dst_ip, tcp, payload_len) != 0U) {
+            return;
+        }
+
+        memcpy(&src_port, &tcp[0], 2U);
+        memcpy(&dst_port, &tcp[2], 2U);
+        seq = net_ntohl(read_be32(&tcp[4]));
+        ack = net_ntohl(read_be32(&tcp[8]));
+        data_off = (uint32_t)((tcp[12] >> 4) & 0x0FU) * 4U;
+        flags = tcp[13];
+        if (data_off < 20U || data_off > payload_len) {
+            return;
+        }
+        tcp_data_len = payload_len - data_off;
+        if (tcp_data_len > TCP_RCV_WIN) {
+            tcp_data_len = TCP_RCV_WIN;
+        }
+
+        for (i = 0; i < NET_MAX_SOCKETS; i++) {
+            struct net_sock *sk = &sock_table[i];
+            if (!sk->used || sk->type != SOCK_STREAM || !sk->bound ||
+                sk->local_port != dst_port || sk->peer_ip != src_ip ||
+                sk->peer_port != src_port) {
+                continue;
+            }
+            if (sk->tcp_state == TCP_STATE_SYN_SENT) {
+                if ((flags & TCP_RST) != 0U) {
+                    /* RFC 793 / RFC 5961: RST in SYN_SENT must ACK our exact SYN */
+                    if ((flags & TCP_ACK) != 0U && ack == sk->tcp_snd_nxt) {
+                        sk->tcp_rst   = TRUE;
+                        sk->tcp_eof   = TRUE;
+                        sk->tcp_state = TCP_STATE_CLOSED;
+                    }
+                    break;
+                }
+                if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
+                    ack == sk->tcp_snd_nxt) {
+                    sk->tcp_snd_una = ack;
+                    sk->tcp_rcv_nxt = seq + 1U;
+                    sk->tcp_state   = TCP_STATE_ESTABLISHED;
+                    (void)tcp_send_segment(sk, TCP_ACK, sk->tcp_snd_nxt,
+                                           sk->tcp_rcv_nxt, NULL, 0U);
+                }
+                break;
+            }
+            if (sk->tcp_state == TCP_STATE_ESTABLISHED ||
+                sk->tcp_state == TCP_STATE_CLOSE_WAIT ||
+                sk->tcp_state == TCP_STATE_FIN_WAIT) {
+                int32_t seq_rel = (int32_t)(seq - sk->tcp_rcv_nxt);
+                bool_t need_ack = FALSE;
+
+                /* RFC 5961 §3.2: exact-match RST closes; in-window RST gets challenge ACK */
+                if ((flags & TCP_RST) != 0U) {
+                    if (seq == sk->tcp_rcv_nxt) {
+                        sk->tcp_rst   = TRUE;
+                        sk->tcp_eof   = TRUE;
+                        sk->tcp_state = TCP_STATE_CLOSED;
+                    } else if (seq_rel > 0 && (uint32_t)seq_rel < TCP_RCV_WIN) {
+                        (void)tcp_send_segment(sk, TCP_ACK, sk->tcp_snd_nxt,
+                                               sk->tcp_rcv_nxt, NULL, 0U);
+                    }
+                    break;
+                }
+
+                /* RFC 5961 §4: reject SYN in synchronized state with challenge ACK */
+                if ((flags & TCP_SYN) != 0U) {
+                    if (seq_rel >= -(int32_t)TCP_RCV_WIN && seq_rel < (int32_t)TCP_RCV_WIN) {
+                        (void)tcp_send_segment(sk, TCP_ACK, sk->tcp_snd_nxt,
+                                               sk->tcp_rcv_nxt, NULL, 0U);
+                    }
+                    break;
+                }
+
+                /* Drop segments completely outside our receive window */
+                if (seq_rel >= (int32_t)TCP_RCV_WIN ||
+                    (int32_t)((seq + tcp_data_len) - sk->tcp_rcv_nxt) < -(int32_t)TCP_RCV_WIN) {
+                    break;
+                }
+
+                /* RFC 793: only advance SND.UNA if ACK is in (SND.UNA, SND.NXT] */
+                if ((flags & TCP_ACK) != 0U &&
+                    (int32_t)(ack - sk->tcp_snd_una) > 0 &&
+                    (int32_t)(ack - sk->tcp_snd_nxt) <= 0) {
+                    sk->tcp_snd_una = ack;
+                }
+
+                if (tcp_data_len > 0U) {
+                    if (seq == sk->tcp_rcv_nxt) {
+                        sock_enqueue_rx(sk, src_ip, src_port,
+                                        &tcp[data_off], tcp_data_len);
+                        sk->tcp_rcv_nxt += tcp_data_len;
+                        need_ack = TRUE;
+                    } else if (seq_rel < 0 &&
+                               (int32_t)((seq + tcp_data_len) - sk->tcp_rcv_nxt) > 0) {
+                        uint32_t skip = sk->tcp_rcv_nxt - seq;
+                        uint32_t take = tcp_data_len - skip;
+                        sock_enqueue_rx(sk, src_ip, src_port,
+                                        &tcp[data_off + skip], take);
+                        sk->tcp_rcv_nxt += take;
+                        need_ack = TRUE;
+                    } else if (seq_rel < 0) {
+                        /* Duplicate retransmit of already-received data: re-ACK */
+                        need_ack = TRUE;
+                    }
+                }
+
+                /* Only honor FIN when it arrives exactly in sequence */
+                if ((flags & TCP_FIN) != 0U && seq + tcp_data_len == sk->tcp_rcv_nxt) {
+                    sk->tcp_rcv_nxt += 1U;
+                    sk->tcp_eof = TRUE;
+                    if (sk->tcp_state == TCP_STATE_ESTABLISHED) {
+                        sk->tcp_state = TCP_STATE_CLOSE_WAIT;
+                    } else {
+                        sk->tcp_state = TCP_STATE_CLOSED;
+                    }
+                    need_ack = TRUE;
+                }
+                if (need_ack) {
+                    (void)tcp_send_segment(sk, TCP_ACK, sk->tcp_snd_nxt,
+                                           sk->tcp_rcv_nxt, NULL, 0U);
+                }
+            }
+            break;
+        }
+    } else if (proto == IPPROTO_ICMP && payload_len >= 8U && is_local_dst) {
+        const uint8_t *icmp = payload;
+        for (i = 0; i < NET_MAX_SOCKETS; i++) {
+            struct net_sock *sk = &sock_table[i];
+            if (sk->used && sk->type == SOCK_RAW &&
+                (sk->protocol == IPPROTO_ICMP || sk->protocol == IPPROTO_IP)) {
+                if (!sk->connected || sk->peer_ip == 0U || sk->peer_ip == src_ip) {
+                    sock_enqueue_rx(sk, src_ip, 0U, icmp, payload_len);
+                }
+            }
+        }
+    }
+}
+
+/* RFC 791 / RFC 5722 overlap-safe IPv4 fragment reassembler */
+static void net_ipv4_reassemble(uint32_t src_ip, uint32_t dst_ip,
+                                bool_t is_local_dst, bool_t is_bcast_dst,
+                                uint16_t ip_id, uint8_t proto, uint16_t frag_off,
+                                const uint8_t *frag_data, uint32_t frag_len)
+{
+    uint32_t byte_off = (uint32_t)(frag_off & 0x1FFFU) * 8U;
+    bool_t   more_frags = ((frag_off & 0x2000U) != 0U) ? TRUE : FALSE;
+    uint32_t now = pit_get_ticks();
+    struct net_ipv4_reasm *slot = NULL;
+    uint32_t i;
+    uint32_t start_blk, num_blks, blk;
+
+    if (frag_len == 0U || byte_off + frag_len > NET_REASM_MAX) {
+        return;
+    }
+    if (more_frags && (frag_len & 7U) != 0U) {
+        return; /* Non-final IPv4 fragments must be multiples of 8 bytes */
+    }
+
+    for (i = 0; i < NET_REASM_SLOTS; i++) {
+        if (reasm_table[i].used && (int32_t)(now - reasm_table[i].expires_tick) >= 0) {
+            reasm_table[i].used = FALSE;
+        }
+        if (reasm_table[i].used &&
+            reasm_table[i].src_ip == src_ip &&
+            reasm_table[i].dst_ip == dst_ip &&
+            reasm_table[i].ip_id  == ip_id  &&
+            reasm_table[i].proto  == proto) {
+            slot = &reasm_table[i];
+            break;
+        }
+    }
+
+    if (slot == NULL) {
+        for (i = 0; i < NET_REASM_SLOTS; i++) {
+            if (!reasm_table[i].used) {
+                slot = &reasm_table[i];
+                break;
+            }
+        }
+        if (slot == NULL) {
+            slot = &reasm_table[0];
+        }
+        memset(slot, 0, sizeof(*slot));
+        slot->used         = TRUE;
+        slot->proto        = proto;
+        slot->ip_id        = ip_id;
+        slot->src_ip       = src_ip;
+        slot->dst_ip       = dst_ip;
+        slot->expires_tick = now + NET_REASM_TTL;
+    }
+
+    if (!more_frags) {
+        uint32_t end_off = byte_off + frag_len;
+        if (slot->have_last && slot->total_len != end_off) {
+            slot->used = FALSE;
+            return;
+        }
+        slot->have_last = TRUE;
+        slot->total_len = end_off;
+    } else if (slot->have_last && byte_off + frag_len > slot->total_len) {
+        slot->used = FALSE;
+        return;
+    }
+
+    start_blk = byte_off / 8U;
+    num_blks  = (frag_len + 7U) / 8U;
+
+    /* RFC 5722: reject overlapping fragments and discard the whole datagram */
+    for (blk = start_blk; blk < start_blk + num_blks; blk++) {
+        if ((slot->block_map[blk / 8U] & (1U << (blk & 7U))) != 0U) {
+            slot->used = FALSE;
+            return;
+        }
+    }
+
+    memcpy(&slot->data[byte_off], frag_data, frag_len);
+    for (blk = start_blk; blk < start_blk + num_blks; blk++) {
+        slot->block_map[blk / 8U] |= (uint8_t)(1U << (blk & 7U));
+    }
+
+    if (slot->have_last && slot->total_len > 0U) {
+        uint32_t need_blks = (slot->total_len + 7U) / 8U;
+        uint32_t deliver_len;
+        for (blk = 0; blk < need_blks; blk++) {
+            if ((slot->block_map[blk / 8U] & (1U << (blk & 7U))) == 0U) {
+                return; /* Still waiting for missing fragment(s) */
+            }
+        }
+        deliver_len = slot->total_len;
+        memcpy(reasm_deliver_buf, slot->data, deliver_len);
+        slot->used = FALSE;
+        net_process_ipv4_payload(src_ip, dst_ip, is_local_dst, is_bcast_dst,
+                                 proto, reasm_deliver_buf, deliver_len);
+    }
+}
+
 static void net_process_frame(const uint8_t *frame, uint32_t len)
 {
+    static const uint8_t bcast_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    struct xhci_net_info ni;
     uint16_t ethertype;
 
     if (len < 14U) {
         return;
     }
+
+    /* Drop Ethernet frames not addressed to our MAC or broadcast */
+    if (xhci_has_usb_net()) {
+        xhci_get_net_info(&ni);
+        if (memcmp(&frame[0], ni.mac, 6U) != 0 &&
+            memcmp(&frame[0], bcast_mac, 6U) != 0) {
+            return;
+        }
+    }
+
     ethertype = (uint16_t)(((uint16_t)frame[12] << 8) | (uint16_t)frame[13]);
 
     if (ethertype == 0x0806U && len >= 42U) {
-        uint16_t oper = (uint16_t)(((uint16_t)frame[20] << 8) | (uint16_t)frame[21]);
-        uint32_t spa  = read_be32(&frame[28]);
-        uint32_t tpa  = read_be32(&frame[38]);
-        arp_cache_put(spa, &frame[22]);
+        uint16_t htype = (uint16_t)(((uint16_t)frame[14] << 8) | (uint16_t)frame[15]);
+        uint16_t ptype = (uint16_t)(((uint16_t)frame[16] << 8) | (uint16_t)frame[17]);
+        uint8_t  hlen  = frame[18];
+        uint8_t  plen  = frame[19];
+        uint16_t oper  = (uint16_t)(((uint16_t)frame[20] << 8) | (uint16_t)frame[21]);
+        uint32_t spa   = read_be32(&frame[28]);
+        uint32_t tpa   = read_be32(&frame[38]);
+
+        if (htype != 1U || ptype != 0x0800U || hlen != 6U || plen != 4U) {
+            return;
+        }
+        if (!arp_valid_sender_ip(spa) || !arp_valid_unicast_mac(&frame[22])) {
+            return;
+        }
+
         if (oper == 1U && tpa == local_ip_be) {
+            if ((spa & netmask_be) == (local_ip_be & netmask_be)) {
+                arp_cache_put(spa, &frame[22]);
+            }
             arp_send_packet(2U, &frame[22], &frame[22], spa);
+        } else if (oper == 2U && tpa == local_ip_be) {
+            /* Only accept solicited replies or refreshes of existing entries */
+            if (spa == arp_pending_ip || arp_cache_has_ip(spa)) {
+                arp_cache_put(spa, &frame[22]);
+            }
         }
         return;
     }
 
     if (ethertype == 0x0800U && len >= 34U) {
-        uint8_t ihl = (uint8_t)((frame[14] & 0x0FU) * 4U);
+        uint8_t  ver        = (uint8_t)(frame[14] >> 4);
+        uint8_t  ihl        = (uint8_t)((frame[14] & 0x0FU) * 4U);
         uint16_t ip_tot_len = (uint16_t)(((uint16_t)frame[16] << 8) | (uint16_t)frame[17]);
-        uint8_t proto = frame[23];
-        uint32_t src_ip = read_be32(&frame[26]);
+        uint16_t ip_id      = (uint16_t)(((uint16_t)frame[18] << 8) | (uint16_t)frame[19]);
+        uint16_t frag_off   = (uint16_t)(((uint16_t)frame[20] << 8) | (uint16_t)frame[21]);
+        uint8_t  proto      = frame[23];
+        uint32_t src_ip     = read_be32(&frame[26]);
+        uint32_t dst_ip     = read_be32(&frame[30]);
+        uint32_t subnet_bcast;
+        bool_t   is_local_dst;
+        bool_t   is_bcast_dst;
         uint32_t payload_off;
         uint32_t payload_len;
-        int i;
 
-        if (ihl < 20U || 14U + ihl > len || ip_tot_len < ihl) {
+        if (ver != 4U || ihl < 20U || 14U + ihl > len || ip_tot_len < ihl) {
             return;
         }
+        if (net_checksum16(&frame[14], ihl) != 0U) {
+            return; /* Drop corrupted IPv4 header */
+        }
+
         payload_off = 14U + ihl;
         payload_len = (uint32_t)ip_tot_len - ihl;
         if (payload_off + payload_len > len) {
-            payload_len = len - payload_off;
+            return; /* Drop truncated IPv4 packet */
         }
 
-        if (proto == IPPROTO_UDP && payload_len >= 8U) {
-            const uint8_t *udp = &frame[payload_off];
-            uint16_t src_port, dst_port, udp_len;
-            memcpy(&src_port, &udp[0], 2U);
-            memcpy(&dst_port, &udp[2], 2U);
-            udp_len = (uint16_t)(((uint16_t)udp[4] << 8) | (uint16_t)udp[5]);
-            if (udp_len < 8U || udp_len > payload_len) {
-                return;
-            }
-            for (i = 0; i < NET_MAX_SOCKETS; i++) {
-                struct net_sock *sk = &sock_table[i];
-                if (sk->used && sk->type == SOCK_DGRAM && sk->bound && sk->local_port == dst_port) {
-                    if (!sk->connected ||
-                        ((sk->peer_ip == 0U || sk->peer_ip == src_ip) &&
-                         (sk->peer_port == 0U || sk->peer_port == src_port))) {
-                        sock_enqueue_rx(sk, src_ip, src_port, &udp[8], (uint32_t)udp_len - 8U);
-                    }
-                }
-            }
-        } else if (proto == IPPROTO_TCP && payload_len >= 20U) {
-            const uint8_t *tcp = &frame[payload_off];
-            uint16_t src_port, dst_port;
-            uint32_t seq, ack, data_off, tcp_data_len;
-            uint8_t flags;
-
-            memcpy(&src_port, &tcp[0], 2U);
-            memcpy(&dst_port, &tcp[2], 2U);
-            seq = net_ntohl(read_be32(&tcp[4]));
-            ack = net_ntohl(read_be32(&tcp[8]));
-            data_off = (uint32_t)((tcp[12] >> 4) & 0x0FU) * 4U;
-            flags = tcp[13];
-            if (data_off < 20U || data_off > payload_len) {
-                return;
-            }
-            tcp_data_len = payload_len - data_off;
-
-            for (i = 0; i < NET_MAX_SOCKETS; i++) {
-                struct net_sock *sk = &sock_table[i];
-                if (!sk->used || sk->type != SOCK_STREAM || !sk->bound ||
-                    sk->local_port != dst_port || sk->peer_ip != src_ip ||
-                    sk->peer_port != src_port) {
-                    continue;
-                }
-                if ((flags & TCP_RST) != 0U) {
-                    sk->tcp_rst   = TRUE;
-                    sk->tcp_eof   = TRUE;
-                    sk->tcp_state = TCP_STATE_CLOSED;
-                    break;
-                }
-                if (sk->tcp_state == TCP_STATE_SYN_SENT) {
-                    if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
-                        ack == sk->tcp_snd_nxt) {
-                        sk->tcp_snd_una = ack;
-                        sk->tcp_rcv_nxt = seq + 1U;
-                        sk->tcp_state   = TCP_STATE_ESTABLISHED;
-                        (void)tcp_send_segment(sk, TCP_ACK, sk->tcp_snd_nxt,
-                                               sk->tcp_rcv_nxt, NULL, 0U);
-                    }
-                    break;
-                }
-                if (sk->tcp_state == TCP_STATE_ESTABLISHED ||
-                    sk->tcp_state == TCP_STATE_CLOSE_WAIT ||
-                    sk->tcp_state == TCP_STATE_FIN_WAIT) {
-                    bool_t need_ack = FALSE;
-                    if ((flags & TCP_ACK) != 0U &&
-                        (int32_t)(ack - sk->tcp_snd_una) > 0) {
-                        sk->tcp_snd_una = ack;
-                    }
-                    if (tcp_data_len > 0U) {
-                        if (seq == sk->tcp_rcv_nxt) {
-                            sock_enqueue_rx(sk, src_ip, src_port,
-                                            &tcp[data_off], tcp_data_len);
-                            sk->tcp_rcv_nxt += tcp_data_len;
-                        } else if ((int32_t)(sk->tcp_rcv_nxt - seq) > 0 &&
-                                   (int32_t)((seq + tcp_data_len) - sk->tcp_rcv_nxt) > 0) {
-                            uint32_t skip = sk->tcp_rcv_nxt - seq;
-                            uint32_t take = tcp_data_len - skip;
-                            sock_enqueue_rx(sk, src_ip, src_port,
-                                            &tcp[data_off + skip], take);
-                            sk->tcp_rcv_nxt += take;
-                        }
-                        need_ack = TRUE;
-                    }
-                    if ((flags & TCP_FIN) != 0U) {
-                        if (seq + tcp_data_len == sk->tcp_rcv_nxt) {
-                            sk->tcp_rcv_nxt += 1U;
-                        }
-                        sk->tcp_eof = TRUE;
-                        if (sk->tcp_state == TCP_STATE_ESTABLISHED) {
-                            sk->tcp_state = TCP_STATE_CLOSE_WAIT;
-                        } else {
-                            sk->tcp_state = TCP_STATE_CLOSED;
-                        }
-                        need_ack = TRUE;
-                    }
-                    if (need_ack) {
-                        (void)tcp_send_segment(sk, TCP_ACK, sk->tcp_snd_nxt,
-                                               sk->tcp_rcv_nxt, NULL, 0U);
-                    }
-                }
-                break;
-            }
-        } else if (proto == IPPROTO_ICMP && payload_len >= 8U) {
-            const uint8_t *icmp = &frame[payload_off];
-            for (i = 0; i < NET_MAX_SOCKETS; i++) {
-                struct net_sock *sk = &sock_table[i];
-                if (sk->used && sk->type == SOCK_RAW &&
-                    (sk->protocol == IPPROTO_ICMP || sk->protocol == IPPROTO_IP)) {
-                    if (!sk->connected || sk->peer_ip == 0U || sk->peer_ip == src_ip) {
-                        sock_enqueue_rx(sk, src_ip, 0U, icmp, payload_len);
-                    }
-                }
-            }
+        subnet_bcast = (local_ip_be & netmask_be) | (~netmask_be);
+        is_local_dst = (dst_ip == local_ip_be) ? TRUE : FALSE;
+        is_bcast_dst = (dst_ip == 0xFFFFFFFFUL ||
+                        (netmask_be != 0UL && dst_ip == subnet_bcast)) ? TRUE : FALSE;
+        if (!is_local_dst && !is_bcast_dst && !dhcp_active) {
+            return;
         }
+
+        if ((frag_off & 0x3FFFU) != 0U) {
+            net_ipv4_reassemble(src_ip, dst_ip, is_local_dst, is_bcast_dst,
+                                ip_id, proto, frag_off,
+                                &frame[payload_off], payload_len);
+            return;
+        }
+
+        net_process_ipv4_payload(src_ip, dst_ip, is_local_dst, is_bcast_dst,
+                                 proto, &frame[payload_off], payload_len);
     }
 }
 
@@ -514,14 +865,17 @@ int net_arp_resolve(uint32_t ip_be, uint8_t out_mac[6])
         return -NET_ENETUNREACH;
     }
 
+    arp_pending_ip = ip_be;
     arp_send_packet(1U, bcast_mac, zero_mac, ip_be);
     for (attempt = 0; attempt < 150; attempt++) {
         net_poll();
         if (arp_cache_lookup(ip_be, out_mac)) {
+            arp_pending_ip = 0UL;
             return 0;
         }
         pit_mdelay(5U);
     }
+    arp_pending_ip = 0UL;
     return -NET_ENETUNREACH;
 }
 
@@ -592,6 +946,10 @@ void net_init(void)
 {
     memset(sock_table, 0, sizeof(sock_table));
     memset(arp_cache, 0, sizeof(arp_cache));
+    memset(reasm_table, 0, sizeof(reasm_table));
+    arp_pending_ip      = 0UL;
+    dhcp_zero_src       = FALSE;
+    dhcp_active         = FALSE;
     local_ip_be         = net_make_ipv4(10, 0, 2, 15);
     netmask_be          = net_make_ipv4(255, 255, 255, 0);
     gateway_ip_be       = net_make_ipv4(10, 0, 2, 2);
@@ -637,6 +995,7 @@ void net_set_config(uint32_t ip_be, uint32_t mask_be, uint32_t gw_be, uint32_t d
         dns_ip_be = gw_be;
     }
     memset(arp_cache, 0, sizeof(arp_cache));
+    memset(reasm_table, 0, sizeof(reasm_table));
 }
 
 static void dhcp_parse_options(const uint8_t *pkt, uint32_t len,
@@ -719,6 +1078,7 @@ int net_dhcp(void)
     bcast_addr.sin_addr   = 0xFFFFFFFFUL;
 
     xid = 0x4F4B5300UL | (pit_get_ticks() & 0xFFFFUL);
+    dhcp_active = TRUE;
 
     /* 1. DHCPDISCOVER -> wait for DHCPOFFER */
     for (attempt = 0; attempt < 2 && !got_offer; attempt++) {
@@ -771,6 +1131,7 @@ int net_dhcp(void)
     }
 
     if (!got_offer || offered_ip == 0UL) {
+        dhcp_active = FALSE;
         (void)net_close(sock);
         return -NET_ETIMEDOUT;
     }
@@ -827,6 +1188,7 @@ int net_dhcp(void)
         }
     }
 
+    dhcp_active = FALSE;
     (void)net_close(sock);
     if (!got_ack) {
         return -NET_ETIMEDOUT;
@@ -938,7 +1300,8 @@ int net_connect(int sockfd, const struct sockaddr *addr, uint32_t addrlen)
     sk->connected = TRUE;
 
     if (sk->type == SOCK_STREAM && !is_loopback_ip(sin->sin_addr)) {
-        uint32_t syn_seq = 0x10000000U + (pit_get_ticks() << 8) + (uint32_t)net_ntohs(sk->local_port);
+        uint32_t syn_seq = tcp_generate_isn(sk->local_ip, sk->local_port,
+                                            sk->peer_ip, sk->peer_port);
         int wait;
 
         sk->tcp_snd_una = syn_seq;
