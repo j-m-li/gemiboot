@@ -1747,7 +1747,7 @@ static int32_t dns_skip_name(const uint8_t *msg, uint32_t len, uint32_t pos)
 {
     int guard = 0;
 
-    while (pos < len && guard < 64) {
+    while (pos < len && guard < 128) {
         uint8_t c = msg[pos];
         if (c == 0U) {
             return (int32_t)(pos + 1U);
@@ -1758,8 +1758,8 @@ static int32_t dns_skip_name(const uint8_t *msg, uint32_t len, uint32_t pos)
                 return -1;
             }
             ptr_off = (uint16_t)(((uint16_t)(c & 0x3FU) << 8) | (uint16_t)msg[pos + 1U]);
-            /* RFC 1035: compression pointer must reference a prior byte inside the packet */
-            if (ptr_off >= len || ptr_off >= pos) {
+            /* RFC 1035: compression pointer must target a prior byte past the 12-byte header */
+            if (ptr_off < 12U || ptr_off >= len || ptr_off >= pos) {
                 return -1;
             }
             return (int32_t)(pos + 2U);
