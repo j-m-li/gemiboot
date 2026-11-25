@@ -419,13 +419,15 @@ def main():
             wait_for_serial(serial_log_path, "[LINUX-DYN] Shared library LIBTEST.SO + libc.so.6 + PT_INTERP PASSED!")
             print("[PASS] 7/10 Linux x86 32-bit static (/mnt/LINUX.ELF) & dynamic (/mnt/DYN.ELF + LIBTEST.SO + ld-linux.so.2) binaries verified")
 
-            # 8. Test xHCI USB Ethernet (RNDIS) ARP + ICMP Echo ping to QEMU SLIRP gateway 10.0.2.2
+            # 8. Test xHCI USB Ethernet (RNDIS) DHCP, ARP + ICMP Echo ping to QEMU SLIRP gateway 10.0.2.2
             send_keys_str(sock, "net\n")
             wait_for_serial(serial_log_path, "eth0: USB RNDIS  MAC 52:54:00:12:34:56")
+            send_keys_str(sock, "net dhcp\n")
+            wait_for_serial(serial_log_path, "DHCP: leased IP 10.0.2.15  Mask 255.255.255.0  GW 10.0.2.2  DNS 10.0.2.3")
             send_keys_str(sock, "net ping\n")
             wait_for_serial(serial_log_path, "ARP reply: 10.0.2.2 is at")
             wait_for_serial(serial_log_path, "ICMP echo reply from 10.0.2.2: seq=1 OK")
-            print("[PASS] 8/13 xHCI USB Ethernet (RNDIS) MAC query, ARP & ICMP ping to 10.0.2.2 verified")
+            print("[PASS] 8/13 xHCI USB Ethernet (RNDIS) MAC query, DHCPv4 lease, ARP & ICMP ping to 10.0.2.2 verified")
 
             # 8b. Test TCP + 'telnet [host [port]]' against local TCP server via QEMU SLIRP 10.0.2.2
             telnet_port, telnet_srv, telnet_thr = start_mock_telnet_server()

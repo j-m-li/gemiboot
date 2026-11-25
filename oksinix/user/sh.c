@@ -93,6 +93,8 @@ static uint16_t net_checksum16(const uint8_t *data, uint32_t len)
     return (uint16_t)(~sum & 0xFFFFU);
 }
 
+static void sh_print_ipv4(uint32_t ip_be);
+
 static void cmd_net(int argc, char **argv)
 {
     struct xhci_net_info ni;
@@ -111,6 +113,14 @@ static void cmd_net(int argc, char **argv)
         sh_print_mac(ni.mac);
         sh_puts("  MTU ");
         sh_print_uint(ni.mtu);
+        sh_puts("\n      IP ");
+        sh_print_ipv4(net_get_local_ip());
+        sh_puts("  Mask ");
+        sh_print_ipv4(net_get_netmask());
+        sh_puts("  GW ");
+        sh_print_ipv4(net_get_gateway_ip());
+        sh_puts("  DNS ");
+        sh_print_ipv4(net_get_dns_ip());
         sh_puts("\n      TX packets=");
         sh_print_uint(ni.tx_packets);
         sh_puts(" (");
@@ -123,9 +133,48 @@ static void cmd_net(int argc, char **argv)
         return;
     }
 
+    if (strcmp(argv[1], "dhcp") == 0) {
+        sh_puts("DHCP: discovering lease on eth0...\n");
+        console_refresh();
+        if (net_dhcp() < 0) {
+            sh_puts("DHCP: timeout (keeping current IP config)\n");
+        } else {
+            sh_puts("DHCP: leased IP ");
+            sh_print_ipv4(net_get_local_ip());
+            sh_puts("  Mask ");
+            sh_print_ipv4(net_get_netmask());
+            sh_puts("  GW ");
+            sh_print_ipv4(net_get_gateway_ip());
+            sh_puts("  DNS ");
+            sh_print_ipv4(net_get_dns_ip());
+            sh_putc('\n');
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "config") == 0) {
+        uint32_t ip, mask, gw, dns = 0UL;
+        if (argc < 5 ||
+            net_parse_ipv4(argv[2], &ip) < 0 ||
+            net_parse_ipv4(argv[3], &mask) < 0 ||
+            net_parse_ipv4(argv[4], &gw) < 0 ||
+            (argc >= 6 && net_parse_ipv4(argv[5], &dns) < 0)) {
+            sh_puts("usage: net config <ip> <mask> <gw> [dns]\n");
+            return;
+        }
+        net_set_config(ip, mask, gw, dns);
+        sh_puts("Configured eth0 IP ");
+        sh_print_ipv4(net_get_local_ip());
+        sh_puts(" GW ");
+        sh_print_ipv4(net_get_gateway_ip());
+        sh_putc('\n');
+        return;
+    }
+
     if (strcmp(argv[1], "ping") == 0) {
-        uint32_t gw_ip = net_get_gateway_ip();
-        uint8_t gw_mac[6];
+        uint32_t target_ip = net_get_gateway_ip();
+        uint32_t next_hop;
+        uint8_t hop_mac[6];
         struct sockaddr_in dst;
         uint8_t icmp_tx[8];
         uint8_t icmp_rx[64];
@@ -133,12 +182,29 @@ static void cmd_net(int argc, char **argv)
         int sock;
         int32_t n;
 
-        if (net_arp_resolve(gw_ip, gw_mac) < 0) {
-            sh_puts("net ping: ARP timeout for 10.0.2.2\n");
+        if (argc >= 3 && net_resolve_host(argv[2], &target_ip) < 0) {
+            sh_puts("net ping: cannot resolve ");
+            sh_puts(argv[2]);
+            sh_putc('\n');
             return;
         }
-        sh_puts("ARP reply: 10.0.2.2 is at ");
-        sh_print_mac(gw_mac);
+
+        if ((target_ip & net_get_netmask()) == (net_get_local_ip() & net_get_netmask())) {
+            next_hop = target_ip;
+        } else {
+            next_hop = net_get_gateway_ip();
+        }
+
+        if (net_arp_resolve(next_hop, hop_mac) < 0) {
+            sh_puts("net ping: ARP timeout for ");
+            sh_print_ipv4(next_hop);
+            sh_putc('\n');
+            return;
+        }
+        sh_puts("ARP reply: ");
+        sh_print_ipv4(next_hop);
+        sh_puts(" is at ");
+        sh_print_mac(hop_mac);
         sh_putc('\n');
 
         sock = net_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -149,7 +215,7 @@ static void cmd_net(int argc, char **argv)
 
         memset(&dst, 0, sizeof(dst));
         dst.sin_family = AF_INET;
-        dst.sin_addr   = gw_ip;
+        dst.sin_addr   = target_ip;
         if (net_connect(sock, (const struct sockaddr *)(const void *)&dst, (uint32_t)sizeof(dst)) < 0) {
             (void)net_close(sock);
             sh_puts("net ping: connect() failed\n");
@@ -174,14 +240,18 @@ static void cmd_net(int argc, char **argv)
         (void)net_close(sock);
 
         if (n >= 8 && icmp_rx[0] == 0U) {
-            sh_puts("ICMP echo reply from 10.0.2.2: seq=1 OK\n");
+            sh_puts("ICMP echo reply from ");
+            sh_print_ipv4(target_ip);
+            sh_puts(": seq=1 OK\n");
         } else {
-            sh_puts("net ping: ICMP timeout from 10.0.2.2\n");
+            sh_puts("net ping: ICMP timeout from ");
+            sh_print_ipv4(target_ip);
+            sh_putc('\n');
         }
         return;
     }
 
-    sh_puts("usage: net [ping]\n");
+    sh_puts("usage: net [dhcp | config <ip> <mask> <gw> [dns] | ping [host]]\n");
 }
 
 static void sh_print_ipv4(uint32_t ip_be)

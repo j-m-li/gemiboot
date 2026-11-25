@@ -55,9 +55,12 @@ struct xhci_usb_dev {
     uint8_t          net_data_alt;
     uint8_t          net_mac_str_idx;
     uint8_t          config_val;
+    uint16_t         vendor_id;
+    uint16_t         product_id;
     uint16_t         ep0_mps;
     uint8_t          int_in_dci;
     uint16_t         int_in_mps;
+    uint8_t          int_in_interval;
     uint8_t          bulk_in_dci;
     uint16_t         bulk_in_mps;
     uint8_t          bulk_in_burst;

@@ -180,7 +180,7 @@ void xhci_interrupt_in_submit(struct xhci_usb_dev *dev, void *buf, uint32_t len)
                  (uint32_t)(uintptr_t)buf,
                  0,
                  len,
-                 (TRB_TYPE_NORMAL << 10) | TRB_IOC);
+                 (TRB_TYPE_NORMAL << 10) | TRB_IOC | TRB_ISP);
     db_base[dev->slot_id] = dev->int_in_dci;
 }
 
@@ -373,6 +373,9 @@ int xhci_control_transfer(struct xhci_usb_dev *dev,
     struct xhci_trb ev;
     uint8_t cc;
 
+    if (wLength > 1024U) {
+        return -1;
+    }
     setup_lo = (uint32_t)bmRequestType |
                ((uint32_t)bRequest << 8) |
                ((uint32_t)wValue << 16);
@@ -583,7 +586,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
     uint32_t *in_ctrl_dw;
     uint32_t *slot_dw;
     uint8_t dev_desc[18];
-    uint8_t cfg_desc[256];
+    static uint8_t cfg_desc[1024];
     uint16_t total_len;
     uint32_t pos;
     uint8_t max_dci = 1;
@@ -728,6 +731,9 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
         return -1;
     }
 
+    dev->vendor_id  = (uint16_t)((uint16_t)dev_desc[8] | ((uint16_t)dev_desc[9] << 8));
+    dev->product_id = (uint16_t)((uint16_t)dev_desc[10] | ((uint16_t)dev_desc[11] << 8));
+
     if (dev_desc[4] == 0x09U) {
         dev->dev_type = USB_DEV_HUB;
     }
@@ -741,6 +747,12 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
             bool_t  capture_eps;
             bool_t  iface_locked = FALSE;
             uint8_t last_ep_dci  = 0;
+            bool_t  iad_valid    = FALSE;
+            uint8_t iad_first    = 0;
+            uint8_t iad_count    = 0;
+            uint32_t iad_type    = USB_DEV_NONE;
+            bool_t  has_union_data = FALSE;
+            uint8_t union_data_if  = 0;
 
             memset(cfg_desc, 0, sizeof(cfg_desc));
             if (xhci_control_transfer(dev, 0x80U, 0x06U,
@@ -774,6 +786,7 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
             dev->net_mac_str_idx = 0;
             dev->int_in_dci      = 0;
             dev->int_in_mps      = 0;
+            dev->int_in_interval = 6U;
             dev->bulk_in_dci     = 0;
             dev->bulk_in_mps     = 0;
             dev->bulk_in_burst   = 0;
@@ -791,7 +804,25 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                 if (bLength == 0) {
                     break;
                 }
-                if (bDescriptorType == 4U && pos + 9U <= total_len) {
+                if (bDescriptorType == 0x0BU && pos + 8U <= total_len) {
+                    /* Interface Association Descriptor (IAD) for composite RNDIS/ECM hardware */
+                    uint8_t f_cls   = cfg_desc[pos + 4U];
+                    uint8_t f_sub   = cfg_desc[pos + 5U];
+                    uint8_t f_proto = cfg_desc[pos + 6U];
+
+                    iad_first = cfg_desc[pos + 2U];
+                    iad_count = cfg_desc[pos + 3U];
+                    iad_type  = USB_DEV_NONE;
+                    if ((f_cls == 0x02U && f_sub == 0x02U && f_proto == 0xFFU) ||
+                        (f_cls == 0xE0U && f_sub == 0x01U && f_proto == 0x03U) ||
+                        (f_cls == 0xEFU && f_sub == 0x04U &&
+                         (f_proto == 0x01U || f_proto == 0x02U || f_proto == 0x03U || f_proto == 0x04U))) {
+                        iad_type = USB_DEV_NET_RNDIS;
+                    } else if (f_cls == 0x02U && f_sub == 0x06U) {
+                        iad_type = USB_DEV_NET_ECM;
+                    }
+                    iad_valid = (iad_type != USB_DEV_NONE) ? TRUE : FALSE;
+                } else if (bDescriptorType == 4U && pos + 9U <= total_len) {
                     uint8_t iface_num   = cfg_desc[pos + 2U];
                     uint8_t alt_setting = cfg_desc[pos + 3U];
                     uint8_t num_eps     = cfg_desc[pos + 4U];
@@ -805,7 +836,14 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                     /* CDC Data interface paired with an already-matched RNDIS or CDC-ECM control interface */
                     if ((dev->dev_type == USB_DEV_NET_RNDIS || dev->dev_type == USB_DEV_NET_ECM) &&
                         iface_class == 0x0AU) {
-                        if (num_eps >= 2U && (dev->bulk_in_dci == 0 || dev->bulk_out_dci == 0)) {
+                        bool_t pair_ok = TRUE;
+                        if (has_union_data && iface_num != union_data_if) {
+                            pair_ok = FALSE;
+                        } else if (!has_union_data && iad_valid &&
+                                   (iface_num < iad_first || iface_num >= (uint8_t)(iad_first + iad_count))) {
+                            pair_ok = FALSE;
+                        }
+                        if (pair_ok && num_eps >= 2U && (dev->bulk_in_dci == 0 || dev->bulk_out_dci == 0)) {
                             dev->net_data_iface = iface_num;
                             dev->net_data_alt   = alt_setting;
                             capture_eps         = TRUE;
@@ -849,7 +887,13 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                             cand_type = USB_DEV_STORAGE;
                         } else if ((iface_class == 0x02U && iface_sub == 0x02U && iface_proto == 0xFFU) ||
                                    (iface_class == 0xE0U && iface_sub == 0x01U && iface_proto == 0x03U) ||
-                                   (iface_class == 0xEFU && iface_sub == 0x04U && iface_proto == 0x01U)) {
+                                   (iface_class == 0xEFU && iface_sub == 0x04U &&
+                                    (iface_proto == 0x01U || iface_proto == 0x02U ||
+                                     iface_proto == 0x03U || iface_proto == 0x04U)) ||
+                                   (iad_valid && iad_type == USB_DEV_NET_RNDIS &&
+                                    iface_num == iad_first &&
+                                    (iface_class == 0x02U || iface_class == 0xE0U ||
+                                     iface_class == 0xEFU || iface_class == 0xFFU))) {
                             cand_type = USB_DEV_NET_RNDIS;
                         } else if (iface_class == 0x02U && iface_sub == 0x06U) {
                             cand_type = USB_DEV_NET_ECM;
@@ -863,21 +907,28 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                             dev->iface_num      = iface_num;
                             dev->int_in_dci     = 0;
                             dev->int_in_mps     = 0;
+                            dev->int_in_interval = 6U;
                             dev->bulk_in_dci    = 0;
                             dev->bulk_in_mps    = 0;
                             dev->bulk_in_burst  = 0;
                             dev->bulk_out_dci   = 0;
                             dev->bulk_out_mps   = 0;
                             dev->bulk_out_burst = 0;
+                            has_union_data      = FALSE;
                             capture_eps         = TRUE;
                         } else {
                             capture_eps = FALSE;
                         }
                     }
                 } else if (bDescriptorType == 0x24U && pos + 4U <= total_len &&
-                           dev->dev_type == USB_DEV_NET_ECM) {
-                    /* CDC Ethernet Networking Functional Descriptor (subtype 0x0F -> iMACAddress) */
-                    if (cfg_desc[pos + 2U] == 0x0FU) {
+                           (dev->dev_type == USB_DEV_NET_ECM || dev->dev_type == USB_DEV_NET_RNDIS)) {
+                    if (cfg_desc[pos + 2U] == 0x06U && pos + 5U <= total_len &&
+                        cfg_desc[pos + 3U] == dev->iface_num) {
+                        /* CDC Union Functional Descriptor: bControlInterface + bSubordinateInterface0 */
+                        union_data_if  = cfg_desc[pos + 4U];
+                        has_union_data = TRUE;
+                    } else if (dev->dev_type == USB_DEV_NET_ECM && cfg_desc[pos + 2U] == 0x0FU) {
+                        /* CDC Ethernet Networking Functional Descriptor (subtype 0x0F -> iMACAddress) */
                         dev->net_mac_str_idx = cfg_desc[pos + 3U];
                     }
                 } else if (bDescriptorType == 5U && pos + 7U <= total_len && capture_eps) {
@@ -885,15 +936,29 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                     uint8_t  ep_attr = (uint8_t)(cfg_desc[pos + 3U] & 0x03U);
                     uint16_t ep_mps  = (uint16_t)(((uint16_t)cfg_desc[pos + 4U] |
                                                   ((uint16_t)cfg_desc[pos + 5U] << 8)) & 0x07FFU);
+                    uint8_t  ep_bInt = cfg_desc[pos + 6U];
                     uint8_t  ep_num  = (uint8_t)(ep_addr & 0x0FU);
                     uint8_t  is_in   = ((ep_addr & 0x80U) != 0) ? 1U : 0U;
                     uint8_t  dci     = (uint8_t)(ep_num * 2U + is_in);
 
                     last_ep_dci = 0;
                     if (ep_attr == 3U && is_in && dev->int_in_dci == 0) {
-                        dev->int_in_dci = dci;
-                        dev->int_in_mps = (ep_mps > 0) ? ep_mps : 8U;
-                        last_ep_dci     = dci;
+                        uint8_t xhci_iv = 6U;
+                        if (speed >= 3U) {
+                            /* High-Speed / SuperSpeed: bInterval is 1..16 -> xHCI Interval = bInterval - 1 */
+                            xhci_iv = (ep_bInt >= 1U && ep_bInt <= 16U) ? (uint8_t)(ep_bInt - 1U) : 6U;
+                        } else if (ep_bInt >= 1U) {
+                            /* Full/Low-Speed: bInterval in ms -> xHCI Interval (3..10) = floor(log2(ms * 8)) */
+                            uint32_t uf = (uint32_t)ep_bInt * 8U;
+                            xhci_iv = 3U;
+                            while (xhci_iv < 10U && (1U << (xhci_iv + 1U)) <= uf) {
+                                xhci_iv++;
+                            }
+                        }
+                        dev->int_in_dci      = dci;
+                        dev->int_in_mps      = (ep_mps > 0) ? ep_mps : 8U;
+                        dev->int_in_interval = xhci_iv;
+                        last_ep_dci          = dci;
                         if (dci > max_dci) {
                             max_dci = dci;
                         }
@@ -973,7 +1038,8 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
         if (dev->int_in_dci != 0) {
             ring_init(&dev->int_in_ring);
             xhci_setup_ep_ctx(dev->in_ctx + ((uint32_t)(dev->int_in_dci + 1U) * ctx_size),
-                              7U, dev->int_in_mps, 0U, 6U, 8U, &dev->int_in_ring);
+                              7U, dev->int_in_mps, 0U, dev->int_in_interval,
+                              (uint32_t)dev->int_in_mps, &dev->int_in_ring);
             add_flags |= (1U << dev->int_in_dci);
         }
 
@@ -1318,7 +1384,7 @@ static int xhci_init_controller(const struct pci_device *pci_dev)
     mmio_write32(rt_base, 0x20 + 0x10, (uint32_t)(uintptr_t)erst);
     mmio_write32(rt_base, 0x20 + 0x14, 0);
 
-    ctrl_dma_buf = (uint8_t *)xhci_dma_alloc(512, 64);
+    ctrl_dma_buf = (uint8_t *)xhci_dma_alloc(1024, 64);
 
     mmio_write32(op_base, 0x00, 1U);
     timeout = 500;

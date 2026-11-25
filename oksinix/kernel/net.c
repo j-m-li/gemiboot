@@ -84,6 +84,7 @@ static uint32_t             local_ip_be   = 0;
 static uint32_t             netmask_be    = 0;
 static uint32_t             gateway_ip_be = 0;
 static uint32_t             dns_ip_be     = 0;
+static bool_t               dhcp_zero_src = FALSE;
 static uint16_t             next_ephemeral_port = 49152U;
 static uint16_t             ipv4_ident = 1U;
 static uint16_t             dns_txid   = 1U;
@@ -537,14 +538,18 @@ static int net_send_ipv4(uint32_t dst_ip_be, uint8_t proto,
         return -NET_ENETUNREACH;
     }
 
-    if ((dst_ip_be & netmask_be) == (local_ip_be & netmask_be)) {
-        next_hop = dst_ip_be;
+    if (dst_ip_be == 0xFFFFFFFFUL) {
+        memset(dst_mac, 0xFF, 6U);
     } else {
-        next_hop = gateway_ip_be;
-    }
+        if ((dst_ip_be & netmask_be) == (local_ip_be & netmask_be)) {
+            next_hop = dst_ip_be;
+        } else {
+            next_hop = gateway_ip_be;
+        }
 
-    if (net_arp_resolve(next_hop, dst_mac) < 0) {
-        return -NET_ENETUNREACH;
+        if (net_arp_resolve(next_hop, dst_mac) < 0) {
+            return -NET_ENETUNREACH;
+        }
     }
 
     xhci_get_net_info(&ni);
@@ -564,7 +569,7 @@ static int net_send_ipv4(uint32_t dst_ip_be, uint8_t proto,
     ipv4_ident++;
     net_tx_frame_buf[22] = 64U;
     net_tx_frame_buf[23] = proto;
-    write_be32(&net_tx_frame_buf[26], local_ip_be);
+    write_be32(&net_tx_frame_buf[26], dhcp_zero_src ? 0UL : local_ip_be);
     write_be32(&net_tx_frame_buf[30], dst_ip_be);
     ck = net_checksum16(&net_tx_frame_buf[14], 20U);
     net_tx_frame_buf[24] = (uint8_t)((ck >> 8) & 0xFFU);
@@ -606,9 +611,232 @@ uint32_t net_get_local_ip(void)
     return local_ip_be;
 }
 
+uint32_t net_get_netmask(void)
+{
+    return netmask_be;
+}
+
 uint32_t net_get_gateway_ip(void)
 {
     return gateway_ip_be;
+}
+
+uint32_t net_get_dns_ip(void)
+{
+    return dns_ip_be;
+}
+
+void net_set_config(uint32_t ip_be, uint32_t mask_be, uint32_t gw_be, uint32_t dns_be)
+{
+    local_ip_be   = ip_be;
+    netmask_be    = (mask_be != 0UL) ? mask_be : net_make_ipv4(255, 255, 255, 0);
+    gateway_ip_be = gw_be;
+    if (dns_be != 0UL) {
+        dns_ip_be = dns_be;
+    } else if (gw_be != 0UL) {
+        dns_ip_be = gw_be;
+    }
+    memset(arp_cache, 0, sizeof(arp_cache));
+}
+
+static void dhcp_parse_options(const uint8_t *pkt, uint32_t len,
+                               uint8_t *msg_type, uint32_t *mask_be,
+                               uint32_t *gw_be, uint32_t *dns_be, uint32_t *srv_be)
+{
+    uint32_t pos = 240U;
+    while (pos < len) {
+        uint8_t opt = pkt[pos++];
+        uint8_t olen;
+        if (opt == 0U) {
+            continue;
+        }
+        if (opt == 255U || pos >= len) {
+            break;
+        }
+        olen = pkt[pos++];
+        if (pos + olen > len) {
+            break;
+        }
+        if (opt == 53U && olen >= 1U) {
+            *msg_type = pkt[pos];
+        } else if (opt == 1U && olen >= 4U) {
+            *mask_be = read_be32(&pkt[pos]);
+        } else if (opt == 3U && olen >= 4U) {
+            *gw_be = read_be32(&pkt[pos]);
+        } else if (opt == 6U && olen >= 4U) {
+            *dns_be = read_be32(&pkt[pos]);
+        } else if (opt == 54U && olen >= 4U) {
+            *srv_be = read_be32(&pkt[pos]);
+        }
+        pos += olen;
+    }
+}
+
+int net_dhcp(void)
+{
+    static uint8_t dhcp_tx[300];
+    static uint8_t dhcp_rx[576];
+    struct xhci_net_info ni;
+    struct sockaddr_in bind_addr;
+    struct sockaddr_in bcast_addr;
+    struct sockaddr_in src_addr;
+    uint32_t src_len;
+    uint32_t xid;
+    int sock;
+    int32_t n;
+    int attempt;
+    uint32_t offered_ip = 0UL;
+    uint32_t server_id  = 0UL;
+    uint32_t opt_mask   = 0UL;
+    uint32_t opt_gw     = 0UL;
+    uint32_t opt_dns    = 0UL;
+    bool_t got_offer    = FALSE;
+    bool_t got_ack      = FALSE;
+
+    if (!xhci_has_usb_net()) {
+        return -NET_ENETUNREACH;
+    }
+    xhci_get_net_info(&ni);
+
+    sock = net_socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return sock;
+    }
+
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port   = net_htons(68U);
+    bind_addr.sin_addr   = 0UL;
+    if (net_bind(sock, (const struct sockaddr *)(const void *)&bind_addr,
+                 (uint32_t)sizeof(bind_addr)) < 0) {
+        (void)net_close(sock);
+        return -NET_EINVAL;
+    }
+
+    memset(&bcast_addr, 0, sizeof(bcast_addr));
+    bcast_addr.sin_family = AF_INET;
+    bcast_addr.sin_port   = net_htons(67U);
+    bcast_addr.sin_addr   = 0xFFFFFFFFUL;
+
+    xid = 0x4F4B5300UL | (pit_get_ticks() & 0xFFFFUL);
+
+    /* 1. DHCPDISCOVER -> wait for DHCPOFFER */
+    for (attempt = 0; attempt < 2 && !got_offer; attempt++) {
+        int wait;
+        memset(dhcp_tx, 0, sizeof(dhcp_tx));
+        dhcp_tx[0] = 1U; /* BOOTREQUEST */
+        dhcp_tx[1] = 1U; /* Ethernet */
+        dhcp_tx[2] = 6U; /* MAC len */
+        write_be32(&dhcp_tx[4], net_htonl(xid));
+        dhcp_tx[10] = 0x80U; /* Broadcast flag */
+        memcpy(&dhcp_tx[28], ni.mac, 6U);
+        dhcp_tx[236] = 0x63U; dhcp_tx[237] = 0x82U;
+        dhcp_tx[238] = 0x53U; dhcp_tx[239] = 0x63U;
+        dhcp_tx[240] = 53U; dhcp_tx[241] = 1U; dhcp_tx[242] = 1U; /* DISCOVER */
+        dhcp_tx[243] = 55U; dhcp_tx[244] = 3U; dhcp_tx[245] = 1U; dhcp_tx[246] = 3U; dhcp_tx[247] = 6U;
+        dhcp_tx[248] = 255U;
+
+        dhcp_zero_src = TRUE;
+        (void)net_sendto(sock, dhcp_tx, (uint32_t)sizeof(dhcp_tx), 0U,
+                         (const struct sockaddr *)(const void *)&bcast_addr,
+                         (uint32_t)sizeof(bcast_addr));
+        dhcp_zero_src = FALSE;
+
+        for (wait = 0; wait < 150 && !got_offer; wait++) {
+            src_len = (uint32_t)sizeof(src_addr);
+            n = net_recvfrom(sock, dhcp_rx, (uint32_t)sizeof(dhcp_rx), MSG_DONTWAIT,
+                             (struct sockaddr *)(void *)&src_addr, &src_len);
+            if (n >= 244 && dhcp_rx[0] == 2U &&
+                net_ntohl(read_be32(&dhcp_rx[4])) == xid &&
+                memcmp(&dhcp_rx[28], ni.mac, 6U) == 0 &&
+                dhcp_rx[236] == 0x63U && dhcp_rx[237] == 0x82U &&
+                dhcp_rx[238] == 0x53U && dhcp_rx[239] == 0x63U) {
+                uint8_t mtype = 0U;
+                dhcp_parse_options(dhcp_rx, (uint32_t)n, &mtype,
+                                   &opt_mask, &opt_gw, &opt_dns, &server_id);
+                if (mtype == 2U) { /* DHCPOFFER */
+                    offered_ip = read_be32(&dhcp_rx[16]);
+                    if (server_id == 0UL) {
+                        server_id = read_be32(&dhcp_rx[20]);
+                    }
+                    if (server_id == 0UL) {
+                        server_id = src_addr.sin_addr;
+                    }
+                    got_offer = TRUE;
+                    break;
+                }
+            }
+            pit_mdelay(10U);
+        }
+    }
+
+    if (!got_offer || offered_ip == 0UL) {
+        (void)net_close(sock);
+        return -NET_ETIMEDOUT;
+    }
+
+    /* 2. DHCPREQUEST -> wait for DHCPACK */
+    for (attempt = 0; attempt < 2 && !got_ack; attempt++) {
+        int wait;
+        uint32_t p = 240U;
+        memset(dhcp_tx, 0, sizeof(dhcp_tx));
+        dhcp_tx[0] = 1U;
+        dhcp_tx[1] = 1U;
+        dhcp_tx[2] = 6U;
+        write_be32(&dhcp_tx[4], net_htonl(xid));
+        dhcp_tx[10] = 0x80U;
+        memcpy(&dhcp_tx[28], ni.mac, 6U);
+        dhcp_tx[236] = 0x63U; dhcp_tx[237] = 0x82U;
+        dhcp_tx[238] = 0x53U; dhcp_tx[239] = 0x63U;
+        dhcp_tx[p++] = 53U; dhcp_tx[p++] = 1U; dhcp_tx[p++] = 3U; /* REQUEST */
+        dhcp_tx[p++] = 50U; dhcp_tx[p++] = 4U; write_be32(&dhcp_tx[p], offered_ip); p += 4U;
+        if (server_id != 0UL) {
+            dhcp_tx[p++] = 54U; dhcp_tx[p++] = 4U; write_be32(&dhcp_tx[p], server_id); p += 4U;
+        }
+        dhcp_tx[p++] = 55U; dhcp_tx[p++] = 3U; dhcp_tx[p++] = 1U; dhcp_tx[p++] = 3U; dhcp_tx[p++] = 6U;
+        dhcp_tx[p++] = 255U;
+
+        dhcp_zero_src = TRUE;
+        (void)net_sendto(sock, dhcp_tx, (uint32_t)sizeof(dhcp_tx), 0U,
+                         (const struct sockaddr *)(const void *)&bcast_addr,
+                         (uint32_t)sizeof(bcast_addr));
+        dhcp_zero_src = FALSE;
+
+        for (wait = 0; wait < 150 && !got_ack; wait++) {
+            src_len = (uint32_t)sizeof(src_addr);
+            n = net_recvfrom(sock, dhcp_rx, (uint32_t)sizeof(dhcp_rx), MSG_DONTWAIT,
+                             (struct sockaddr *)(void *)&src_addr, &src_len);
+            if (n >= 244 && dhcp_rx[0] == 2U &&
+                net_ntohl(read_be32(&dhcp_rx[4])) == xid &&
+                memcmp(&dhcp_rx[28], ni.mac, 6U) == 0 &&
+                dhcp_rx[236] == 0x63U && dhcp_rx[237] == 0x82U &&
+                dhcp_rx[238] == 0x53U && dhcp_rx[239] == 0x63U) {
+                uint8_t mtype = 0U;
+                dhcp_parse_options(dhcp_rx, (uint32_t)n, &mtype,
+                                   &opt_mask, &opt_gw, &opt_dns, &server_id);
+                if (mtype == 5U) { /* DHCPACK */
+                    uint32_t ack_ip = read_be32(&dhcp_rx[16]);
+                    if (ack_ip != 0UL) {
+                        offered_ip = ack_ip;
+                    }
+                    got_ack = TRUE;
+                    break;
+                }
+            }
+            pit_mdelay(10U);
+        }
+    }
+
+    (void)net_close(sock);
+    if (!got_ack) {
+        return -NET_ETIMEDOUT;
+    }
+
+    if (opt_gw == 0UL) {
+        opt_gw = server_id;
+    }
+    net_set_config(offered_ip, opt_mask, opt_gw, opt_dns);
+    return 0;
 }
 
 int net_socket(int domain, int type, int protocol)
