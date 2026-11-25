@@ -330,6 +330,125 @@ _start:
     cmpl $0x2A00, PIC_ADDR(wait_status)     /* exit status 42 << 8 */
     jne .Lfail
 
+    /* 15. BSD socket syscalls: socket (359), bind (361), connect (362),
+     *     socketcall (102: SYS_SEND=9, SYS_RECV=10), sendto (369), recvfrom (371), close (6) */
+    movl $359, %eax                         /* SYS_socket(AF_INET=2, SOCK_DGRAM=2, 0) */
+    movl $2, %ebx
+    movl $2, %ecx
+    xorl %edx, %edx
+    int $0x80
+    testl %eax, %eax
+    js .Lfail
+    movl %eax, PIC_ADDR(saved_sock_srv)
+
+    movl $361, %eax                         /* SYS_bind(srv_fd, &sock_addr_lo, 16) */
+    movl PIC_ADDR(saved_sock_srv), %ebx
+    leal PIC_ADDR(sock_addr_lo), %ecx
+    movl $16, %edx
+    int $0x80
+    testl %eax, %eax
+    jnz .Lfail
+
+    movl $359, %eax                         /* SYS_socket(AF_INET=2, SOCK_DGRAM=2, 0) */
+    movl $2, %ebx
+    movl $2, %ecx
+    xorl %edx, %edx
+    int $0x80
+    testl %eax, %eax
+    js .Lfail
+    movl %eax, PIC_ADDR(saved_sock_cli)
+
+    movl $362, %eax                         /* SYS_connect(cli_fd, &sock_addr_lo, 16) */
+    movl PIC_ADDR(saved_sock_cli), %ebx
+    leal PIC_ADDR(sock_addr_lo), %ecx
+    movl $16, %edx
+    int $0x80
+    testl %eax, %eax
+    jnz .Lfail
+
+    /* SYS_socketcall(SYS_SEND=9, [cli_fd, &file_msg, 4, 0]) */
+    movl PIC_ADDR(saved_sock_cli), %eax
+    movl %eax, PIC_ADDR(sockcall_args)
+    leal PIC_ADDR(file_msg), %eax
+    movl %eax, PIC_ADDR(sockcall_args + 4)
+    movl $4, PIC_ADDR(sockcall_args + 8)
+    movl $0, PIC_ADDR(sockcall_args + 12)
+    movl $102, %eax
+    movl $9, %ebx
+    leal PIC_ADDR(sockcall_args), %ecx
+    int $0x80
+    cmpl $4, %eax
+    jne .Lfail
+
+    /* SYS_socketcall(SYS_RECV=10, [srv_fd, &scratch_buf, 16, 0]) */
+    movl $0, PIC_ADDR(scratch_buf)
+    movl PIC_ADDR(saved_sock_srv), %eax
+    movl %eax, PIC_ADDR(sockcall_args)
+    leal PIC_ADDR(scratch_buf), %eax
+    movl %eax, PIC_ADDR(sockcall_args + 4)
+    movl $16, PIC_ADDR(sockcall_args + 8)
+    movl $0, PIC_ADDR(sockcall_args + 12)
+    movl $102, %eax
+    movl $10, %ebx
+    leal PIC_ADDR(sockcall_args), %ecx
+    int $0x80
+    cmpl $4, %eax
+    jne .Lfail
+    cmpl $0x58534B4F, PIC_ADDR(scratch_buf) /* "OKSX" */
+    jne .Lfail
+
+    /* Direct SYS_sendto (369) + SYS_recvfrom (371) verification */
+    movl $369, %eax
+    movl PIC_ADDR(saved_sock_cli), %ebx
+    leal PIC_ADDR(file_msg), %ecx
+    movl $4, %edx
+    xorl %esi, %esi
+    xorl %edi, %edi
+    pushl %ebp
+    xorl %ebp, %ebp
+    int $0x80
+    popl %ebp
+    cmpl $4, %eax
+    jne .Lfail
+
+    movl $0, PIC_ADDR(scratch_buf)
+    movl $16, PIC_ADDR(sock_addr_len)
+    movl PIC_ADDR(saved_sock_srv), %ebx
+    leal PIC_ADDR(scratch_buf), %ecx
+    movl $16, %edx
+    xorl %esi, %esi
+    leal PIC_ADDR(sock_addr_peer), %edi
+    leal PIC_ADDR(sock_addr_len), %eax
+    pushl %ebp
+    movl %eax, %ebp
+    movl $371, %eax
+    int $0x80
+    popl %ebp
+    cmpl $4, %eax
+    jne .Lfail
+    cmpl $0x58534B4F, PIC_ADDR(scratch_buf)
+    jne .Lfail
+    cmpl $0x0100007F, PIC_ADDR(sock_addr_peer + 4) /* 127.0.0.1 */
+    jne .Lfail
+
+    movl $6, %eax                           /* SYS_close(cli_fd) */
+    movl PIC_ADDR(saved_sock_cli), %ebx
+    int $0x80
+    testl %eax, %eax
+    jnz .Lfail
+
+    movl $6, %eax                           /* SYS_close(srv_fd) */
+    movl PIC_ADDR(saved_sock_srv), %ebx
+    int $0x80
+    testl %eax, %eax
+    jnz .Lfail
+
+    movl $4, %eax
+    movl $1, %ebx
+    leal PIC_ADDR(sock_pass_msg), %ecx
+    movl $sock_pass_msg_len, %edx
+    int $0x80
+
     /* Print success banner via SYS_write (4) and exit via SYS_exit_group (252) */
     movl $4, %eax
     movl $1, %ebx
@@ -409,11 +528,30 @@ pass_msg:
     .ascii "[LINUX-ELF] All 37 Linux i386 syscalls PASSED!\n"
 .set pass_msg_len, . - pass_msg
 
+sock_pass_msg:
+    .ascii "[LINUX-ELF] BSD socket syscalls (socket/bind/connect/send/recv) PASSED!\n"
+.set sock_pass_msg_len, . - sock_pass_msg
+
 fail_msg:
     .ascii "[LINUX-ELF] Syscall verification FAILED!\n"
 .set fail_msg_len, . - fail_msg
 
 .align 4
+sock_addr_lo:
+    .word 2                                 /* AF_INET */
+    .word 0x9210                            /* htons(4242) */
+    .long 0x0100007F                        /* 127.0.0.1 */
+    .space 8
+sock_addr_peer:
+    .space 16
+sock_addr_len:
+    .long 16
+sockcall_args:
+    .long 0, 0, 0, 0, 0, 0
+saved_sock_srv:
+    .long 0
+saved_sock_cli:
+    .long 0
 saved_pid:
     .long 0
 saved_child_pid:

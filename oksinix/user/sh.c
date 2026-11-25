@@ -6,6 +6,7 @@
 
 #include "user.h"
 #include "acpi.h"
+#include "net.h"
 #include "vfs.h"
 #include "fat32.h"
 #include "xhci.h"
@@ -123,46 +124,16 @@ static void cmd_net(int argc, char **argv)
     }
 
     if (strcmp(argv[1], "ping") == 0) {
-        static const uint8_t src_ip[4] = { 10, 0, 2, 15 };
-        static const uint8_t dst_ip[4] = { 10, 0, 2, 2 };
-        uint8_t tx[64];
-        uint8_t rx[256];
+        uint32_t gw_ip = net_get_gateway_ip();
         uint8_t gw_mac[6];
-        bool_t got_arp = FALSE;
-        bool_t got_icmp = FALSE;
-        int wait;
+        struct sockaddr_in dst;
+        uint8_t icmp_tx[8];
+        uint8_t icmp_rx[64];
+        uint16_t ic_ck;
+        int sock;
+        int32_t n;
 
-        /* 1. Send ARP Request for gateway 10.0.2.2 */
-        memset(tx, 0, sizeof(tx));
-        memset(&tx[0], 0xFF, 6);
-        memcpy(&tx[6], ni.mac, 6);
-        tx[12] = 0x08; tx[13] = 0x06; /* EtherType ARP */
-        tx[14] = 0x00; tx[15] = 0x01; /* HTYPE Ethernet */
-        tx[16] = 0x08; tx[17] = 0x00; /* PTYPE IPv4 */
-        tx[18] = 6;    tx[19] = 4;    /* HLEN=6, PLEN=4 */
-        tx[20] = 0x00; tx[21] = 0x01; /* OPER Request */
-        memcpy(&tx[22], ni.mac, 6);
-        memcpy(&tx[28], src_ip, 4);
-        memcpy(&tx[38], dst_ip, 4);
-
-        if (xhci_net_send(tx, 42U) < 0) {
-            sh_puts("net ping: ARP transmit failed\n");
-            return;
-        }
-
-        for (wait = 0; wait < 200; wait++) {
-            int32_t n = xhci_net_recv(rx, sizeof(rx));
-            if (n >= 42 && rx[12] == 0x08 && rx[13] == 0x06 &&
-                rx[20] == 0x00 && rx[21] == 0x02 &&
-                memcmp(&rx[28], dst_ip, 4) == 0) {
-                memcpy(gw_mac, &rx[22], 6);
-                got_arp = TRUE;
-                break;
-            }
-            pit_mdelay(5U);
-        }
-
-        if (!got_arp) {
+        if (net_arp_resolve(gw_ip, gw_mac) < 0) {
             sh_puts("net ping: ARP timeout for 10.0.2.2\n");
             return;
         }
@@ -170,48 +141,39 @@ static void cmd_net(int argc, char **argv)
         sh_print_mac(gw_mac);
         sh_putc('\n');
 
-        /* 2. Send ICMP Echo Request to 10.0.2.2 */
-        memset(tx, 0, sizeof(tx));
-        memcpy(&tx[0], gw_mac, 6);
-        memcpy(&tx[6], ni.mac, 6);
-        tx[12] = 0x08; tx[13] = 0x00; /* EtherType IPv4 */
-        tx[14] = 0x45; tx[15] = 0x00; /* IPv4 IHL=5 */
-        tx[16] = 0x00; tx[17] = 28;   /* Total Length = 20 IP + 8 ICMP */
-        tx[18] = 0x00; tx[19] = 0x01; /* ID */
-        tx[22] = 64;   tx[23] = 1;    /* TTL=64, Proto=ICMP */
-        memcpy(&tx[26], src_ip, 4);
-        memcpy(&tx[30], dst_ip, 4);
-        {
-            uint16_t ip_ck = net_checksum16(&tx[14], 20U);
-            tx[24] = (uint8_t)(ip_ck >> 8);
-            tx[25] = (uint8_t)(ip_ck & 0xFFU);
-        }
-        tx[34] = 8;    tx[35] = 0;    /* ICMP Echo Request */
-        tx[38] = 0x12; tx[39] = 0x34; /* ID */
-        tx[40] = 0x00; tx[41] = 0x01; /* Seq */
-        {
-            uint16_t ic_ck = net_checksum16(&tx[34], 8U);
-            tx[36] = (uint8_t)(ic_ck >> 8);
-            tx[37] = (uint8_t)(ic_ck & 0xFFU);
-        }
-
-        if (xhci_net_send(tx, 42U) < 0) {
-            sh_puts("net ping: ICMP transmit failed\n");
+        sock = net_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        if (sock < 0) {
+            sh_puts("net ping: socket() failed\n");
             return;
         }
 
-        for (wait = 0; wait < 200; wait++) {
-            int32_t n = xhci_net_recv(rx, sizeof(rx));
-            if (n >= 42 && rx[12] == 0x08 && rx[13] == 0x00 &&
-                rx[23] == 1 && memcmp(&rx[26], dst_ip, 4) == 0 &&
-                rx[34] == 0) {
-                got_icmp = TRUE;
-                break;
-            }
-            pit_mdelay(5U);
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_addr   = gw_ip;
+        if (net_connect(sock, (const struct sockaddr *)(const void *)&dst, (uint32_t)sizeof(dst)) < 0) {
+            (void)net_close(sock);
+            sh_puts("net ping: connect() failed\n");
+            return;
         }
 
-        if (got_icmp) {
+        memset(icmp_tx, 0, sizeof(icmp_tx));
+        icmp_tx[0] = 8U;    /* ICMP Echo Request */
+        icmp_tx[4] = 0x12U; icmp_tx[5] = 0x34U;
+        icmp_tx[6] = 0x00U; icmp_tx[7] = 0x01U;
+        ic_ck = net_checksum16(icmp_tx, 8U);
+        icmp_tx[2] = (uint8_t)(ic_ck >> 8);
+        icmp_tx[3] = (uint8_t)(ic_ck & 0xFFU);
+
+        if (net_send(sock, icmp_tx, 8U, 0U) < 0) {
+            (void)net_close(sock);
+            sh_puts("net ping: send() failed\n");
+            return;
+        }
+
+        n = net_recv(sock, icmp_rx, (uint32_t)sizeof(icmp_rx), 0U);
+        (void)net_close(sock);
+
+        if (n >= 8 && icmp_rx[0] == 0U) {
             sh_puts("ICMP echo reply from 10.0.2.2: seq=1 OK\n");
         } else {
             sh_puts("net ping: ICMP timeout from 10.0.2.2\n");
@@ -220,6 +182,297 @@ static void cmd_net(int argc, char **argv)
     }
 
     sh_puts("usage: net [ping]\n");
+}
+
+static void sh_print_ipv4(uint32_t ip_be)
+{
+    uint32_t ip = net_ntohl(ip_be);
+    sh_print_uint((ip >> 24) & 0xFFU);
+    sh_putc('.');
+    sh_print_uint((ip >> 16) & 0xFFU);
+    sh_putc('.');
+    sh_print_uint((ip >> 8) & 0xFFU);
+    sh_putc('.');
+    sh_print_uint(ip & 0xFFU);
+}
+
+static int parse_port(const char *s, uint16_t *out_port)
+{
+    uint32_t val = 0U;
+    if (s == NULL || *s == '\0') {
+        return -1;
+    }
+    while (*s != '\0') {
+        if (*s < '0' || *s > '9') {
+            return -1;
+        }
+        val = val * 10U + (uint32_t)(*s - '0');
+        if (val > 65535U) {
+            return -1;
+        }
+        s++;
+    }
+    if (val == 0U) {
+        return -1;
+    }
+    *out_port = (uint16_t)val;
+    return 0;
+}
+
+static void telnet_session(const char *host, uint16_t port)
+{
+    uint32_t ip_be = 0U;
+    struct sockaddr_in dst;
+    int sock;
+    uint8_t rx_buf[256];
+    char tx_line[256];
+    uint32_t tx_len = 0U;
+    int iac_state = 0;
+    uint8_t iac_cmd = 0U;
+    int running = 1;
+
+    if (net_resolve_host(host, &ip_be) < 0) {
+        sh_puts("telnet: cannot resolve host: ");
+        sh_puts(host);
+        sh_putc('\n');
+        return;
+    }
+
+    sh_puts("Trying ");
+    sh_print_ipv4(ip_be);
+    sh_putc(':');
+    sh_print_uint((uint32_t)port);
+    sh_puts("...\n");
+    console_refresh();
+
+    sock = net_socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        sh_puts("telnet: socket() failed\n");
+        return;
+    }
+
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port   = net_htons(port);
+    dst.sin_addr   = ip_be;
+
+    if (net_connect(sock, (const struct sockaddr *)(const void *)&dst, (uint32_t)sizeof(dst)) < 0) {
+        (void)net_close(sock);
+        sh_puts("telnet: unable to connect to remote host\n");
+        return;
+    }
+
+    sh_puts("Connected to ");
+    sh_puts(host);
+    sh_puts(" (");
+    sh_print_ipv4(ip_be);
+    sh_putc(':');
+    sh_print_uint((uint32_t)port);
+    sh_puts(").\nEscape character is '^]' or ESC.\n");
+    console_refresh();
+
+    while (running) {
+        int32_t n;
+        int need_redraw = 0;
+        struct key_event ev;
+
+        while ((n = net_recv(sock, rx_buf, (uint32_t)sizeof(rx_buf), MSG_DONTWAIT)) > 0) {
+            int32_t i;
+            for (i = 0; i < n; i++) {
+                uint8_t b = rx_buf[i];
+                if (iac_state == 0) {
+                    if (b == 255U) {
+                        iac_state = 1;
+                    } else if (b == '\r') {
+                        /* NVT CRLF -> ignore CR */
+                    } else if ((b >= 32U && b <= 126U) || b == '\n' || b == '\t' || b == '\b') {
+                        sh_putc((char)b);
+                        need_redraw = 1;
+                    }
+                } else if (iac_state == 1) {
+                    if (b == 255U) {
+                        iac_state = 0;
+                    } else if (b == 251U || b == 252U || b == 253U || b == 254U) {
+                        iac_cmd = b;
+                        iac_state = 2;
+                    } else if (b == 250U) {
+                        iac_state = 3;
+                    } else {
+                        iac_state = 0;
+                    }
+                } else if (iac_state == 2) {
+                    /* RFC 854: refuse DO with WONT, WILL with DONT */
+                    uint8_t reply[3];
+                    if (iac_cmd == 253U) {
+                        reply[0] = 255U; reply[1] = 252U; reply[2] = b;
+                        (void)net_send(sock, reply, 3U, 0U);
+                    } else if (iac_cmd == 251U) {
+                        reply[0] = 255U; reply[1] = 254U; reply[2] = b;
+                        (void)net_send(sock, reply, 3U, 0U);
+                    }
+                    iac_state = 0;
+                } else if (iac_state == 3) {
+                    if (b == 255U) {
+                        iac_state = 4;
+                    }
+                } else {
+                    iac_state = (b == 240U) ? 0 : 3;
+                }
+            }
+        }
+        if (n == 0) {
+            sh_puts("\nConnection closed by foreign host.\n");
+            running = 0;
+            break;
+        }
+
+        while (kbd_pop_event(&ev)) {
+            if (ev.released) {
+                continue;
+            }
+            if (ev.ascii == 27 || (ev.ctrl && ev.ascii == ']')) {
+                sh_puts("\nConnection closed.\n");
+                running = 0;
+                break;
+            }
+            if (ev.ctrl && ev.ascii >= 'a' && ev.ascii <= 'z') {
+                uint8_t ctrl_ch = (uint8_t)(ev.ascii - 'a' + 1);
+                if (net_send(sock, &ctrl_ch, 1U, 0U) < 0) {
+                    sh_puts("\nConnection closed.\n");
+                    running = 0;
+                    break;
+                }
+            } else if (ev.ascii == '\n') {
+                sh_putc('\n');
+                tx_line[tx_len++] = '\r';
+                tx_line[tx_len++] = '\n';
+                if (net_send(sock, tx_line, tx_len, 0U) < 0) {
+                    sh_puts("telnet: send error\n");
+                    running = 0;
+                    break;
+                }
+                tx_len = 0U;
+                need_redraw = 1;
+            } else if (ev.ascii == '\b' || ev.ascii == 127) {
+                if (tx_len > 0U) {
+                    tx_len--;
+                    sh_putc('\b');
+                    need_redraw = 1;
+                }
+            } else if (ev.ascii >= 32 && ev.ascii <= 126) {
+                sh_putc(ev.ascii);
+                tx_line[tx_len++] = ev.ascii;
+                need_redraw = 1;
+                if (tx_len >= (uint32_t)sizeof(tx_line) - 2U) {
+                    if (net_send(sock, tx_line, tx_len, 0U) < 0) {
+                        sh_puts("\ntelnet: send error\n");
+                        running = 0;
+                        break;
+                    }
+                    tx_len = 0U;
+                }
+            }
+        }
+
+        if (need_redraw) {
+            console_refresh();
+        }
+        if (xhci_is_initialized()) {
+            xhci_poll();
+            net_poll();
+            io_wait();
+        } else {
+            pit_mdelay(5U);
+        }
+    }
+
+    (void)net_close(sock);
+    console_refresh();
+}
+
+static int tokenize_line(char *line, char **argv, int max_args);
+
+static void cmd_telnet(int argc, char **argv)
+{
+    uint16_t port = 23U;
+
+    if (argc >= 2) {
+        if (argc >= 3 && parse_port(argv[2], &port) < 0) {
+            sh_puts("usage: telnet [host [port]]\n");
+            return;
+        }
+        telnet_session(argv[1], port);
+        return;
+    }
+
+    for (;;) {
+        char line[SH_LINE_MAX];
+        uint32_t line_len = 0U;
+        char *targv[SH_MAX_ARGS];
+        int targc;
+        int done = 0;
+
+        sh_puts("telnet> ");
+        console_refresh();
+
+        while (!done) {
+            struct key_event ev;
+            int need_redraw = 0;
+
+            while (kbd_pop_event(&ev)) {
+                if (ev.released) {
+                    continue;
+                }
+                if (ev.ascii == 27 || (ev.ctrl && (ev.ascii == 'c' || ev.ascii == 'd' || ev.ascii == ']'))) {
+                    sh_putc('\n');
+                    return;
+                }
+                if (ev.ascii == '\n') {
+                    sh_putc('\n');
+                    line[line_len] = '\0';
+                    done = 1;
+                    break;
+                } else if (ev.ascii == '\b' || ev.ascii == 127) {
+                    if (line_len > 0U) {
+                        line_len--;
+                        sh_putc('\b');
+                        need_redraw = 1;
+                    }
+                } else if (ev.ascii >= 32 && ev.ascii <= 126 && line_len + 1U < SH_LINE_MAX) {
+                    line[line_len++] = ev.ascii;
+                    sh_putc(ev.ascii);
+                    need_redraw = 1;
+                }
+            }
+            if (need_redraw) {
+                console_refresh();
+            }
+            if (xhci_is_initialized()) {
+                xhci_poll();
+                io_wait();
+            } else {
+                cpu_hlt();
+            }
+        }
+
+        targc = tokenize_line(line, targv, SH_MAX_ARGS);
+        if (targc == 0) {
+            continue;
+        }
+        if (strcmp(targv[0], "quit") == 0 || strcmp(targv[0], "q") == 0 ||
+            strcmp(targv[0], "exit") == 0) {
+            return;
+        } else if (strcmp(targv[0], "open") == 0 && targc >= 2) {
+            port = 23U;
+            if (targc >= 3 && parse_port(targv[2], &port) < 0) {
+                sh_puts("usage: open <host> [port]\n");
+            } else {
+                telnet_session(targv[1], port);
+            }
+        } else {
+            sh_puts("Commands: open <host> [port], quit\n");
+        }
+    }
 }
 
 static void cmd_memmap(void)
@@ -645,9 +898,11 @@ static void sh_execute_line(char *line)
     }
 
     if (strcmp(argv[0], "help") == 0) {
-        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net memmap acpi keymap ps uname uptime clear vi shutdown\n");
+        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net telnet memmap acpi keymap ps uname uptime clear vi shutdown\n");
     } else if (strcmp(argv[0], "net") == 0) {
         cmd_net(argc, argv);
+    } else if (strcmp(argv[0], "telnet") == 0) {
+        cmd_telnet(argc, argv);
     } else if (strcmp(argv[0], "shutdown") == 0 || strcmp(argv[0], "poweroff") == 0) {
         sh_puts("Shutting down system via ACPI...\n");
         console_refresh();

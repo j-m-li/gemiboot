@@ -6,6 +6,7 @@
 
 #include "syscall.h"
 #include "acpi.h"
+#include "net.h"
 #include "vfs.h"
 #include "pit.h"
 #include "console.h"
@@ -1943,7 +1944,11 @@ void syscall_dispatch(struct isr_regs *regs)
         break;
 
     case LINUX_SYS_close:
-        ret = (vfs_close((int)arg1) == 0) ? 0 : -LINUX_EBADF;
+        if (net_is_socket_fd((int)arg1)) {
+            ret = net_close((int)arg1);
+        } else {
+            ret = (vfs_close((int)arg1) == 0) ? 0 : -LINUX_EBADF;
+        }
         break;
 
     case LINUX_SYS_lseek:
@@ -1971,6 +1976,8 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_read:
         if (arg3 == 0) {
             ret = 0;
+        } else if (net_is_socket_fd((int)arg1)) {
+            ret = net_recv((int)arg1, (void *)(uintptr_t)arg2, arg3, 0U);
         } else {
             ret = vfs_read((int)arg1, (void *)(uintptr_t)arg2, arg3);
             if (ret < 0) {
@@ -1982,6 +1989,8 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_write:
         if (arg3 == 0) {
             ret = 0;
+        } else if (net_is_socket_fd((int)arg1)) {
+            ret = net_send((int)arg1, (const void *)(uintptr_t)arg2, arg3, 0U);
         } else {
             ret = vfs_write((int)arg1, (const void *)(uintptr_t)arg2, arg3);
             if (ret < 0) {
@@ -2412,6 +2421,86 @@ void syscall_dispatch(struct isr_regs *regs)
             proc_table[found_idx].state = PROC_UNUSED;
         }
         ret = 0;
+        break;
+    }
+
+    case LINUX_SYS_socket:
+        ret = net_socket((int)arg1, (int)arg2, (int)arg3);
+        break;
+
+    case LINUX_SYS_bind:
+        ret = net_bind((int)arg1, (const struct sockaddr *)(uintptr_t)arg2, arg3);
+        break;
+
+    case LINUX_SYS_connect:
+        ret = net_connect((int)arg1, (const struct sockaddr *)(uintptr_t)arg2, arg3);
+        break;
+
+    case LINUX_SYS_getsockname:
+        ret = net_getsockname((int)arg1, (struct sockaddr *)(uintptr_t)arg2,
+                              (uint32_t *)(uintptr_t)arg3);
+        break;
+
+    case LINUX_SYS_getpeername:
+        ret = net_getpeername((int)arg1, (struct sockaddr *)(uintptr_t)arg2,
+                              (uint32_t *)(uintptr_t)arg3);
+        break;
+
+    case LINUX_SYS_sendto:
+        ret = net_sendto((int)arg1, (const void *)(uintptr_t)arg2, arg3, arg4,
+                         (const struct sockaddr *)(uintptr_t)arg5, arg6);
+        break;
+
+    case LINUX_SYS_recvfrom:
+        ret = net_recvfrom((int)arg1, (void *)(uintptr_t)arg2, arg3, arg4,
+                           (struct sockaddr *)(uintptr_t)arg5, (uint32_t *)(uintptr_t)arg6);
+        break;
+
+    case LINUX_SYS_socketcall: {
+        const uint32_t *a = (const uint32_t *)(uintptr_t)arg2;
+        if (a == NULL) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        switch (arg1) {
+        case 1: /* SYS_SOCKET */
+            ret = net_socket((int)a[0], (int)a[1], (int)a[2]);
+            break;
+        case 2: /* SYS_BIND */
+            ret = net_bind((int)a[0], (const struct sockaddr *)(uintptr_t)a[1], a[2]);
+            break;
+        case 3: /* SYS_CONNECT */
+            ret = net_connect((int)a[0], (const struct sockaddr *)(uintptr_t)a[1], a[2]);
+            break;
+        case 6: /* SYS_GETSOCKNAME */
+            ret = net_getsockname((int)a[0], (struct sockaddr *)(uintptr_t)a[1],
+                                  (uint32_t *)(uintptr_t)a[2]);
+            break;
+        case 7: /* SYS_GETPEERNAME */
+            ret = net_getpeername((int)a[0], (struct sockaddr *)(uintptr_t)a[1],
+                                  (uint32_t *)(uintptr_t)a[2]);
+            break;
+        case 9: /* SYS_SEND */
+            ret = net_send((int)a[0], (const void *)(uintptr_t)a[1], a[2], a[3]);
+            break;
+        case 10: /* SYS_RECV */
+            ret = net_recv((int)a[0], (void *)(uintptr_t)a[1], a[2], a[3]);
+            break;
+        case 11: /* SYS_SENDTO */
+            ret = net_sendto((int)a[0], (const void *)(uintptr_t)a[1], a[2], a[3],
+                             (const struct sockaddr *)(uintptr_t)a[4], a[5]);
+            break;
+        case 12: /* SYS_RECVFROM */
+            ret = net_recvfrom((int)a[0], (void *)(uintptr_t)a[1], a[2], a[3],
+                               (struct sockaddr *)(uintptr_t)a[4], (uint32_t *)(uintptr_t)a[5]);
+            break;
+        case 13: /* SYS_SHUTDOWN */
+            ret = net_is_socket_fd((int)a[0]) ? 0 : -LINUX_EBADF;
+            break;
+        default:
+            ret = -LINUX_ENOSYS;
+            break;
+        }
         break;
     }
 

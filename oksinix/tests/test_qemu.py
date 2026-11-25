@@ -11,7 +11,51 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+
+
+def start_mock_telnet_server():
+    """Start a local TCP mock telnet server reachable via QEMU SLIRP at 10.0.2.2:<port>."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(2)
+    srv.settimeout(30.0)
+    port = srv.getsockname()[1]
+
+    def worker():
+        try:
+            conn, _ = srv.accept()
+            conn.settimeout(10.0)
+            # Send RFC 854 IAC DO TTYPE + IAC WILL SGA + greeting banner
+            conn.sendall(b"\xff\xfd\x18\xff\xfb\x03WELCOME TO OKSINIX TELNET TEST\r\n")
+            buf = b""
+            while b"\n" not in buf:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                buf += chunk
+            # Strip any 3-byte Telnet IAC responses (0xFF <cmd> <opt>)
+            cleaned = bytearray()
+            i = 0
+            while i < len(buf):
+                if buf[i] == 0xFF and i + 2 < len(buf):
+                    i += 3
+                else:
+                    cleaned.append(buf[i])
+                    i += 1
+            line = cleaned.decode("ascii", errors="replace").strip()
+            conn.sendall(f"ECHO: {line}\r\n".encode("ascii"))
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            srv.close()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return port, srv, t
 
 
 def make_fat32_usb_image(out_path, label11, fname83, content_bytes, mbr_banner=None):
@@ -364,6 +408,7 @@ def main():
             send_keys_str(sock, "/mnt/LINUX.ELF\n")
             wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/mnt/LINUX.ELF\"")
             wait_for_serial(serial_log_path, "[LINUX-ELF] execve child running via int 0x80 (PID verified)")
+            wait_for_serial(serial_log_path, "[LINUX-ELF] BSD socket syscalls (socket/bind/connect/send/recv) PASSED!")
             wait_for_serial(serial_log_path, "[LINUX-ELF] All 37 Linux i386 syscalls PASSED!")
             send_keys_str(sock, "memmap\n")
             wait_for_serial(serial_log_path, "ACPI RSDP:")
@@ -381,6 +426,23 @@ def main():
             wait_for_serial(serial_log_path, "ARP reply: 10.0.2.2 is at")
             wait_for_serial(serial_log_path, "ICMP echo reply from 10.0.2.2: seq=1 OK")
             print("[PASS] 8/13 xHCI USB Ethernet (RNDIS) MAC query, ARP & ICMP ping to 10.0.2.2 verified")
+
+            # 8b. Test TCP + 'telnet [host [port]]' against local TCP server via QEMU SLIRP 10.0.2.2
+            telnet_port, telnet_srv, telnet_thr = start_mock_telnet_server()
+            try:
+                send_keys_str(sock, f"telnet 10.0.2.2 {telnet_port}\n")
+                wait_for_serial(serial_log_path, f"Connected to 10.0.2.2 (10.0.2.2:{telnet_port}).")
+                wait_for_serial(serial_log_path, "WELCOME TO OKSINIX TELNET TEST")
+                send_keys_str(sock, "hello-telnet\n")
+                wait_for_serial(serial_log_path, "ECHO: hello-telnet")
+                wait_for_serial(serial_log_path, "Connection closed by foreign host.")
+                send_keys_str(sock, "telnet\n")
+                wait_for_serial(serial_log_path, "telnet> ")
+                send_keys_str(sock, "quit\n")
+                time.sleep(0.15)
+            finally:
+                telnet_thr.join(timeout=2.0)
+            print(f"[PASS] 8b/14 TCP client & 'telnet 10.0.2.2 {telnet_port}' (IAC negotiation, send/recv, FIN close) verified")
 
             # 9. Test xHCI USB Mouse (on Hub port 1.2) movement & button clicks
             send_hmp_cmd(sock, "mouse_move 35 -15", delay=0.1)

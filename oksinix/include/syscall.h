@@ -37,6 +37,7 @@
 #define LINUX_SYS_mmap           90
 #define LINUX_SYS_munmap         91
 #define LINUX_SYS_ftruncate      93
+#define LINUX_SYS_socketcall     102
 #define LINUX_SYS_stat           106
 #define LINUX_SYS_lstat          107
 #define LINUX_SYS_fstat          108
@@ -69,6 +70,13 @@
 #define LINUX_SYS_unlinkat       301
 #define LINUX_SYS_faccessat      307
 #define LINUX_SYS_dup3           330
+#define LINUX_SYS_socket         359
+#define LINUX_SYS_bind           361
+#define LINUX_SYS_connect        362
+#define LINUX_SYS_getsockname    367
+#define LINUX_SYS_getpeername    368
+#define LINUX_SYS_sendto         369
+#define LINUX_SYS_recvfrom       371
 #define LINUX_SYS_statx          383
 #define LINUX_SYS_clock_gettime64 403
 

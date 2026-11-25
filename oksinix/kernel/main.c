@@ -21,6 +21,7 @@
 #include "vfs.h"
 #include "fat32.h"
 #include "syscall.h"
+#include "net.h"
 #include "user.h"
 
 static void parse_multiboot_info(uint32_t mbi_addr)
@@ -98,6 +99,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
 
     acpi_init(magic, mbi_addr);
     syscall_init();
+    net_init();
 
     pit_init();
 
