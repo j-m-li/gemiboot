@@ -390,7 +390,7 @@ static void telnet_session(const char *host, uint16_t port)
                 }
             }
         }
-        if (n == 0) {
+        if (n == 0 || (n < 0 && n != -11)) {
             sh_puts("\nConnection closed by foreign host.\n");
             running = 0;
             break;

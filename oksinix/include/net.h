@@ -24,6 +24,7 @@
 #define IPPROTO_UDP      17
 
 /* Socket flags */
+#define MSG_PEEK         0x02U
 #define MSG_DONTWAIT     0x40U
 
 /* Socket descriptor table (disjoint from VFS fds 0..31) */

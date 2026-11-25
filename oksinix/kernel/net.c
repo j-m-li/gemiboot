@@ -19,10 +19,12 @@
 #define NET_EMFILE        24
 #define NET_EPIPE         32
 #define NET_EDESTADDRREQ  89
+#define NET_EMSGSIZE      90
 #define NET_EPROTONOSUPP  93
 #define NET_EAFNOSUPPORT  97
 #define NET_EADDRINUSE    98
 #define NET_ENETUNREACH   101
+#define NET_ECONNRESET    104
 #define NET_ENOTCONN      107
 #define NET_ETIMEDOUT     110
 #define NET_ECONNREFUSED  111
@@ -218,8 +220,8 @@ static void sock_enqueue_rx(struct net_sock *sk, uint32_t src_ip, uint16_t src_p
     sk->rx_head = next_head;
 }
 
-static uint16_t net_tcp_checksum(uint32_t src_ip_be, uint32_t dst_ip_be,
-                                 const uint8_t *seg, uint32_t seg_len)
+static uint16_t net_l4_checksum(uint32_t src_ip_be, uint32_t dst_ip_be,
+                                uint8_t proto, const uint8_t *seg, uint32_t seg_len)
 {
     uint32_t sum = 0;
     uint32_t i;
@@ -228,7 +230,7 @@ static uint16_t net_tcp_checksum(uint32_t src_ip_be, uint32_t dst_ip_be,
     write_be32(&pseudo[0], src_ip_be);
     write_be32(&pseudo[4], dst_ip_be);
     pseudo[8]  = 0U;
-    pseudo[9]  = IPPROTO_TCP;
+    pseudo[9]  = proto;
     pseudo[10] = (uint8_t)((seg_len >> 8) & 0xFFU);
     pseudo[11] = (uint8_t)(seg_len & 0xFFU);
 
@@ -245,6 +247,12 @@ static uint16_t net_tcp_checksum(uint32_t src_ip_be, uint32_t dst_ip_be,
         sum = (sum & 0xFFFFU) + (sum >> 16);
     }
     return (uint16_t)(~sum & 0xFFFFU);
+}
+
+static uint16_t net_tcp_checksum(uint32_t src_ip_be, uint32_t dst_ip_be,
+                                 const uint8_t *seg, uint32_t seg_len)
+{
+    return net_l4_checksum(src_ip_be, dst_ip_be, IPPROTO_TCP, seg, seg_len);
 }
 
 static int tcp_send_segment(struct net_sock *sk, uint8_t flags,
@@ -1340,6 +1348,8 @@ int net_connect(int sockfd, const struct sockaddr *addr, uint32_t addrlen)
     return 0;
 }
 
+static uint8_t udp_tx_buf[1520];
+
 int32_t net_sendto(int sockfd, const void *buf, uint32_t len, uint32_t flags,
                    const struct sockaddr *dest_addr, uint32_t addrlen)
 {
@@ -1355,11 +1365,18 @@ int32_t net_sendto(int sockfd, const void *buf, uint32_t len, uint32_t flags,
     if (buf == NULL && len > 0U) {
         return -NET_EFAULT;
     }
-    if (len > NET_SOCK_RX_MAX) {
-        len = NET_SOCK_RX_MAX;
-    }
 
-    if (dest_addr != NULL) {
+    if (sk->type == SOCK_STREAM) {
+        /* Stream sockets always send to their connected peer; ignore dest_addr */
+        if (!sk->connected) {
+            return -NET_ENOTCONN;
+        }
+        dst_ip   = sk->peer_ip;
+        dst_port = sk->peer_port;
+        if (len > NET_SOCK_RX_MAX) {
+            len = NET_SOCK_RX_MAX;
+        }
+    } else if (dest_addr != NULL) {
         const struct sockaddr_in *sin;
         if (addrlen < (uint32_t)sizeof(struct sockaddr_in)) {
             return -NET_EINVAL;
@@ -1386,18 +1403,20 @@ int32_t net_sendto(int sockfd, const void *buf, uint32_t len, uint32_t flags,
 
     /* Loopback delivery (127.0.0.1 or own IP) */
     if (is_loopback_ip(dst_ip)) {
+        if (len > NET_SOCK_RX_MAX) {
+            return -NET_EMSGSIZE;
+        }
         if (sk->type == SOCK_RAW && sk->protocol == IPPROTO_ICMP && len >= 8U) {
-            uint8_t reply[NET_SOCK_RX_MAX];
             uint16_t ck;
-            memcpy(reply, buf, len);
-            if (reply[0] == 8U) {
-                reply[0] = 0U;
-                reply[2] = 0U;
-                reply[3] = 0U;
-                ck = net_checksum16(reply, len);
-                reply[2] = (uint8_t)((ck >> 8) & 0xFFU);
-                reply[3] = (uint8_t)(ck & 0xFFU);
-                sock_enqueue_rx(sk, dst_ip, 0U, reply, len);
+            memcpy(udp_tx_buf, buf, len);
+            if (udp_tx_buf[0] == 8U) {
+                udp_tx_buf[0] = 0U;
+                udp_tx_buf[2] = 0U;
+                udp_tx_buf[3] = 0U;
+                ck = net_checksum16(udp_tx_buf, len);
+                udp_tx_buf[2] = (uint8_t)((ck >> 8) & 0xFFU);
+                udp_tx_buf[3] = (uint8_t)(ck & 0xFFU);
+                sock_enqueue_rx(sk, dst_ip, 0U, udp_tx_buf, len);
             }
             return (int32_t)len;
         } else {
@@ -1405,9 +1424,14 @@ int32_t net_sendto(int sockfd, const void *buf, uint32_t len, uint32_t flags,
             for (i = 0; i < NET_MAX_SOCKETS; i++) {
                 struct net_sock *dst = &sock_table[i];
                 if (dst->used && dst->bound && dst->type == sk->type &&
-                    dst->local_port == dst_port) {
-                    sock_enqueue_rx(dst, src_ip, sk->local_port, (const uint8_t *)buf, len);
-                    return (int32_t)len;
+                    dst->local_port == dst_port &&
+                    (dst->local_ip == 0U || dst->local_ip == dst_ip)) {
+                    if (!dst->connected ||
+                        ((dst->peer_ip == 0U || dst->peer_ip == src_ip) &&
+                         (dst->peer_port == 0U || dst->peer_port == sk->local_port))) {
+                        sock_enqueue_rx(dst, src_ip, sk->local_port, (const uint8_t *)buf, len);
+                        return (int32_t)len;
+                    }
                 }
             }
             return (int32_t)len;
@@ -1416,27 +1440,40 @@ int32_t net_sendto(int sockfd, const void *buf, uint32_t len, uint32_t flags,
 
     /* External IPv4 packet transmission over USB Ethernet (RNDIS / CDC-ECM) */
     if (sk->type == SOCK_RAW && sk->protocol == IPPROTO_ICMP) {
-        int rc = net_send_ipv4(dst_ip, IPPROTO_ICMP, (const uint8_t *)buf, len);
+        int rc;
+        if (len > 1480U) {
+            return -NET_EMSGSIZE; /* Exceeds 1500B IPv4 MTU (20B IP + payload) */
+        }
+        rc = net_send_ipv4(dst_ip, IPPROTO_ICMP, (const uint8_t *)buf, len);
         return (rc == 0) ? (int32_t)len : rc;
     }
 
     if (sk->type == SOCK_DGRAM) {
-        uint8_t udp_buf[1520];
-        uint16_t udp_len = (uint16_t)(8U + len);
+        uint16_t udp_len;
+        uint16_t udp_ck;
         int rc;
-        if (udp_len > sizeof(udp_buf)) {
-            return -NET_EINVAL;
+        if (len > 1472U) {
+            return -NET_EMSGSIZE; /* Exceeds 1500B IPv4 MTU (20B IP + 8B UDP + payload) */
         }
-        memcpy(&udp_buf[0], &sk->local_port, 2U);
-        memcpy(&udp_buf[2], &dst_port, 2U);
-        udp_buf[4] = (uint8_t)((udp_len >> 8) & 0xFFU);
-        udp_buf[5] = (uint8_t)(udp_len & 0xFFU);
-        udp_buf[6] = 0U;
-        udp_buf[7] = 0U;
+        udp_len = (uint16_t)(8U + len);
+        memcpy(&udp_tx_buf[0], &sk->local_port, 2U);
+        memcpy(&udp_tx_buf[2], &dst_port, 2U);
+        udp_tx_buf[4] = (uint8_t)((udp_len >> 8) & 0xFFU);
+        udp_tx_buf[5] = (uint8_t)(udp_len & 0xFFU);
+        udp_tx_buf[6] = 0U;
+        udp_tx_buf[7] = 0U;
         if (len > 0U) {
-            memcpy(&udp_buf[8], buf, len);
+            memcpy(&udp_tx_buf[8], buf, len);
         }
-        rc = net_send_ipv4(dst_ip, IPPROTO_UDP, udp_buf, udp_len);
+        udp_ck = net_l4_checksum(dhcp_zero_src ? 0UL : local_ip_be,
+                                 dst_ip, IPPROTO_UDP, udp_tx_buf, udp_len);
+        if (udp_ck == 0U) {
+            udp_ck = 0xFFFFU; /* RFC 768: transmitted 0 checksum becomes 0xFFFF */
+        }
+        udp_tx_buf[6] = (uint8_t)((udp_ck >> 8) & 0xFFU);
+        udp_tx_buf[7] = (uint8_t)(udp_ck & 0xFFU);
+
+        rc = net_send_ipv4(dst_ip, IPPROTO_UDP, udp_tx_buf, udp_len);
         return (rc == 0) ? (int32_t)len : rc;
     }
 
@@ -1481,6 +1518,8 @@ int32_t net_sendto(int sockfd, const void *buf, uint32_t len, uint32_t flags,
                 pit_mdelay(10U);
             }
             if (!acked) {
+                /* Rewind SND.NXT to SND.UNA so unacked bytes do not leave a sequence gap */
+                sk->tcp_snd_nxt = sk->tcp_snd_una;
                 return (sent > 0U) ? (int32_t)sent : -NET_ETIMEDOUT;
             }
             sent += chunk;
@@ -1513,8 +1552,11 @@ int32_t net_recvfrom(int sockfd, void *buf, uint32_t len, uint32_t flags,
     if (sk == NULL) {
         return -NET_EBADF;
     }
-    if (buf == NULL && len > 0U) {
+    if ((buf == NULL && len > 0U) || (src_addr != NULL && addrlen == NULL)) {
         return -NET_EFAULT;
+    }
+    if (sk->type == SOCK_STREAM && len == 0U) {
+        return 0;
     }
 
     net_poll();
@@ -1532,14 +1574,20 @@ int32_t net_recvfrom(int sockfd, void *buf, uint32_t len, uint32_t flags,
     }
 
     if (sk->rx_tail == sk->rx_head) {
-        if (sk->type == SOCK_STREAM && (sk->tcp_eof || sk->tcp_rst)) {
-            return 0;
+        if (sk->type == SOCK_STREAM) {
+            if (sk->tcp_rst) {
+                sk->tcp_rst = FALSE;
+                return -NET_ECONNRESET;
+            }
+            if (sk->tcp_eof) {
+                return 0;
+            }
         }
         return -NET_EAGAIN;
     }
 
     pkt = &sk->rx_q[sk->rx_tail];
-    copy_len = (uint32_t)(pkt->len - pkt->off);
+    copy_len = (pkt->off < pkt->len) ? (uint32_t)(pkt->len - pkt->off) : 0U;
     if (copy_len > len) {
         copy_len = len;
     }
@@ -1547,23 +1595,31 @@ int32_t net_recvfrom(int sockfd, void *buf, uint32_t len, uint32_t flags,
         memcpy(buf, &pkt->data[pkt->off], copy_len);
     }
 
-    if (src_addr != NULL && addrlen != NULL && *addrlen >= (uint32_t)sizeof(struct sockaddr_in)) {
+    if (src_addr != NULL) {
         struct sockaddr_in sin;
+        uint32_t out_len = *addrlen;
         memset(&sin, 0, sizeof(sin));
         sin.sin_family = AF_INET;
         sin.sin_port   = pkt->src_port;
         sin.sin_addr   = pkt->src_ip;
-        memcpy(src_addr, &sin, sizeof(sin));
+        if (out_len > (uint32_t)sizeof(sin)) {
+            out_len = (uint32_t)sizeof(sin);
+        }
+        if (out_len > 0U) {
+            memcpy(src_addr, &sin, out_len);
+        }
         *addrlen = (uint32_t)sizeof(sin);
     }
 
-    if (sk->type == SOCK_STREAM) {
-        pkt->off = (uint16_t)(pkt->off + copy_len);
-        if (pkt->off >= pkt->len) {
+    if ((flags & MSG_PEEK) == 0U) {
+        if (sk->type == SOCK_STREAM) {
+            pkt->off = (uint16_t)(pkt->off + copy_len);
+            if (pkt->off >= pkt->len) {
+                sk->rx_tail = (sk->rx_tail + 1U) % NET_SOCK_RX_SLOTS;
+            }
+        } else {
             sk->rx_tail = (sk->rx_tail + 1U) % NET_SOCK_RX_SLOTS;
         }
-    } else {
-        sk->rx_tail = (sk->rx_tail + 1U) % NET_SOCK_RX_SLOTS;
     }
     return (int32_t)copy_len;
 }
@@ -1687,36 +1743,51 @@ int net_parse_ipv4(const char *s, uint32_t *out_ip_be)
     return 0;
 }
 
-static uint32_t dns_skip_name(const uint8_t *msg, uint32_t len, uint32_t pos)
+static int32_t dns_skip_name(const uint8_t *msg, uint32_t len, uint32_t pos)
 {
     int guard = 0;
+
     while (pos < len && guard < 64) {
         uint8_t c = msg[pos];
         if (c == 0U) {
-            return pos + 1U;
+            return (int32_t)(pos + 1U);
         }
         if ((c & 0xC0U) == 0xC0U) {
-            return (pos + 2U <= len) ? (pos + 2U) : len;
+            uint16_t ptr_off;
+            if (pos + 2U > len) {
+                return -1;
+            }
+            ptr_off = (uint16_t)(((uint16_t)(c & 0x3FU) << 8) | (uint16_t)msg[pos + 1U]);
+            /* RFC 1035: compression pointer must reference a prior byte inside the packet */
+            if (ptr_off >= len || ptr_off >= pos) {
+                return -1;
+            }
+            return (int32_t)(pos + 2U);
+        }
+        if ((c & 0xC0U) != 0U) {
+            return -1; /* Reserved label length bits (0x40..0xBF) are invalid */
+        }
+        if (pos + 1U + (uint32_t)c > len) {
+            return -1; /* Label extends past end of packet */
         }
         pos += 1U + (uint32_t)c;
         guard++;
     }
-    return len;
+    return -1;
 }
 
 int net_resolve_host(const char *host, uint32_t *out_ip_be)
 {
-    uint8_t qbuf[256];
-    uint8_t rbuf[512];
+    static uint8_t qbuf[256];
+    static uint8_t rbuf[512];
     struct sockaddr_in dst;
+    struct sockaddr_in src;
+    uint32_t slen;
     uint32_t qpos;
     const char *p;
     uint16_t txid;
     int sock;
-    int32_t n;
-    uint16_t ancount;
-    uint32_t rpos;
-    uint16_t i;
+    int wait;
 
     if (host == NULL || out_ip_be == NULL || host[0] == '\0') {
         return -1;
@@ -1728,11 +1799,15 @@ int net_resolve_host(const char *host, uint32_t *out_ip_be)
         *out_ip_be = net_make_ipv4(127, 0, 0, 1);
         return 0;
     }
-    if (!xhci_has_usb_net()) {
+    if (!xhci_has_usb_net() || dns_ip_be == 0UL) {
         return -1;
     }
 
-    txid = dns_txid++;
+    txid = (uint16_t)(tcp_mix32(tcp_isn_secret ^ pit_get_ticks() ^
+                                ((uint32_t)(dns_txid++) << 16)) & 0xFFFFU);
+    if (txid == 0U) {
+        txid = 1U;
+    }
     memset(qbuf, 0, 12U);
     qbuf[0] = (uint8_t)((txid >> 8) & 0xFFU);
     qbuf[1] = (uint8_t)(txid & 0xFFU);
@@ -1769,49 +1844,82 @@ int net_resolve_host(const char *host, uint32_t *out_ip_be)
     dst.sin_port   = net_htons(53U);
     dst.sin_addr   = dns_ip_be;
 
-    if (net_sendto(sock, qbuf, qpos, 0U,
-                   (const struct sockaddr *)(const void *)&dst,
-                   (uint32_t)sizeof(dst)) < 0) {
+    if (net_connect(sock, (const struct sockaddr *)(const void *)&dst,
+                    (uint32_t)sizeof(dst)) < 0 ||
+        net_send(sock, qbuf, qpos, 0U) < 0) {
         (void)net_close(sock);
         return -1;
     }
 
-    n = net_recv(sock, rbuf, (uint32_t)sizeof(rbuf), 0U);
+    for (wait = 0; wait < 150; wait++) {
+        int32_t n;
+        uint16_t qdcount, ancount, q, i;
+        int32_t rpos;
+
+        slen = (uint32_t)sizeof(src);
+        n = net_recvfrom(sock, rbuf, (uint32_t)sizeof(rbuf), MSG_DONTWAIT,
+                         (struct sockaddr *)(void *)&src, &slen);
+        if (n < 0) {
+            pit_mdelay(10U);
+            continue;
+        }
+        /* Ignore spoofed/stray packets not matching DNS server, port 53, TXID, QR=1, OPCODE=0 */
+        if (n < 12 || src.sin_addr != dns_ip_be || src.sin_port != net_htons(53U) ||
+            rbuf[0] != (uint8_t)((txid >> 8) & 0xFFU) ||
+            rbuf[1] != (uint8_t)(txid & 0xFFU) ||
+            (rbuf[2] & 0x80U) == 0U || (rbuf[2] & 0x78U) != 0U) {
+            continue;
+        }
+        if ((rbuf[3] & 0x0FU) != 0U) {
+            /* Authoritative DNS error (NXDOMAIN / SERVFAIL / REFUSED) */
+            (void)net_close(sock);
+            return -1;
+        }
+
+        qdcount = (uint16_t)(((uint16_t)rbuf[4] << 8) | (uint16_t)rbuf[5]);
+        ancount = (uint16_t)(((uint16_t)rbuf[6] << 8) | (uint16_t)rbuf[7]);
+        rpos = 12;
+
+        for (q = 0; q < qdcount; q++) {
+            rpos = dns_skip_name(rbuf, (uint32_t)n, (uint32_t)rpos);
+            if (rpos < 0 || (uint32_t)rpos + 4U > (uint32_t)n) {
+                rpos = -1;
+                break;
+            }
+            rpos += 4; /* Skip QTYPE + QCLASS */
+        }
+        if (rpos < 0) {
+            (void)net_close(sock);
+            return -1;
+        }
+
+        for (i = 0; i < ancount && (uint32_t)rpos < (uint32_t)n; i++) {
+            uint16_t rtype, rclass, rdlen;
+            rpos = dns_skip_name(rbuf, (uint32_t)n, (uint32_t)rpos);
+            if (rpos < 0 || (uint32_t)rpos + 10U > (uint32_t)n) {
+                break;
+            }
+            rtype  = (uint16_t)(((uint16_t)rbuf[rpos] << 8) | (uint16_t)rbuf[rpos + 1]);
+            rclass = (uint16_t)(((uint16_t)rbuf[rpos + 2] << 8) | (uint16_t)rbuf[rpos + 3]);
+            rdlen  = (uint16_t)(((uint16_t)rbuf[rpos + 8] << 8) | (uint16_t)rbuf[rpos + 9]);
+            rpos += 10;
+            if ((uint32_t)rpos + (uint32_t)rdlen > (uint32_t)n) {
+                break;
+            }
+            if (rtype == 1U && rclass == 1U && rdlen == 4U) {
+                uint32_t ip = read_be32(&rbuf[rpos]);
+                if (ip != 0UL) {
+                    *out_ip_be = ip;
+                    (void)net_close(sock);
+                    return 0;
+                }
+            }
+            rpos += (int32_t)rdlen;
+        }
+        (void)net_close(sock);
+        return -1;
+    }
+
     (void)net_close(sock);
-    if (n < 12) {
-        return -1;
-    }
-    if (rbuf[0] != (uint8_t)((txid >> 8) & 0xFFU) ||
-        rbuf[1] != (uint8_t)(txid & 0xFFU) ||
-        (rbuf[2] & 0x80U) == 0U || (rbuf[3] & 0x0FU) != 0U) {
-        return -1;
-    }
-
-    ancount = (uint16_t)(((uint16_t)rbuf[6] << 8) | (uint16_t)rbuf[7]);
-    rpos = dns_skip_name(rbuf, (uint32_t)n, 12U);
-    if (rpos + 4U > (uint32_t)n) {
-        return -1;
-    }
-    rpos += 4U; /* Skip QTYPE + QCLASS */
-
-    for (i = 0; i < ancount && rpos < (uint32_t)n; i++) {
-        uint16_t rtype, rclass, rdlen;
-        rpos = dns_skip_name(rbuf, (uint32_t)n, rpos);
-        if (rpos + 10U > (uint32_t)n) {
-            break;
-        }
-        rtype  = (uint16_t)(((uint16_t)rbuf[rpos] << 8) | (uint16_t)rbuf[rpos + 1U]);
-        rclass = (uint16_t)(((uint16_t)rbuf[rpos + 2U] << 8) | (uint16_t)rbuf[rpos + 3U]);
-        rdlen  = (uint16_t)(((uint16_t)rbuf[rpos + 8U] << 8) | (uint16_t)rbuf[rpos + 9U]);
-        rpos += 10U;
-        if (rpos + rdlen > (uint32_t)n) {
-            break;
-        }
-        if (rtype == 1U && rclass == 1U && rdlen == 4U) {
-            *out_ip_be = read_be32(&rbuf[rpos]);
-            return 0;
-        }
-        rpos += rdlen;
-    }
     return -1;
 }
