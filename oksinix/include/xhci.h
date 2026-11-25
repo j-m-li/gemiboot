@@ -10,7 +10,22 @@
 
 #include "types.h"
 
-#define XHCI_MAX_MSC_DEVS 4
+#define XHCI_MAX_MSC_DEVS    4
+#define XHCI_NET_PROTO_NONE  0
+#define XHCI_NET_PROTO_RNDIS 1
+#define XHCI_NET_PROTO_ECM   2
+
+struct xhci_net_info {
+    bool_t   present;
+    uint8_t  slot_id;
+    uint8_t  protocol;
+    uint8_t  mac[6];
+    uint16_t mtu;
+    uint32_t tx_packets;
+    uint32_t rx_packets;
+    uint32_t tx_bytes;
+    uint32_t rx_bytes;
+};
 
 struct xhci_msc_info {
     bool_t   present;
@@ -50,9 +65,13 @@ bool_t xhci_has_usb_hub(void);
 bool_t xhci_has_usb_kbd(void);
 bool_t xhci_has_usb_mouse(void);
 bool_t xhci_has_usb_storage(void);
+bool_t xhci_has_usb_net(void);
 
 void    xhci_get_controller_info(struct xhci_controller_info *out);
 void    xhci_get_hub_info(struct xhci_hub_info *out);
+void    xhci_get_net_info(struct xhci_net_info *out);
+int32_t xhci_net_send(const uint8_t *frame, uint32_t len);
+int32_t xhci_net_recv(uint8_t *buf, uint32_t max_len);
 int     xhci_get_msc_count(void);
 int     xhci_get_msc_info_idx(int disk_idx, struct xhci_msc_info *out);
 void    xhci_get_msc_info(struct xhci_msc_info *out);

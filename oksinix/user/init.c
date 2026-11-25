@@ -123,6 +123,9 @@ int bin_init_main(int argc, char **argv)
         if (xhci_has_usb_mouse()) {
             fd_puts(fd_out, "usb-mouse ");
         }
+        if (xhci_has_usb_net()) {
+            fd_puts(fd_out, "usb-net ");
+        }
         if (xhci_has_usb_storage()) {
             int i;
             int printed = 0;

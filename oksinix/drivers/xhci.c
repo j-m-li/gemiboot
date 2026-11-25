@@ -38,6 +38,7 @@
 /* xHCI TRB Flag bits */
 #define TRB_CYCLE                  (1U << 0)
 #define TRB_LINK_TOGGLE_CYCLE      (1U << 1)
+#define TRB_ISP                    (1U << 2)
 #define TRB_IOC                    (1U << 5)
 #define TRB_IDT                    (1U << 6)
 #define TRB_DIR_IN                 (1U << 16)
@@ -183,6 +184,16 @@ void xhci_interrupt_in_submit(struct xhci_usb_dev *dev, void *buf, uint32_t len)
     db_base[dev->slot_id] = dev->int_in_dci;
 }
 
+void xhci_bulk_in_submit(struct xhci_usb_dev *dev, void *buf, uint32_t len)
+{
+    ring_enqueue(&dev->bulk_in_ring,
+                 (uint32_t)(uintptr_t)buf,
+                 0,
+                 len,
+                 (TRB_TYPE_NORMAL << 10) | TRB_IOC | TRB_ISP);
+    db_base[dev->slot_id] = dev->bulk_in_dci;
+}
+
 bool_t xhci_has_free_slot(void)
 {
     return (num_usb_devs < XHCI_MAX_SLOTS) ? TRUE : FALSE;
@@ -218,15 +229,21 @@ static void xhci_dispatch_async_event(const struct xhci_trb *ev)
 {
     uint32_t trb_type = (ev->control >> 10) & 0x3FU;
     uint8_t  slot_id  = (uint8_t)((ev->control >> 24) & 0xFFU);
+    uint8_t  ep_dci   = (uint8_t)((ev->control >> 16) & 0x1FU);
 
     if (trb_type == TRB_TYPE_TRANSFER_EVENT) {
-        (void)usbhid_handle_transfer_event(slot_id);
+        if (!usbhid_handle_transfer_event(slot_id)) {
+            uint8_t  cc       = (uint8_t)((ev->status >> 24) & 0xFFU);
+            uint32_t residual = ev->status & 0x00FFFFFFU;
+            (void)usbnet_handle_transfer_event(slot_id, ep_dci, cc, residual);
+        }
     } else if (trb_type == TRB_TYPE_PORT_STATUS_CHG) {
         hotplug_pending = TRUE;
     }
 }
 
-static int xhci_wait_event(uint32_t expected_type, uint8_t expected_slot, struct xhci_trb *out)
+static int xhci_wait_event(uint32_t expected_type, uint8_t expected_slot,
+                           uint8_t expected_dci, struct xhci_trb *out)
 {
     int timeout = 25000;
     struct xhci_trb ev;
@@ -235,9 +252,11 @@ static int xhci_wait_event(uint32_t expected_type, uint8_t expected_slot, struct
         if (xhci_pop_event(&ev)) {
             uint32_t trb_type = (ev.control >> 10) & 0x3FU;
             uint8_t  slot_id  = (uint8_t)((ev.control >> 24) & 0xFFU);
+            uint8_t  ep_dci   = (uint8_t)((ev.control >> 16) & 0x1FU);
 
             if (trb_type == expected_type &&
-                (expected_slot == 0 || slot_id == expected_slot)) {
+                (expected_slot == 0 || slot_id == expected_slot) &&
+                (expected_dci == 0 || ep_dci == expected_dci)) {
                 if (out != NULL) {
                     *out = ev;
                 }
@@ -309,7 +328,7 @@ static int xhci_send_command(uint32_t param_lo, uint32_t param_hi, uint32_t cont
 {
     ring_enqueue(&cmd_ring, param_lo, param_hi, 0, control);
     db_base[0] = 0;
-    if (xhci_wait_event(TRB_TYPE_CMD_COMPLETION, 0, out_ev) < 0) {
+    if (xhci_wait_event(TRB_TYPE_CMD_COMPLETION, 0, 0, out_ev) < 0) {
         return -1;
     }
     if (((out_ev->status >> 24) & 0xFFU) != 1U) {
@@ -390,7 +409,7 @@ int xhci_control_transfer(struct xhci_usb_dev *dev,
 
     db_base[dev->slot_id] = 1U;
 
-    if (xhci_wait_event(TRB_TYPE_TRANSFER_EVENT, dev->slot_id, &ev) < 0) {
+    if (xhci_wait_event(TRB_TYPE_TRANSFER_EVENT, dev->slot_id, 1U, &ev) < 0) {
         return -1;
     }
 
@@ -398,7 +417,7 @@ int xhci_control_transfer(struct xhci_usb_dev *dev,
 
     /* If controller generated a Short Packet event on the Data Stage TRB, also consume Status Stage */
     if (cc == 13U && ev.param_lo != status_trb_phys) {
-        if (xhci_wait_event(TRB_TYPE_TRANSFER_EVENT, dev->slot_id, &ev) < 0) {
+        if (xhci_wait_event(TRB_TYPE_TRANSFER_EVENT, dev->slot_id, 1U, &ev) < 0) {
             return -1;
         }
         cc = (uint8_t)((ev.status >> 24) & 0xFFU);
@@ -464,7 +483,7 @@ int xhci_bulk_transfer(struct xhci_usb_dev *dev, bool_t is_in,
                  (TRB_TYPE_NORMAL << 10) | TRB_IOC);
     db_base[dev->slot_id] = dci;
 
-    if (xhci_wait_event(TRB_TYPE_TRANSFER_EVENT, dev->slot_id, &ev) < 0) {
+    if (xhci_wait_event(TRB_TYPE_TRANSFER_EVENT, dev->slot_id, dci, &ev) < 0) {
         return -1;
     }
     cc = (uint8_t)((ev.status >> 24) & 0xFFU);
@@ -537,6 +556,8 @@ void xhci_disconnect_port(uint8_t root_port, uint8_t parent_hub_slot, uint8_t pa
                 usbmsc_remove_device(dev);
             } else if (dev->dev_type == USB_DEV_KBD || dev->dev_type == USB_DEV_MOUSE) {
                 usbhid_remove_device(dev);
+            } else if (dev->dev_type == USB_DEV_NET_RNDIS || dev->dev_type == USB_DEV_NET_ECM) {
+                usbnet_remove_device(dev);
             }
             xhci_release_dev(dev);
         }
@@ -711,140 +732,206 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
         dev->dev_type = USB_DEV_HUB;
     }
 
-    /* 4. Read Configuration Descriptor */
-    memset(cfg_desc, 0, sizeof(cfg_desc));
-    if (xhci_control_transfer(dev, 0x80U, 0x06U, 0x0200U, 0, 9U, cfg_desc) < 0) {
-        xhci_release_dev(dev);
-        return -1;
-    }
-    total_len = (uint16_t)((uint16_t)cfg_desc[2] | ((uint16_t)cfg_desc[3] << 8));
-    if (total_len > sizeof(cfg_desc)) {
-        total_len = sizeof(cfg_desc);
-    }
-    if (xhci_control_transfer(dev, 0x80U, 0x06U, 0x0200U, 0, total_len, cfg_desc) < 0) {
-        xhci_release_dev(dev);
-        return -1;
-    }
-
-    dev->config_val = cfg_desc[5];
-
+    /* 4. Read Configuration Descriptor(s) and match class/endpoints */
     {
-        bool_t  capture_eps  = (dev->dev_type == USB_DEV_HUB) ? TRUE : FALSE;
-        bool_t  iface_locked = FALSE;
-        uint8_t last_ep_dci  = 0;
+        uint8_t num_cfgs = (dev_desc[17] > 0 && dev_desc[17] <= 4U) ? dev_desc[17] : 1U;
+        uint8_t cfg_idx;
 
-        pos = 0;
-        while (pos + 2U <= total_len) {
-            uint8_t bLength = cfg_desc[pos];
-            uint8_t bDescriptorType = cfg_desc[pos + 1U];
+        for (cfg_idx = 0; cfg_idx < num_cfgs; cfg_idx++) {
+            bool_t  capture_eps;
+            bool_t  iface_locked = FALSE;
+            uint8_t last_ep_dci  = 0;
 
-            if (bLength == 0) {
+            memset(cfg_desc, 0, sizeof(cfg_desc));
+            if (xhci_control_transfer(dev, 0x80U, 0x06U,
+                                      (uint16_t)(0x0200U | cfg_idx), 0, 9U, cfg_desc) < 0) {
+                if (cfg_idx == 0) {
+                    xhci_release_dev(dev);
+                    return -1;
+                }
                 break;
             }
-            if (bDescriptorType == 4U && pos + 9U <= total_len) {
-                uint8_t iface_num   = cfg_desc[pos + 2U];
-                uint8_t alt_setting = cfg_desc[pos + 3U];
-                uint8_t iface_class = cfg_desc[pos + 5U];
-                uint8_t iface_sub   = cfg_desc[pos + 6U];
-                uint8_t iface_proto = cfg_desc[pos + 7U];
-                uint32_t cand_type  = USB_DEV_NONE;
-
-                last_ep_dci = 0;
-
-                /* Check if previous matched interface already captured all required endpoints */
-                if ((dev->dev_type == USB_DEV_KBD && dev->int_in_dci != 0) ||
-                    (dev->dev_type == USB_DEV_MOUSE && dev->int_in_dci != 0) ||
-                    (dev->dev_type == USB_DEV_STORAGE && dev->bulk_in_dci != 0 && dev->bulk_out_dci != 0) ||
-                    (dev->dev_type == USB_DEV_HUB && dev->int_in_dci != 0)) {
-                    iface_locked = TRUE;
-                }
-
-                /* If a keyboard is already registered and a second composite device has a mouse interface, allow it */
-                if (iface_locked && dev->dev_type == USB_DEV_KBD &&
-                    xhci_has_usb_kbd() && !xhci_has_usb_mouse() &&
-                    alt_setting == 0U && iface_class == 0x03U && iface_proto == 0x02U) {
-                    iface_locked = FALSE;
-                }
-
-                if (iface_locked || alt_setting != 0U) {
-                    capture_eps = FALSE;
-                } else {
-                    if (iface_class == 0x09U) {
-                        cand_type = USB_DEV_HUB;
-                    } else if (iface_class == 0x03U && iface_proto == 0x01U) {
-                        cand_type = USB_DEV_KBD;
-                    } else if (iface_class == 0x03U && iface_proto == 0x02U) {
-                        cand_type = USB_DEV_MOUSE;
-                    } else if (iface_class == 0x08U && iface_proto == 0x50U &&
-                               (iface_sub == 0x06U || iface_sub == 0x02U ||
-                                iface_sub == 0x05U || iface_sub == 0x01U ||
-                                iface_sub == 0x04U || iface_sub == 0x00U)) {
-                        cand_type = USB_DEV_STORAGE;
-                    } else if (iface_class == 0x03U && iface_proto == 0x00U &&
-                               dev->dev_type == USB_DEV_NONE) {
-                        cand_type = (!xhci_has_usb_kbd()) ? USB_DEV_KBD : USB_DEV_MOUSE;
-                    }
-
-                    if (cand_type != USB_DEV_NONE) {
-                        dev->dev_type       = cand_type;
-                        dev->iface_num      = iface_num;
-                        dev->int_in_dci     = 0;
-                        dev->int_in_mps     = 0;
-                        dev->bulk_in_dci    = 0;
-                        dev->bulk_in_mps    = 0;
-                        dev->bulk_in_burst  = 0;
-                        dev->bulk_out_dci   = 0;
-                        dev->bulk_out_mps   = 0;
-                        dev->bulk_out_burst = 0;
-                        capture_eps         = TRUE;
-                    } else {
-                        capture_eps = FALSE;
-                    }
-                }
-            } else if (bDescriptorType == 5U && pos + 7U <= total_len && capture_eps) {
-                uint8_t  ep_addr = cfg_desc[pos + 2U];
-                uint8_t  ep_attr = (uint8_t)(cfg_desc[pos + 3U] & 0x03U);
-                uint16_t ep_mps  = (uint16_t)(((uint16_t)cfg_desc[pos + 4U] |
-                                              ((uint16_t)cfg_desc[pos + 5U] << 8)) & 0x07FFU);
-                uint8_t  ep_num  = (uint8_t)(ep_addr & 0x0FU);
-                uint8_t  is_in   = ((ep_addr & 0x80U) != 0) ? 1U : 0U;
-                uint8_t  dci     = (uint8_t)(ep_num * 2U + is_in);
-
-                last_ep_dci = 0;
-                if (ep_attr == 3U && is_in && dev->int_in_dci == 0) {
-                    dev->int_in_dci = dci;
-                    dev->int_in_mps = (ep_mps > 0) ? ep_mps : 8U;
-                    last_ep_dci     = dci;
-                    if (dci > max_dci) {
-                        max_dci = dci;
-                    }
-                } else if (ep_attr == 2U && dev->dev_type == USB_DEV_STORAGE) {
-                    uint16_t def_mps = (speed >= 4U) ? 1024U : ((speed == 3U) ? 512U : 64U);
-                    if (is_in && dev->bulk_in_dci == 0) {
-                        dev->bulk_in_dci = dci;
-                        dev->bulk_in_mps = (ep_mps > 0) ? ep_mps : def_mps;
-                        last_ep_dci      = dci;
-                    } else if (!is_in && dev->bulk_out_dci == 0) {
-                        dev->bulk_out_dci = dci;
-                        dev->bulk_out_mps = (ep_mps > 0) ? ep_mps : def_mps;
-                        last_ep_dci       = dci;
-                    }
-                    if (dci > max_dci) {
-                        max_dci = dci;
-                    }
-                }
-            } else if (bDescriptorType == 0x30U && pos + 3U <= total_len && capture_eps) {
-                /* SuperSpeed Endpoint Companion Descriptor (USB 3.0 Spec Section 9.6.7) */
-                uint8_t max_burst = (uint8_t)(cfg_desc[pos + 2U] & 0x0FU);
-                if (last_ep_dci != 0) {
-                    if (last_ep_dci == dev->bulk_in_dci) {
-                        dev->bulk_in_burst = max_burst;
-                    } else if (last_ep_dci == dev->bulk_out_dci) {
-                        dev->bulk_out_burst = max_burst;
-                    }
-                }
+            total_len = (uint16_t)((uint16_t)cfg_desc[2] | ((uint16_t)cfg_desc[3] << 8));
+            if (total_len > sizeof(cfg_desc)) {
+                total_len = sizeof(cfg_desc);
             }
-            pos += bLength;
+            if (xhci_control_transfer(dev, 0x80U, 0x06U,
+                                      (uint16_t)(0x0200U | cfg_idx), 0, total_len, cfg_desc) < 0) {
+                if (cfg_idx == 0) {
+                    xhci_release_dev(dev);
+                    return -1;
+                }
+                break;
+            }
+
+            if (dev_desc[4] != 0x09U) {
+                dev->dev_type = USB_DEV_NONE;
+            }
+            dev->config_val      = cfg_desc[5];
+            dev->iface_num       = 0;
+            dev->net_data_iface  = 0;
+            dev->net_data_alt    = 0;
+            dev->net_mac_str_idx = 0;
+            dev->int_in_dci      = 0;
+            dev->int_in_mps      = 0;
+            dev->bulk_in_dci     = 0;
+            dev->bulk_in_mps     = 0;
+            dev->bulk_in_burst   = 0;
+            dev->bulk_out_dci    = 0;
+            dev->bulk_out_mps    = 0;
+            dev->bulk_out_burst  = 0;
+            max_dci              = 1;
+            capture_eps          = (dev->dev_type == USB_DEV_HUB) ? TRUE : FALSE;
+
+            pos = 0;
+            while (pos + 2U <= total_len) {
+                uint8_t bLength = cfg_desc[pos];
+                uint8_t bDescriptorType = cfg_desc[pos + 1U];
+
+                if (bLength == 0) {
+                    break;
+                }
+                if (bDescriptorType == 4U && pos + 9U <= total_len) {
+                    uint8_t iface_num   = cfg_desc[pos + 2U];
+                    uint8_t alt_setting = cfg_desc[pos + 3U];
+                    uint8_t num_eps     = cfg_desc[pos + 4U];
+                    uint8_t iface_class = cfg_desc[pos + 5U];
+                    uint8_t iface_sub   = cfg_desc[pos + 6U];
+                    uint8_t iface_proto = cfg_desc[pos + 7U];
+                    uint32_t cand_type  = USB_DEV_NONE;
+
+                    last_ep_dci = 0;
+
+                    /* CDC Data interface paired with an already-matched RNDIS or CDC-ECM control interface */
+                    if ((dev->dev_type == USB_DEV_NET_RNDIS || dev->dev_type == USB_DEV_NET_ECM) &&
+                        iface_class == 0x0AU) {
+                        if (num_eps >= 2U && (dev->bulk_in_dci == 0 || dev->bulk_out_dci == 0)) {
+                            dev->net_data_iface = iface_num;
+                            dev->net_data_alt   = alt_setting;
+                            capture_eps         = TRUE;
+                        } else {
+                            capture_eps = FALSE;
+                        }
+                        pos += bLength;
+                        continue;
+                    }
+
+                    /* Check if previous matched interface already captured all required endpoints */
+                    if ((dev->dev_type == USB_DEV_KBD && dev->int_in_dci != 0) ||
+                        (dev->dev_type == USB_DEV_MOUSE && dev->int_in_dci != 0) ||
+                        (dev->dev_type == USB_DEV_STORAGE && dev->bulk_in_dci != 0 && dev->bulk_out_dci != 0) ||
+                        (dev->dev_type == USB_DEV_HUB && dev->int_in_dci != 0) ||
+                        ((dev->dev_type == USB_DEV_NET_RNDIS || dev->dev_type == USB_DEV_NET_ECM) &&
+                         dev->bulk_in_dci != 0 && dev->bulk_out_dci != 0)) {
+                        iface_locked = TRUE;
+                    }
+
+                    /* If a keyboard is already registered and a second composite device has a mouse interface, allow it */
+                    if (iface_locked && dev->dev_type == USB_DEV_KBD &&
+                        xhci_has_usb_kbd() && !xhci_has_usb_mouse() &&
+                        alt_setting == 0U && iface_class == 0x03U && iface_proto == 0x02U) {
+                        iface_locked = FALSE;
+                    }
+
+                    if (iface_locked || alt_setting != 0U) {
+                        capture_eps = FALSE;
+                    } else {
+                        if (iface_class == 0x09U) {
+                            cand_type = USB_DEV_HUB;
+                        } else if (iface_class == 0x03U && iface_proto == 0x01U) {
+                            cand_type = USB_DEV_KBD;
+                        } else if (iface_class == 0x03U && iface_proto == 0x02U) {
+                            cand_type = USB_DEV_MOUSE;
+                        } else if (iface_class == 0x08U && iface_proto == 0x50U &&
+                                   (iface_sub == 0x06U || iface_sub == 0x02U ||
+                                    iface_sub == 0x05U || iface_sub == 0x01U ||
+                                    iface_sub == 0x04U || iface_sub == 0x00U)) {
+                            cand_type = USB_DEV_STORAGE;
+                        } else if ((iface_class == 0x02U && iface_sub == 0x02U && iface_proto == 0xFFU) ||
+                                   (iface_class == 0xE0U && iface_sub == 0x01U && iface_proto == 0x03U) ||
+                                   (iface_class == 0xEFU && iface_sub == 0x04U && iface_proto == 0x01U)) {
+                            cand_type = USB_DEV_NET_RNDIS;
+                        } else if (iface_class == 0x02U && iface_sub == 0x06U) {
+                            cand_type = USB_DEV_NET_ECM;
+                        } else if (iface_class == 0x03U && iface_proto == 0x00U &&
+                                   dev->dev_type == USB_DEV_NONE) {
+                            cand_type = (!xhci_has_usb_kbd()) ? USB_DEV_KBD : USB_DEV_MOUSE;
+                        }
+
+                        if (cand_type != USB_DEV_NONE) {
+                            dev->dev_type       = cand_type;
+                            dev->iface_num      = iface_num;
+                            dev->int_in_dci     = 0;
+                            dev->int_in_mps     = 0;
+                            dev->bulk_in_dci    = 0;
+                            dev->bulk_in_mps    = 0;
+                            dev->bulk_in_burst  = 0;
+                            dev->bulk_out_dci   = 0;
+                            dev->bulk_out_mps   = 0;
+                            dev->bulk_out_burst = 0;
+                            capture_eps         = TRUE;
+                        } else {
+                            capture_eps = FALSE;
+                        }
+                    }
+                } else if (bDescriptorType == 0x24U && pos + 4U <= total_len &&
+                           dev->dev_type == USB_DEV_NET_ECM) {
+                    /* CDC Ethernet Networking Functional Descriptor (subtype 0x0F -> iMACAddress) */
+                    if (cfg_desc[pos + 2U] == 0x0FU) {
+                        dev->net_mac_str_idx = cfg_desc[pos + 3U];
+                    }
+                } else if (bDescriptorType == 5U && pos + 7U <= total_len && capture_eps) {
+                    uint8_t  ep_addr = cfg_desc[pos + 2U];
+                    uint8_t  ep_attr = (uint8_t)(cfg_desc[pos + 3U] & 0x03U);
+                    uint16_t ep_mps  = (uint16_t)(((uint16_t)cfg_desc[pos + 4U] |
+                                                  ((uint16_t)cfg_desc[pos + 5U] << 8)) & 0x07FFU);
+                    uint8_t  ep_num  = (uint8_t)(ep_addr & 0x0FU);
+                    uint8_t  is_in   = ((ep_addr & 0x80U) != 0) ? 1U : 0U;
+                    uint8_t  dci     = (uint8_t)(ep_num * 2U + is_in);
+
+                    last_ep_dci = 0;
+                    if (ep_attr == 3U && is_in && dev->int_in_dci == 0) {
+                        dev->int_in_dci = dci;
+                        dev->int_in_mps = (ep_mps > 0) ? ep_mps : 8U;
+                        last_ep_dci     = dci;
+                        if (dci > max_dci) {
+                            max_dci = dci;
+                        }
+                    } else if (ep_attr == 2U &&
+                               (dev->dev_type == USB_DEV_STORAGE ||
+                                dev->dev_type == USB_DEV_NET_RNDIS ||
+                                dev->dev_type == USB_DEV_NET_ECM)) {
+                        uint16_t def_mps = (speed >= 4U) ? 1024U : ((speed == 3U) ? 512U : 64U);
+                        if (is_in && dev->bulk_in_dci == 0) {
+                            dev->bulk_in_dci = dci;
+                            dev->bulk_in_mps = (ep_mps > 0) ? ep_mps : def_mps;
+                            last_ep_dci      = dci;
+                        } else if (!is_in && dev->bulk_out_dci == 0) {
+                            dev->bulk_out_dci = dci;
+                            dev->bulk_out_mps = (ep_mps > 0) ? ep_mps : def_mps;
+                            last_ep_dci       = dci;
+                        }
+                        if (dci > max_dci) {
+                            max_dci = dci;
+                        }
+                    }
+                } else if (bDescriptorType == 0x30U && pos + 3U <= total_len && capture_eps) {
+                    /* SuperSpeed Endpoint Companion Descriptor (USB 3.0 Spec Section 9.6.7) */
+                    uint8_t max_burst = (uint8_t)(cfg_desc[pos + 2U] & 0x0FU);
+                    if (last_ep_dci != 0) {
+                        if (last_ep_dci == dev->bulk_in_dci) {
+                            dev->bulk_in_burst = max_burst;
+                        } else if (last_ep_dci == dev->bulk_out_dci) {
+                            dev->bulk_out_burst = max_burst;
+                        }
+                    }
+                }
+                pos += bLength;
+            }
+
+            if (dev->dev_type != USB_DEV_NONE) {
+                break;
+            }
         }
     }
 
@@ -855,6 +942,13 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
 
     /* 5. Send USB SET_CONFIGURATION on EP0 before configuring xHCI endpoints/hub context */
     (void)xhci_control_transfer(dev, 0x00U, 0x09U, dev->config_val, 0, 0, NULL);
+
+    /* For CDC-ECM (or any device using a non-zero alternate data interface), send SET_INTERFACE */
+    if ((dev->dev_type == USB_DEV_NET_ECM || dev->dev_type == USB_DEV_NET_RNDIS) &&
+        dev->net_data_alt != 0U) {
+        (void)xhci_control_transfer(dev, 0x01U, 0x0BU,
+                                    dev->net_data_alt, dev->net_data_iface, 0, NULL);
+    }
 
     /* For USB Hubs, read the Hub Descriptor and set Hub Depth now so CONFIGURE_EP gets Number of Ports > 0 */
     {
@@ -920,6 +1014,8 @@ int xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
         usbhid_init_mouse(dev);
     } else if (dev->dev_type == USB_DEV_STORAGE) {
         usbmsc_init_device(dev);
+    } else if (dev->dev_type == USB_DEV_NET_RNDIS || dev->dev_type == USB_DEV_NET_ECM) {
+        usbnet_init_device(dev);
     }
 
     return 0;
@@ -1133,6 +1229,7 @@ static int xhci_init_controller(const struct pci_device *pci_dev)
     usbhub_reset();
     usbhid_reset();
     usbmsc_reset();
+    usbnet_reset();
 
     xhci_intel_port_switchover(pci_dev);
 

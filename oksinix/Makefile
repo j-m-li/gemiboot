@@ -34,6 +34,7 @@ C_SRCS   := arch/x86/gdt.c \
             drivers/usbhid.c \
             drivers/usbmsc.c \
             drivers/usbhub.c \
+            drivers/usbnet.c \
             drivers/vga.c \
             drivers/console.c \
             fs/vfs.c \
@@ -124,7 +125,9 @@ run: $(BOOT_IMG) $(USB_DISK)
 		-device usb-kbd,bus=xhci.0,port=1.1 \
 		-device usb-mouse,bus=xhci.0,port=1.2 \
 		-drive file=$(USB_DISK),if=none,format=raw,id=usbdisk \
-		-device usb-storage,bus=xhci.0,port=1.3,drive=usbdisk
+		-device usb-storage,bus=xhci.0,port=1.3,drive=usbdisk \
+		-netdev user,id=net0 \
+		-device usb-net,netdev=net0,bus=xhci.0,port=2,mac=52:54:00:12:34:56
 
 run-multiboot: $(KERNEL_ELF) $(USB_DISK)
 	$(QEMU) -kernel $(KERNEL_ELF) -serial stdio -vga std \
@@ -133,7 +136,9 @@ run-multiboot: $(KERNEL_ELF) $(USB_DISK)
 		-device usb-kbd,bus=xhci.0,port=1.1 \
 		-device usb-mouse,bus=xhci.0,port=1.2 \
 		-drive file=$(USB_DISK),if=none,format=raw,id=usbdisk \
-		-device usb-storage,bus=xhci.0,port=1.3,drive=usbdisk
+		-device usb-storage,bus=xhci.0,port=1.3,drive=usbdisk \
+		-netdev user,id=net0 \
+		-device usb-net,netdev=net0,bus=xhci.0,port=2,mac=52:54:00:12:34:56
 
 test: $(KERNEL_ELF) $(BOOT_IMG) $(USB_DISK)
 	python3 tests/test_qemu.py $(BOOT_IMG) $(USB_DISK) $(KERNEL_ELF)

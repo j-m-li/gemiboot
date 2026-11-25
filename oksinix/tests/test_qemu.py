@@ -219,6 +219,8 @@ def main():
             "-device", "usb-storage,id=usbdev2,bus=xhci.0,port=1.5,drive=usbdisk3",
             "-drive", f"file={usb_disk4_path},if=none,format=raw,id=usbdisk4",
             "-device", "usb-storage,id=usbdev3,bus=xhci.0,port=1.6,drive=usbdisk4",
+            "-netdev", "user,id=net0",
+            "-device", "usb-net,netdev=net0,bus=xhci.0,port=2,mac=52:54:00:12:34:56",
             "-serial", f"file:{serial_log_path}",
             "-monitor", f"unix:{mon_sock_path},server,nowait",
             "-no-reboot",
@@ -257,7 +259,10 @@ def main():
             wait_for_serial(serial_log_path, "[FAT32] Mounted volume \"MEDIA1     \" at /media1")
             wait_for_serial(serial_log_path, "[FAT32] Mounted volume \"MEDIA2     \" at /media2")
             wait_for_serial(serial_log_path, "[FAT32] Mounted volume \"MEDIA3     \" at /media3")
-            wait_for_serial(serial_log_path, "[/bin/init] xHCI USB bus active (usb-hub usb-kbd usb-mouse usb-storage:/dev/sda,/dev/sdb,/dev/sdc,/dev/sdd)")
+            wait_for_serial(serial_log_path, "[USBNET] USB Ethernet (RNDIS) ready on slot")
+            wait_for_serial(serial_log_path, "MAC=52:54:00:12:34:56")
+            wait_for_serial(serial_log_path, "[DEVFS] Registered network device /dev/eth0 (10,200)")
+            wait_for_serial(serial_log_path, "[/bin/init] xHCI USB bus active (usb-hub usb-kbd usb-mouse usb-net usb-storage:/dev/sda,/dev/sdb,/dev/sdc,/dev/sdd)")
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /mnt")
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media1")
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media2")
@@ -369,7 +374,15 @@ def main():
             wait_for_serial(serial_log_path, "[LINUX-DYN] Shared library LIBTEST.SO + libc.so.6 + PT_INTERP PASSED!")
             print("[PASS] 7/10 Linux x86 32-bit static (/mnt/LINUX.ELF) & dynamic (/mnt/DYN.ELF + LIBTEST.SO + ld-linux.so.2) binaries verified")
 
-            # 8. Test xHCI USB Mouse (on Hub port 1.2) movement & button clicks
+            # 8. Test xHCI USB Ethernet (RNDIS) ARP + ICMP Echo ping to QEMU SLIRP gateway 10.0.2.2
+            send_keys_str(sock, "net\n")
+            wait_for_serial(serial_log_path, "eth0: USB RNDIS  MAC 52:54:00:12:34:56")
+            send_keys_str(sock, "net ping\n")
+            wait_for_serial(serial_log_path, "ARP reply: 10.0.2.2 is at")
+            wait_for_serial(serial_log_path, "ICMP echo reply from 10.0.2.2: seq=1 OK")
+            print("[PASS] 8/13 xHCI USB Ethernet (RNDIS) MAC query, ARP & ICMP ping to 10.0.2.2 verified")
+
+            # 9. Test xHCI USB Mouse (on Hub port 1.2) movement & button clicks
             send_hmp_cmd(sock, "mouse_move 35 -15", delay=0.1)
             send_hmp_cmd(sock, "mouse_button 1", delay=0.1)
             send_hmp_cmd(sock, "mouse_button 0", delay=0.1)

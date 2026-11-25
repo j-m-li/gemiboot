@@ -219,9 +219,39 @@ static int devfs_register_usb_disks(void)
     return changed;
 }
 
+/* /dev/eth0 (10, 200) - xHCI USB Ethernet (RNDIS / CDC-ECM) raw frame interface */
+static int32_t dev_eth0_read(struct vfs_node *node, uint32_t offset, uint32_t size, uint8_t *buf)
+{
+    (void)node;
+    (void)offset;
+    return xhci_net_recv(buf, size);
+}
+
+static int32_t dev_eth0_write(struct vfs_node *node, uint32_t offset, uint32_t size, const uint8_t *buf)
+{
+    (void)node;
+    (void)offset;
+    return xhci_net_send(buf, size);
+}
+
+static void devfs_sync_usb_net(void)
+{
+    struct vfs_node *existing = vfs_lookup("/dev/eth0");
+    if (xhci_has_usb_net()) {
+        if (existing == NULL) {
+            (void)vfs_register_chardev("/dev/eth0", 10, 200, dev_eth0_read, dev_eth0_write);
+            kprintf("[DEVFS] Registered network device /dev/eth0 (10,200)\n");
+        }
+    } else if (existing != NULL) {
+        (void)vfs_unlink("/dev/eth0");
+        kprintf("[DEVFS] Unregistered network device /dev/eth0\n");
+    }
+}
+
 void devfs_sync_usb_storage(void)
 {
     (void)devfs_register_usb_disks();
+    devfs_sync_usb_net();
     fat32_sync_mounts();
 }
 
@@ -245,6 +275,7 @@ void devfs_init(void)
     }
 
     (void)devfs_register_usb_disks();
+    devfs_sync_usb_net();
     msc_count = xhci_get_msc_count();
 
     kprintf("[DEVFS] Mounted /dev (null, zero, console, tty0, ttyS0, kbd, mouse, fb0%s)\n",

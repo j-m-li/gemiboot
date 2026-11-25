@@ -58,6 +58,170 @@ static void sh_print_hex32(uint32_t val)
     }
 }
 
+static void sh_print_hex8(uint8_t val)
+{
+    const char *hex = "0123456789abcdef";
+    sh_putc(hex[(val >> 4) & 0x0FU]);
+    sh_putc(hex[val & 0x0FU]);
+}
+
+static void sh_print_mac(const uint8_t *mac)
+{
+    int i;
+    for (i = 0; i < 6; i++) {
+        if (i > 0) {
+            sh_putc(':');
+        }
+        sh_print_hex8(mac[i]);
+    }
+}
+
+static uint16_t net_checksum16(const uint8_t *data, uint32_t len)
+{
+    uint32_t sum = 0;
+    uint32_t i;
+    for (i = 0; i + 1U < len; i += 2U) {
+        sum += ((uint32_t)data[i] << 8) | (uint32_t)data[i + 1U];
+    }
+    if ((len & 1U) != 0U) {
+        sum += (uint32_t)data[len - 1U] << 8;
+    }
+    while ((sum >> 16) != 0U) {
+        sum = (sum & 0xFFFFU) + (sum >> 16);
+    }
+    return (uint16_t)(~sum & 0xFFFFU);
+}
+
+static void cmd_net(int argc, char **argv)
+{
+    struct xhci_net_info ni;
+
+    devfs_sync_usb_storage();
+    if (!xhci_has_usb_net()) {
+        sh_puts("No USB Ethernet (RNDIS / CDC-ECM) device detected.\n");
+        return;
+    }
+    xhci_get_net_info(&ni);
+
+    if (argc < 2) {
+        sh_puts("eth0: USB ");
+        sh_puts((ni.protocol == XHCI_NET_PROTO_RNDIS) ? "RNDIS" : "CDC-ECM");
+        sh_puts("  MAC ");
+        sh_print_mac(ni.mac);
+        sh_puts("  MTU ");
+        sh_print_uint(ni.mtu);
+        sh_puts("\n      TX packets=");
+        sh_print_uint(ni.tx_packets);
+        sh_puts(" (");
+        sh_print_uint(ni.tx_bytes);
+        sh_puts(" B)  RX packets=");
+        sh_print_uint(ni.rx_packets);
+        sh_puts(" (");
+        sh_print_uint(ni.rx_bytes);
+        sh_puts(" B)\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "ping") == 0) {
+        static const uint8_t src_ip[4] = { 10, 0, 2, 15 };
+        static const uint8_t dst_ip[4] = { 10, 0, 2, 2 };
+        uint8_t tx[64];
+        uint8_t rx[256];
+        uint8_t gw_mac[6];
+        bool_t got_arp = FALSE;
+        bool_t got_icmp = FALSE;
+        int wait;
+
+        /* 1. Send ARP Request for gateway 10.0.2.2 */
+        memset(tx, 0, sizeof(tx));
+        memset(&tx[0], 0xFF, 6);
+        memcpy(&tx[6], ni.mac, 6);
+        tx[12] = 0x08; tx[13] = 0x06; /* EtherType ARP */
+        tx[14] = 0x00; tx[15] = 0x01; /* HTYPE Ethernet */
+        tx[16] = 0x08; tx[17] = 0x00; /* PTYPE IPv4 */
+        tx[18] = 6;    tx[19] = 4;    /* HLEN=6, PLEN=4 */
+        tx[20] = 0x00; tx[21] = 0x01; /* OPER Request */
+        memcpy(&tx[22], ni.mac, 6);
+        memcpy(&tx[28], src_ip, 4);
+        memcpy(&tx[38], dst_ip, 4);
+
+        if (xhci_net_send(tx, 42U) < 0) {
+            sh_puts("net ping: ARP transmit failed\n");
+            return;
+        }
+
+        for (wait = 0; wait < 200; wait++) {
+            int32_t n = xhci_net_recv(rx, sizeof(rx));
+            if (n >= 42 && rx[12] == 0x08 && rx[13] == 0x06 &&
+                rx[20] == 0x00 && rx[21] == 0x02 &&
+                memcmp(&rx[28], dst_ip, 4) == 0) {
+                memcpy(gw_mac, &rx[22], 6);
+                got_arp = TRUE;
+                break;
+            }
+            pit_mdelay(5U);
+        }
+
+        if (!got_arp) {
+            sh_puts("net ping: ARP timeout for 10.0.2.2\n");
+            return;
+        }
+        sh_puts("ARP reply: 10.0.2.2 is at ");
+        sh_print_mac(gw_mac);
+        sh_putc('\n');
+
+        /* 2. Send ICMP Echo Request to 10.0.2.2 */
+        memset(tx, 0, sizeof(tx));
+        memcpy(&tx[0], gw_mac, 6);
+        memcpy(&tx[6], ni.mac, 6);
+        tx[12] = 0x08; tx[13] = 0x00; /* EtherType IPv4 */
+        tx[14] = 0x45; tx[15] = 0x00; /* IPv4 IHL=5 */
+        tx[16] = 0x00; tx[17] = 28;   /* Total Length = 20 IP + 8 ICMP */
+        tx[18] = 0x00; tx[19] = 0x01; /* ID */
+        tx[22] = 64;   tx[23] = 1;    /* TTL=64, Proto=ICMP */
+        memcpy(&tx[26], src_ip, 4);
+        memcpy(&tx[30], dst_ip, 4);
+        {
+            uint16_t ip_ck = net_checksum16(&tx[14], 20U);
+            tx[24] = (uint8_t)(ip_ck >> 8);
+            tx[25] = (uint8_t)(ip_ck & 0xFFU);
+        }
+        tx[34] = 8;    tx[35] = 0;    /* ICMP Echo Request */
+        tx[38] = 0x12; tx[39] = 0x34; /* ID */
+        tx[40] = 0x00; tx[41] = 0x01; /* Seq */
+        {
+            uint16_t ic_ck = net_checksum16(&tx[34], 8U);
+            tx[36] = (uint8_t)(ic_ck >> 8);
+            tx[37] = (uint8_t)(ic_ck & 0xFFU);
+        }
+
+        if (xhci_net_send(tx, 42U) < 0) {
+            sh_puts("net ping: ICMP transmit failed\n");
+            return;
+        }
+
+        for (wait = 0; wait < 200; wait++) {
+            int32_t n = xhci_net_recv(rx, sizeof(rx));
+            if (n >= 42 && rx[12] == 0x08 && rx[13] == 0x00 &&
+                rx[23] == 1 && memcmp(&rx[26], dst_ip, 4) == 0 &&
+                rx[34] == 0) {
+                got_icmp = TRUE;
+                break;
+            }
+            pit_mdelay(5U);
+        }
+
+        if (got_icmp) {
+            sh_puts("ICMP echo reply from 10.0.2.2: seq=1 OK\n");
+        } else {
+            sh_puts("net ping: ICMP timeout from 10.0.2.2\n");
+        }
+        return;
+    }
+
+    sh_puts("usage: net [ping]\n");
+}
+
 static void cmd_memmap(void)
 {
     int i;
@@ -481,7 +645,9 @@ static void sh_execute_line(char *line)
     }
 
     if (strcmp(argv[0], "help") == 0) {
-        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb memmap acpi keymap ps uname uptime clear vi shutdown\n");
+        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net memmap acpi keymap ps uname uptime clear vi shutdown\n");
+    } else if (strcmp(argv[0], "net") == 0) {
+        cmd_net(argc, argv);
     } else if (strcmp(argv[0], "shutdown") == 0 || strcmp(argv[0], "poweroff") == 0) {
         sh_puts("Shutting down system via ACPI...\n");
         console_refresh();
@@ -615,6 +781,15 @@ static void sh_execute_line(char *line)
             }
             if (xhci_has_usb_mouse()) {
                 sh_puts("  - USB HID Boot Mouse (/dev/mouse)\n");
+            }
+            if (xhci_has_usb_net()) {
+                struct xhci_net_info ni;
+                xhci_get_net_info(&ni);
+                sh_puts("  - USB Ethernet (");
+                sh_puts((ni.protocol == XHCI_NET_PROTO_RNDIS) ? "RNDIS" : "CDC-ECM");
+                sh_puts("): MAC ");
+                sh_print_mac(ni.mac);
+                sh_puts(" -> /dev/eth0\n");
             }
             for (i = 0; i < XHCI_MAX_MSC_DEVS; i++) {
                 struct xhci_msc_info msc;

@@ -19,6 +19,8 @@
 #define USB_DEV_MOUSE      2
 #define USB_DEV_STORAGE    3
 #define USB_DEV_HUB        4
+#define USB_DEV_NET_RNDIS  5
+#define USB_DEV_NET_ECM    6
 
 /* 16-byte xHCI Transfer Request Block (TRB) */
 struct xhci_trb {
@@ -49,6 +51,9 @@ struct xhci_usb_dev {
     uint8_t          hub_ttt;
     uint32_t         hub_port_conn_mask;
     uint8_t          iface_num;
+    uint8_t          net_data_iface;
+    uint8_t          net_data_alt;
+    uint8_t          net_mac_str_idx;
     uint8_t          config_val;
     uint16_t         ep0_mps;
     uint8_t          int_in_dci;
@@ -79,6 +84,7 @@ int    xhci_bulk_transfer(struct xhci_usb_dev *dev, bool_t is_in,
                           void *buf, uint32_t len);
 void   xhci_clear_bulk_stall(struct xhci_usb_dev *dev, bool_t is_in);
 void   xhci_interrupt_in_submit(struct xhci_usb_dev *dev, void *buf, uint32_t len);
+void   xhci_bulk_in_submit(struct xhci_usb_dev *dev, void *buf, uint32_t len);
 bool_t xhci_has_free_slot(void);
 int    xhci_enumerate_device(uint8_t root_port, uint32_t route_string,
                              uint32_t tier, uint8_t speed,
@@ -103,5 +109,12 @@ uint32_t usbhub_read_descriptor(struct xhci_usb_dev *hub_dev, uint32_t tier);
 void     usbhub_init_device(struct xhci_usb_dev *hub_dev, uint32_t tier, uint32_t pwr_delay_ms);
 void     usbhub_remove_device(struct xhci_usb_dev *hub_dev);
 void     usbhub_poll_ports(void);
+
+/* USB Network class driver - RNDIS & CDC-ECM (drivers/usbnet.c) */
+void   usbnet_reset(void);
+void   usbnet_init_device(struct xhci_usb_dev *dev);
+void   usbnet_remove_device(struct xhci_usb_dev *dev);
+bool_t usbnet_handle_transfer_event(uint8_t slot_id, uint8_t ep_dci,
+                                    uint8_t cc, uint32_t residual);
 
 #endif /* OKSINIX_XHCI_INTERNAL_H */
