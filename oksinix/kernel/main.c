@@ -115,7 +115,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     kbd_init();
     mouse_init(VGA_WIDTH, VGA_HEIGHT);
 
-    console_set_status("KERNEL: Probing PCI xHCI USB 3.0 controller...", 0);
+    console_set_status("KERNEL: Probing PCI USB (xHCI/EHCI/OHCI/UHCI)...", 0);
     console_refresh();
 
     (void)xhci_init();

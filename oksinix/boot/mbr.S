@@ -74,11 +74,11 @@ e820_loop:
 e820_done:
 
     /*
-     * Load 240 sectors (120 KiB) from LBA 1..240 to physical 0x10000..0x2DFFF
-     * using 15 safe 16-sector (8 KiB) transfers so we never exceed USB BIOS
+     * Load 352 sectors (176 KiB) from LBA 1..352 to physical 0x10000..0x3BFFF
+     * using 22 safe 16-sector (8 KiB) transfers so we never exceed USB BIOS
      * max transfer size or cross a 64 KiB DMA boundary.
      */
-    movw $15, %di
+    movw $22, %di
 load_loop:
     call read_dap_retry
     addw $0x0200, dap_segment
@@ -166,10 +166,10 @@ pm_entry:
     movw %ax, %ss
     movl $0x7C00, %esp
 
-    /* Copy 120 KiB (30720 dwords) from 0x00010000 to 0x00100000 (1 MiB) */
+    /* Copy 176 KiB (45056 dwords) from 0x00010000 to 0x00100000 (1 MiB) */
     movl $0x00010000, %esi
     movl $0x00100000, %edi
-    movl $30720, %ecx
+    movl $45056, %ecx
     rep movsl
 
     /* Pass Multiboot-compatible magic in %eax and jump to _start at 0x00100030 */
@@ -215,10 +215,10 @@ gdt_end:
 
 /* Pad to MBR Partition Table at offset 446 (0x1BE) */
 .org 446
-    /* Partition 1: Bootable (0x80), FAT32 LBA (0x0C), LBA 256, 1792 sectors */
+    /* Partition 1: Bootable (0x80), FAT32 LBA (0x0C), LBA 384, 1664 sectors */
     .byte 0x80, 0x01, 0x01, 0x00, 0x0C, 0x0F, 0x3F, 0x04
-    .long 256
-    .long 1792
+    .long 384
+    .long 1664
     /* Partitions 2..4: Empty */
     .space 48, 0
 

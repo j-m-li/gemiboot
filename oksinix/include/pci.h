@@ -23,6 +23,7 @@ struct pci_device {
     uint8_t  prog_if;
     uint8_t  irq_line;
     uint32_t bar0_mmio;
+    uint16_t bar4_io;
 };
 
 uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);

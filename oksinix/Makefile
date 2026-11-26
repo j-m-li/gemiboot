@@ -31,6 +31,9 @@ C_SRCS   := arch/x86/gdt.c \
             drivers/keyboard.c \
             drivers/mouse.c \
             drivers/xhci.c \
+            drivers/uhci.c \
+            drivers/ohci.c \
+            drivers/ehci.c \
             drivers/usbhid.c \
             drivers/usbmsc.c \
             drivers/usbhub.c \
@@ -113,7 +116,7 @@ $(USB_DISK): $(BOOT_IMG)
 
 disk: $(BOOT_IMG) $(USB_DISK)
 
-%.o: %.c
+%.o: %.c $(wildcard include/*.h drivers/*.h)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.S

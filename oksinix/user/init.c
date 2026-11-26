@@ -113,7 +113,19 @@ int bin_init_main(int argc, char **argv)
     }
 
     if (xhci_is_initialized()) {
-        fd_puts(fd_out, "[/bin/init] xHCI USB bus active (");
+        struct xhci_controller_info ci;
+        const char *hci_tag = "xHCI";
+        xhci_get_controller_info(&ci);
+        if (ci.hci_type == USB_HCI_EHCI) {
+            hci_tag = "EHCI";
+        } else if (ci.hci_type == USB_HCI_OHCI) {
+            hci_tag = "OHCI";
+        } else if (ci.hci_type == USB_HCI_UHCI) {
+            hci_tag = "UHCI";
+        }
+        fd_puts(fd_out, "[/bin/init] ");
+        fd_puts(fd_out, hci_tag);
+        fd_puts(fd_out, " USB bus active (");
         if (xhci_has_usb_hub()) {
             fd_puts(fd_out, "usb-hub ");
         }

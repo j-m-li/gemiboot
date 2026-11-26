@@ -1090,15 +1090,25 @@ static void sh_execute_line(char *line)
         }
     } else if (strcmp(argv[0], "lsusb") == 0) {
         if (!xhci_is_initialized()) {
-            sh_puts("No xHCI controller found.\n");
+            sh_puts("No USB host controller found.\n");
         } else {
             struct xhci_controller_info ci;
             struct xhci_hub_info hub;
+            const char *hci_name = "xHCI USB 3.0";
             int i;
             devfs_sync_usb_storage();
             xhci_get_controller_info(&ci);
             xhci_get_hub_info(&hub);
-            sh_puts("Bus 001: xHCI USB 3.0 Host Controller (ports=");
+            if (ci.hci_type == USB_HCI_EHCI) {
+                hci_name = "EHCI USB 2.0";
+            } else if (ci.hci_type == USB_HCI_OHCI) {
+                hci_name = "OHCI USB 1.1";
+            } else if (ci.hci_type == USB_HCI_UHCI) {
+                hci_name = "UHCI USB 1.1";
+            }
+            sh_puts("Bus 001: ");
+            sh_puts(hci_name);
+            sh_puts(" Host Controller (ports=");
             sh_print_uint(ci.max_ports);
             sh_puts(", devices=");
             sh_print_uint(ci.num_devices);

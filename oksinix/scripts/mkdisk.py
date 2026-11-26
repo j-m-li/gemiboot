@@ -77,7 +77,7 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
     struct.pack_into("<H", vbr, 0x16, 0)       # fat_sz_16 = 0
     struct.pack_into("<H", vbr, 0x18, 63)      # sec_per_trk
     struct.pack_into("<H", vbr, 0x1A, 16)      # num_heads
-    struct.pack_into("<I", vbr, 0x1C, 256)     # hidd_sec (partition LBA 256)
+    struct.pack_into("<I", vbr, 0x1C, 384)     # hidd_sec (partition LBA 384)
     struct.pack_into("<I", vbr, 0x20, part_sectors)
     struct.pack_into("<I", vbr, 0x24, fat_sz_32)
     struct.pack_into("<H", vbr, 0x28, 0)       # ext_flags
@@ -209,8 +209,8 @@ def main():
     out_path = sys.argv[3]
 
     total_sectors = 2048  # 1 MiB (2048 * 512B sectors)
-    part_start_lba = 256
-    part_sectors = total_sectors - part_start_lba  # 1792 sectors
+    part_start_lba = 384
+    part_sectors = total_sectors - part_start_lba  # 1664 sectors
     total_size = total_sectors * 512
 
     with open(mbr_path, "rb") as f:
@@ -224,7 +224,7 @@ def main():
     with open(kernel_bin_path, "rb") as f:
         kernel_data = f.read()
 
-    max_kernel_size = 240 * 512  # 120 KiB loaded by MBR (LBA 1..240)
+    max_kernel_size = 352 * 512  # 176 KiB loaded by MBR (LBA 1..352)
     if len(kernel_data) > max_kernel_size:
         raise RuntimeError(
             f"Kernel binary ({len(kernel_data)} B) exceeds MBR loader limit ({max_kernel_size} B)"
@@ -255,7 +255,7 @@ def main():
 
     print(
         f"Created bootable + FAT32 disk image: {out_path} "
-        f"({total_size} bytes, MBR=512B, kernel={len(kernel_data)}B, FAT32@LBA256={len(fat32_part)}B)"
+        f"({total_size} bytes, MBR=512B, kernel={len(kernel_data)}B, FAT32@LBA{part_start_lba}={len(fat32_part)}B)"
     )
 
 

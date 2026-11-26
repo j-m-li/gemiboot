@@ -15,6 +15,13 @@
 #define XHCI_NET_PROTO_RNDIS 1
 #define XHCI_NET_PROTO_ECM   2
 
+/* USB Host Controller Interface types */
+#define USB_HCI_NONE         0
+#define USB_HCI_UHCI         1
+#define USB_HCI_OHCI         2
+#define USB_HCI_EHCI         3
+#define USB_HCI_XHCI         4
+
 struct xhci_net_info {
     bool_t   present;
     bool_t   link_up;
@@ -47,6 +54,8 @@ struct xhci_hub_info {
 
 struct xhci_controller_info {
     bool_t   present;
+    uint8_t  hci_type;
+    uint8_t  active_hcis;
     uint8_t  bus;
     uint8_t  slot;
     uint8_t  func;

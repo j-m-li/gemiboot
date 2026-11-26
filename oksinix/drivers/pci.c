@@ -121,35 +121,51 @@ int pci_find_class_nth(uint8_t class_code, uint8_t subclass, uint8_t prog_if,
                 if (cc == class_code && sc == subclass && pi == prog_if) {
                     if (match_idx == index) {
                         uint32_t bar0 = pci_read32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x10);
+                        uint32_t bar4 = pci_read32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x20);
                         uint32_t cmd  = pci_read32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04);
                         uint32_t intr = pci_read32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x3C);
-                        uint32_t mmio_base = bar0 & ~0x0FUL;
-                        bool_t   is_64bit = (((bar0 >> 1) & 0x03U) == 0x02U) ? TRUE : FALSE;
-                        uint32_t fallback = PCI_FALLBACK_MMIO_BASE + ((uint32_t)index * 0x00100000UL);
+                        uint32_t mmio_base = 0;
+                        uint16_t io_base   = 0;
 
-                        if (mmio_base == 0) {
-                            pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04, cmd & ~0x0002U);
-                            mmio_base = pci_resolve_bridge_mmio((uint8_t)bus, fallback);
-                            pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x10,
-                                        mmio_base | (bar0 & 0x0FUL));
-                            if (is_64bit) {
-                                pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x14, 0);
+                        if (cc == 0x0CU && sc == 0x03U && pi == 0x00U) {
+                            /* UHCI uses I/O Space BAR4 (PCI offset 0x20, bit 0 = 1) */
+                            if ((bar4 & 0x01U) != 0) {
+                                io_base = (uint16_t)(bar4 & 0xFFFCU);
+                            } else if ((bar0 & 0x01U) != 0) {
+                                io_base = (uint16_t)(bar0 & 0xFFFCU);
                             }
-                        } else if (is_64bit) {
-                            /* Ensure upper 32 bits of 64-bit BAR are 0 for 32-bit protected mode */
-                            uint32_t bar1 = pci_read32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x14);
-                            if (bar1 != 0) {
+                            /* Enable PCI I/O Space (bit 0) and Bus Master (bit 2) */
+                            cmd |= 0x0005U;
+                            pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04, cmd);
+                        } else {
+                            bool_t   is_64bit = (((bar0 >> 1) & 0x03U) == 0x02U) ? TRUE : FALSE;
+                            uint32_t fallback = PCI_FALLBACK_MMIO_BASE + ((uint32_t)index * 0x00100000UL);
+                            mmio_base = bar0 & ~0x0FUL;
+
+                            if (mmio_base == 0) {
                                 pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04, cmd & ~0x0002U);
                                 mmio_base = pci_resolve_bridge_mmio((uint8_t)bus, fallback);
                                 pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x10,
                                             mmio_base | (bar0 & 0x0FUL));
-                                pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x14, 0);
+                                if (is_64bit) {
+                                    pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x14, 0);
+                                }
+                            } else if (is_64bit) {
+                                /* Ensure upper 32 bits of 64-bit BAR are 0 for 32-bit protected mode */
+                                uint32_t bar1 = pci_read32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x14);
+                                if (bar1 != 0) {
+                                    pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04, cmd & ~0x0002U);
+                                    mmio_base = pci_resolve_bridge_mmio((uint8_t)bus, fallback);
+                                    pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x10,
+                                                mmio_base | (bar0 & 0x0FUL));
+                                    pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x14, 0);
+                                }
                             }
-                        }
 
-                        /* Enable PCI Memory Space (bit 1) and Bus Master (bit 2) */
-                        cmd |= 0x0006U;
-                        pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04, cmd);
+                            /* Enable PCI Memory Space (bit 1) and Bus Master (bit 2) */
+                            cmd |= 0x0006U;
+                            pci_write32((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04, cmd);
+                        }
 
                         out->bus        = (uint8_t)bus;
                         out->slot       = (uint8_t)slot;
@@ -161,11 +177,19 @@ int pci_find_class_nth(uint8_t class_code, uint8_t subclass, uint8_t prog_if,
                         out->prog_if    = pi;
                         out->irq_line   = (uint8_t)(intr & 0xFFU);
                         out->bar0_mmio  = mmio_base;
+                        out->bar4_io    = io_base;
 
-                        kprintf("[PCI] Found %02x:%02x.%u vendor=0x%04x device=0x%04x BAR0=0x%08x\n",
-                                bus, slot, func,
-                                (uint32_t)out->vendor_id, (uint32_t)out->device_id,
-                                out->bar0_mmio);
+                        if (io_base != 0) {
+                            kprintf("[PCI] Found %02x:%02x.%u vendor=0x%04x device=0x%04x BAR4_IO=0x%04x\n",
+                                    bus, slot, func,
+                                    (uint32_t)out->vendor_id, (uint32_t)out->device_id,
+                                    (uint32_t)out->bar4_io);
+                        } else {
+                            kprintf("[PCI] Found %02x:%02x.%u vendor=0x%04x device=0x%04x BAR0=0x%08x\n",
+                                    bus, slot, func,
+                                    (uint32_t)out->vendor_id, (uint32_t)out->device_id,
+                                    out->bar0_mmio);
+                        }
                         return 0;
                     }
                     match_idx++;
