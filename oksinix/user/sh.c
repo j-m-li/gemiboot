@@ -189,23 +189,25 @@ static void cmd_net(int argc, char **argv)
             return;
         }
 
-        if ((target_ip & net_get_netmask()) == (net_get_local_ip() & net_get_netmask())) {
-            next_hop = target_ip;
-        } else {
-            next_hop = net_get_gateway_ip();
-        }
+        if (((uint8_t)(target_ip & 0xFFU)) != 127U && target_ip != net_get_local_ip()) {
+            if ((target_ip & net_get_netmask()) == (net_get_local_ip() & net_get_netmask())) {
+                next_hop = target_ip;
+            } else {
+                next_hop = net_get_gateway_ip();
+            }
 
-        if (net_arp_resolve(next_hop, hop_mac) < 0) {
-            sh_puts("net ping: ARP timeout for ");
+            if (net_arp_resolve(next_hop, hop_mac) < 0) {
+                sh_puts("net ping: ARP timeout for ");
+                sh_print_ipv4(next_hop);
+                sh_putc('\n');
+                return;
+            }
+            sh_puts("ARP reply: ");
             sh_print_ipv4(next_hop);
+            sh_puts(" is at ");
+            sh_print_mac(hop_mac);
             sh_putc('\n');
-            return;
         }
-        sh_puts("ARP reply: ");
-        sh_print_ipv4(next_hop);
-        sh_puts(" is at ");
-        sh_print_mac(hop_mac);
-        sh_putc('\n');
 
         sock = net_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
         if (sock < 0) {
@@ -239,7 +241,10 @@ static void cmd_net(int argc, char **argv)
         n = net_recv(sock, icmp_rx, (uint32_t)sizeof(icmp_rx), 0U);
         (void)net_close(sock);
 
-        if (n >= 8 && icmp_rx[0] == 0U) {
+        if (n >= 8 && icmp_rx[0] == 0U && icmp_rx[1] == 0U &&
+            icmp_rx[4] == 0x12U && icmp_rx[5] == 0x34U &&
+            icmp_rx[6] == 0x00U && icmp_rx[7] == 0x01U &&
+            net_checksum16(icmp_rx, (uint32_t)n) == 0U) {
             sh_puts("ICMP echo reply from ");
             sh_print_ipv4(target_ip);
             sh_puts(": seq=1 OK\n");
@@ -289,12 +294,16 @@ static int parse_port(const char *s, uint16_t *out_port)
     return 0;
 }
 
+#define SH_NET_EAGAIN (-11)
+
 static void telnet_session(const char *host, uint16_t port)
 {
     uint32_t ip_be = 0U;
     struct sockaddr_in dst;
     int sock;
     uint8_t rx_buf[256];
+    uint8_t iac_tx[60];
+    uint32_t iac_tx_len = 0U;
     char tx_line[256];
     uint32_t tx_len = 0U;
     int iac_state = 0;
@@ -371,14 +380,12 @@ static void telnet_session(const char *host, uint16_t port)
                         iac_state = 0;
                     }
                 } else if (iac_state == 2) {
-                    /* RFC 854: refuse DO with WONT, WILL with DONT */
-                    uint8_t reply[3];
-                    if (iac_cmd == 253U) {
-                        reply[0] = 255U; reply[1] = 252U; reply[2] = b;
-                        (void)net_send(sock, reply, 3U, 0U);
-                    } else if (iac_cmd == 251U) {
-                        reply[0] = 255U; reply[1] = 254U; reply[2] = b;
-                        (void)net_send(sock, reply, 3U, 0U);
+                    /* RFC 854: refuse DO with WONT, WILL with DONT (batched to prevent IAC stall) */
+                    if ((iac_cmd == 253U || iac_cmd == 251U) &&
+                        iac_tx_len + 3U <= (uint32_t)sizeof(iac_tx)) {
+                        iac_tx[iac_tx_len++] = 255U;
+                        iac_tx[iac_tx_len++] = (iac_cmd == 253U) ? 252U : 254U;
+                        iac_tx[iac_tx_len++] = b;
                     }
                     iac_state = 0;
                 } else if (iac_state == 3) {
@@ -390,7 +397,11 @@ static void telnet_session(const char *host, uint16_t port)
                 }
             }
         }
-        if (n == 0 || (n < 0 && n != -11)) {
+        if (iac_tx_len > 0U) {
+            (void)net_send(sock, iac_tx, iac_tx_len, 0U);
+            iac_tx_len = 0U;
+        }
+        if (n == 0 || (n < 0 && n != SH_NET_EAGAIN)) {
             sh_puts("\nConnection closed by foreign host.\n");
             running = 0;
             break;

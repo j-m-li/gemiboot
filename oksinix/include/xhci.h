@@ -17,6 +17,7 @@
 
 struct xhci_net_info {
     bool_t   present;
+    bool_t   link_up;
     uint8_t  slot_id;
     uint8_t  protocol;
     uint8_t  mac[6];

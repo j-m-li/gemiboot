@@ -99,6 +99,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
 
     acpi_init(magic, mbi_addr);
     syscall_init();
+    stack_guard_init();
     net_init();
 
     pit_init();

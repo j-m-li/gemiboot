@@ -357,7 +357,17 @@ static int               next_pid = 100;
 static uint32_t          saved_host_esp = 0;
 
 /* Temporary kernel storage for sys_execve arguments across image replacement */
-static uint8_t           exec_kstack[8192];
+#define STACK_GUARD_W0 0xDEADBEEFUL
+#define STACK_GUARD_W1 0xCAFEBABEUL
+#define STACK_GUARD_W2 0x57AC4600UL
+#define STACK_GUARD_W3 0xBADC0FFEUL
+
+extern uint32_t          kernel_stack_bottom[];
+extern uint32_t          kernel_stack_top[];
+
+static uint32_t          exec_kstack[8192]; /* 32 KiB dedicated execve kernel stack */
+static volatile bool_t   stack_guards_armed = FALSE;
+static volatile bool_t   user_stack_guard_armed = FALSE;
 static int               exec_argc_saved = 0;
 static int               exec_envc_saved = 0;
 static char              exec_path_buf[VFS_MAX_PATH];
@@ -365,6 +375,63 @@ static char              exec_arg_Pool[16][64];
 static char             *exec_argv_ptrs[17];
 static char              exec_env_Pool[8][64];
 static char             *exec_envp_ptrs[9];
+
+static void stack_guard_write(volatile uint32_t *base)
+{
+    base[0] = STACK_GUARD_W0;
+    base[1] = STACK_GUARD_W1;
+    base[2] = STACK_GUARD_W2;
+    base[3] = STACK_GUARD_W3;
+}
+
+static bool_t stack_guard_intact(const volatile uint32_t *base)
+{
+    return (base[0] == STACK_GUARD_W0 &&
+            base[1] == STACK_GUARD_W1 &&
+            base[2] == STACK_GUARD_W2 &&
+            base[3] == STACK_GUARD_W3) ? TRUE : FALSE;
+}
+
+static void stack_guard_panic(const char *ctx, const char *which)
+{
+    cpu_cli();
+    kprintf("\n[PANIC] Stack overflow detected in %s: %s guard corrupted!\n", ctx, which);
+    for (;;) {
+        cpu_hlt();
+    }
+}
+
+void stack_guard_init(void)
+{
+    stack_guard_write(kernel_stack_bottom);
+    stack_guard_write(exec_kstack);
+    user_stack_guard_armed = FALSE;
+    stack_guards_armed = TRUE;
+}
+
+static void stack_guard_arm_user_stack(void)
+{
+    stack_guard_write((volatile uint32_t *)(uintptr_t)LINUX_STACK_BOTTOM);
+    user_stack_guard_armed = TRUE;
+}
+
+void stack_guard_check(const char *ctx)
+{
+    if (!stack_guards_armed) {
+        return;
+    }
+    if (!stack_guard_intact(kernel_stack_bottom)) {
+        stack_guard_panic(ctx, "kernel_stack");
+    }
+    if (!stack_guard_intact(exec_kstack)) {
+        stack_guard_panic(ctx, "exec_kstack");
+    }
+    if (cur_proc_idx >= 0 && user_stack_guard_armed) {
+        if (!stack_guard_intact((const volatile uint32_t *)(uintptr_t)LINUX_STACK_BOTTOM)) {
+            stack_guard_panic(ctx, "linux_user_stack");
+        }
+    }
+}
 
 static uint32_t page_align_up(uint32_t addr)
 {
@@ -379,7 +446,8 @@ static uint32_t page_align_down(uint32_t addr)
 static void resolve_user_path(const char *cwd, const char *in_path, char *out_path, size_t max_len)
 {
     char combined[VFS_MAX_PATH * 2];
-    char segments[16][VFS_MAX_NAME];
+    const char *seg_ptrs[16];
+    size_t seg_lens[16];
     int seg_count = 0;
     const char *p;
     size_t pos;
@@ -407,6 +475,9 @@ static void resolve_user_path(const char *cwd, const char *in_path, char *out_pa
         size_t ilen = strlen(in_path);
         pos = 0;
         if (clen > 1) {
+            if (clen >= sizeof(combined) - 1U) {
+                clen = sizeof(combined) - 2U;
+            }
             memcpy(combined, cwd, clen);
             pos = clen;
         }
@@ -446,8 +517,8 @@ static void resolve_user_path(const char *cwd, const char *in_path, char *out_pa
             if (len >= VFS_MAX_NAME) {
                 len = VFS_MAX_NAME - 1U;
             }
-            memcpy(segments[seg_count], start, len);
-            segments[seg_count][len] = '\0';
+            seg_ptrs[seg_count] = start;
+            seg_lens[seg_count] = len;
             seg_count++;
         }
     }
@@ -460,12 +531,12 @@ static void resolve_user_path(const char *cwd, const char *in_path, char *out_pa
 
     pos = 0;
     for (i = 0; i < seg_count; i++) {
-        size_t slen = strlen(segments[i]);
+        size_t slen = seg_lens[i];
         if (pos + 1U + slen >= max_len) {
             break;
         }
         out_path[pos++] = '/';
-        memcpy(&out_path[pos], segments[i], slen);
+        memcpy(&out_path[pos], seg_ptrs[i], slen);
         pos += slen;
     }
     out_path[pos] = '\0';
@@ -1331,8 +1402,10 @@ static int load_elf32_into_proc(struct linux_proc *proc, const char *path,
         }
     }
 
-    /* Clear user stack region */
+    /* Clear user stack region and arm bottom guard watermark */
+    user_stack_guard_armed = FALSE;
     memset((void *)(uintptr_t)LINUX_STACK_BOTTOM, 0, LINUX_STACK_SIZE);
+    stack_guard_arm_user_stack();
     sp = LINUX_STACK_TOP - 64U;
 
     /* Push 16 random bytes for AT_RANDOM */
@@ -1483,6 +1556,7 @@ static void handle_process_exit(int exit_code)
 
     proc = &proc_table[cur_proc_idx];
     kprintf("[SYSCALL] Process PID %d exited with code %d\n", proc->pid, exit_code);
+    net_close_pid_sockets(proc->pid);
 
     if (proc->is_cloned_child) {
         int parent_idx = -1;
@@ -1501,6 +1575,10 @@ static void handle_process_exit(int exit_code)
             struct isr_regs *saved_regs_in_snap;
             uint32_t regs_off;
 
+            if (parent->saved_regs_esp < LINUX_STACK_BOTTOM + 16U ||
+                parent->saved_regs_esp > LINUX_STACK_TOP - (uint32_t)sizeof(struct isr_regs)) {
+                stack_guard_panic("handle_process_exit", "parent_saved_regs_esp");
+            }
             cur_proc_idx = parent_idx;
 
             /* Restore parent's code/data/brk and mmap regions */
@@ -1529,6 +1607,8 @@ static void handle_process_exit(int exit_code)
     }
 
     /* Clean up any remaining processes and return to host kernel (/bin/sh) */
+    user_stack_guard_armed = FALSE;
+    net_close_all_user_sockets();
     memset(proc_table, 0, sizeof(proc_table));
     cur_proc_idx = -1;
     linux_return_to_host(saved_host_esp, exit_code);
@@ -1630,6 +1710,10 @@ static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32
     /* Snapshot parent's load+brk region, mmap region, and stack */
     parent->saved_image_len = parent->brk_cur - parent->load_low;
     parent->saved_mmap_len  = parent->mmap_cur - LINUX_MMAP_BASE;
+    if ((uint32_t)(uintptr_t)regs < LINUX_STACK_BOTTOM + 16U ||
+        (uint32_t)(uintptr_t)regs > LINUX_STACK_TOP - (uint32_t)sizeof(struct isr_regs)) {
+        return -LINUX_EFAULT;
+    }
     parent->saved_regs_esp  = (uint32_t)(uintptr_t)regs;
 
     if (parent->saved_image_len > 0) {
@@ -1749,12 +1833,13 @@ static int32_t do_execve(struct linux_proc *proc, const char *ufilename,
     exec_envc_saved = envc;
 
     linux_call_on_kstack(do_execve_on_kstack,
-                         (uint32_t)(uintptr_t)&exec_kstack[sizeof(exec_kstack)]);
+                         (uint32_t)(uintptr_t)&exec_kstack[sizeof(exec_kstack) / sizeof(exec_kstack[0])]);
     return 0;
 }
 
 void syscall_dispatch(struct isr_regs *regs)
 {
+    uint32_t regs_addr = (uint32_t)(uintptr_t)regs;
     uint32_t nr   = regs->eax;
     uint32_t arg1 = regs->ebx;
     uint32_t arg2 = regs->ecx;
@@ -1764,6 +1849,17 @@ void syscall_dispatch(struct isr_regs *regs)
     uint32_t arg6 = regs->ebp;
     int32_t  ret  = -LINUX_ENOSYS;
     struct linux_proc *proc;
+
+    stack_guard_check("syscall");
+
+    /* Verify user %esp lies within the Linux process space with >=4 KiB headroom above guard */
+    if (regs_addr < LINUX_VA_BASE + 4096U ||
+        regs_addr > LINUX_STACK_TOP - (uint32_t)sizeof(struct isr_regs) ||
+        (regs_addr >= LINUX_STACK_BOTTOM && regs_addr < LINUX_STACK_BOTTOM + 4096U)) {
+        kprintf("[SYSCALL] Stack bounds violation (esp=0x%08x, nr=%u)\n", regs_addr, nr);
+        handle_process_exit(128 + 11);
+        return;
+    }
 
     if (cur_proc_idx < 0 || cur_proc_idx >= MAX_PROCS) {
         proc_table[0].state = PROC_RUNNING;
@@ -2004,6 +2100,7 @@ void syscall_dispatch(struct isr_regs *regs)
         int iovcnt = (int)arg3;
         int i;
         int32_t total = 0;
+        bool_t is_sock = net_is_socket_fd((int)arg1);
         if (iov == NULL || iovcnt < 0) {
             ret = -LINUX_EINVAL;
             break;
@@ -2013,10 +2110,15 @@ void syscall_dispatch(struct isr_regs *regs)
             if (iov[i].iov_len == 0) {
                 continue;
             }
-            n = vfs_read((int)arg1, (void *)(uintptr_t)iov[i].iov_base, iov[i].iov_len);
+            if (is_sock) {
+                n = net_recv((int)arg1, (void *)(uintptr_t)iov[i].iov_base, iov[i].iov_len,
+                             (total > 0) ? MSG_DONTWAIT : 0U);
+            } else {
+                n = vfs_read((int)arg1, (void *)(uintptr_t)iov[i].iov_base, iov[i].iov_len);
+            }
             if (n < 0) {
                 if (total == 0) {
-                    total = -LINUX_EBADF;
+                    total = is_sock ? n : -LINUX_EBADF;
                 }
                 break;
             }
@@ -2034,6 +2136,7 @@ void syscall_dispatch(struct isr_regs *regs)
         int iovcnt = (int)arg3;
         int i;
         int32_t total = 0;
+        bool_t is_sock = net_is_socket_fd((int)arg1);
         if (iov == NULL || iovcnt < 0) {
             ret = -LINUX_EINVAL;
             break;
@@ -2043,10 +2146,15 @@ void syscall_dispatch(struct isr_regs *regs)
             if (iov[i].iov_len == 0) {
                 continue;
             }
-            n = vfs_write((int)arg1, (const void *)(uintptr_t)iov[i].iov_base, iov[i].iov_len);
+            if (is_sock) {
+                n = net_send((int)arg1, (const void *)(uintptr_t)iov[i].iov_base,
+                             iov[i].iov_len, 0U);
+            } else {
+                n = vfs_write((int)arg1, (const void *)(uintptr_t)iov[i].iov_base, iov[i].iov_len);
+            }
             if (n < 0) {
                 if (total == 0) {
-                    total = -LINUX_EBADF;
+                    total = is_sock ? n : -LINUX_EBADF;
                 }
                 break;
             }
@@ -2123,6 +2231,16 @@ void syscall_dispatch(struct isr_regs *regs)
             ret = -LINUX_EFAULT;
             break;
         }
+        if (net_is_socket_fd((int)arg1)) {
+            struct linux_stat *st = (struct linux_stat *)(uintptr_t)arg2;
+            memset(st, 0, sizeof(*st));
+            st->st_ino     = (uint32_t)arg1;
+            st->st_mode    = (uint16_t)(0140000U | 0777U);
+            st->st_nlink   = 1U;
+            st->st_blksize = 4096U;
+            ret = 0;
+            break;
+        }
         if (vfs_fstat((int)arg1, &de) < 0) {
             ret = -LINUX_EBADF;
             break;
@@ -2136,6 +2254,17 @@ void syscall_dispatch(struct isr_regs *regs)
         struct vfs_dirent de;
         if (arg2 == 0) {
             ret = -LINUX_EFAULT;
+            break;
+        }
+        if (net_is_socket_fd((int)arg1)) {
+            struct linux_stat64 *st = (struct linux_stat64 *)(uintptr_t)arg2;
+            memset(st, 0, sizeof(*st));
+            st->__st_ino   = (uint32_t)arg1;
+            st->st_ino_lo  = (uint32_t)arg1;
+            st->st_mode    = 0140000U | 0777U;
+            st->st_nlink   = 1U;
+            st->st_blksize = 4096U;
+            ret = 0;
             break;
         }
         if (vfs_fstat((int)arg1, &de) < 0) {
@@ -2426,6 +2555,9 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_socket:
         ret = net_socket((int)arg1, (int)arg2, (int)arg3);
+        if (ret >= 0) {
+            net_set_socket_owner((int)ret, proc->pid);
+        }
         break;
 
     case LINUX_SYS_bind:
@@ -2465,6 +2597,9 @@ void syscall_dispatch(struct isr_regs *regs)
         switch (arg1) {
         case 1: /* SYS_SOCKET */
             ret = net_socket((int)a[0], (int)a[1], (int)a[2]);
+            if (ret >= 0) {
+                net_set_socket_owner((int)ret, proc->pid);
+            }
             break;
         case 2: /* SYS_BIND */
             ret = net_bind((int)a[0], (const struct sockaddr *)(uintptr_t)a[1], a[2]);

@@ -75,5 +75,8 @@ int32_t  net_recv(int sockfd, void *buf, uint32_t len, uint32_t flags);
 int      net_getsockname(int sockfd, struct sockaddr *addr, uint32_t *addrlen);
 int      net_getpeername(int sockfd, struct sockaddr *addr, uint32_t *addrlen);
 int      net_close(int sockfd);
+void     net_set_socket_owner(int sockfd, int pid);
+void     net_close_pid_sockets(int pid);
+void     net_close_all_user_sockets(void);
 
 #endif /* OKSINIX_NET_H */

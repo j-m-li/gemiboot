@@ -49,21 +49,23 @@
 /* DMA and RX Ring Sizing (16 KiB DMA supports real-hardware RNDIS packet aggregation) */
 #define USBNET_DMA_BUF_SIZE     16384U
 #define USBNET_ETH_MIN_LEN      14U
+#define USBNET_ETH_WIRE_MIN_LEN 60U
 #define USBNET_ETH_MAX_LEN      1518U
 #define USBNET_RX_RING_SLOTS    16U
 
-static struct xhci_usb_dev *net_dev            = NULL;
+static struct xhci_usb_dev *net_dev               = NULL;
 static struct xhci_net_info net_info;
-static uint8_t             *net_rx_dma         = NULL;
-static uint8_t             *net_tx_dma         = NULL;
-static uint8_t             *net_int_dma        = NULL;
-static uint32_t             rndis_req_id       = 1U;
-static uint32_t             rndis_rx_xfer_size = 2048U;
-static uint32_t             rndis_tx_max_size  = 2048U;
-static uint32_t             rndis_pkt_align    = 1U;
-static uint32_t             rx_armed_len       = 2048U;
-static volatile bool_t      rndis_resp_pending = FALSE;
-static bool_t               rndis_link_up      = TRUE;
+static uint8_t             *net_rx_dma            = NULL;
+static uint8_t             *net_tx_dma            = NULL;
+static uint8_t             *net_int_dma           = NULL;
+static uint32_t             rndis_req_id          = 1U;
+static uint32_t             rndis_rx_xfer_size    = 2048U;
+static uint32_t             rndis_tx_max_size     = 2048U;
+static uint32_t             rndis_pkt_align       = 1U;
+static uint32_t             rx_armed_len          = 2048U;
+static volatile bool_t      rndis_resp_pending    = FALSE;
+static volatile bool_t      bulk_in_stall_pending = FALSE;
+static bool_t               rndis_link_up         = TRUE;
 
 /* Received Ethernet frame ring buffer */
 static uint8_t  rx_ring_data[USBNET_RX_RING_SLOTS][USBNET_ETH_MAX_LEN];
@@ -166,9 +168,11 @@ static void rndis_handle_unsolicited(struct xhci_usb_dev *dev, const uint8_t *ms
         uint32_t status = net_read_le32(&msg[8]);
         if (status == RNDIS_STATUS_MEDIA_CONN) {
             rndis_link_up = TRUE;
+            net_info.link_up = TRUE;
             kprintf("[USBNET] RNDIS link UP\n");
         } else if (status == RNDIS_STATUS_MEDIA_DISC) {
             rndis_link_up = FALSE;
+            net_info.link_up = FALSE;
             kprintf("[USBNET] RNDIS link DOWN\n");
         }
     }
@@ -197,6 +201,9 @@ static void rndis_drain_notifications(void)
         if (rtype == 0U || rlen < 12U) {
             break;
         }
+        if (rlen > (uint32_t)sizeof(resp)) {
+            rlen = (uint32_t)sizeof(resp);
+        }
         rndis_handle_unsolicited(net_dev, resp, rlen);
         budget--;
     }
@@ -209,6 +216,9 @@ static int rndis_send_cmd(struct xhci_usb_dev *dev,
 {
     int attempt;
 
+    if (resp_max < 16U) {
+        return -1;
+    }
     if (xhci_control_transfer(dev, 0x21U, CDC_REQ_SEND_ENCAP_CMD,
                               0U, dev->iface_num, cmd_len, (void *)(uintptr_t)cmd) < 0) {
         return -1;
@@ -223,6 +233,9 @@ static int rndis_send_cmd(struct xhci_usb_dev *dev,
             uint32_t rtype = net_read_le32(&resp[0]);
             uint32_t rlen  = net_read_le32(&resp[4]);
             uint32_t rreq  = net_read_le32(&resp[8]);
+            if (rlen > (uint32_t)resp_max) {
+                rlen = (uint32_t)resp_max;
+            }
             if (rtype == expect_type && rlen >= 16U && rreq == expect_req_id) {
                 return 0;
             }
@@ -261,7 +274,9 @@ static int rndis_query_oid(struct xhci_usb_dev *dev, uint32_t oid,
     status   = net_read_le32(&resp[12]);
     info_len = net_read_le32(&resp[16]);
     info_off = net_read_le32(&resp[20]);
-    if (status != 0U || info_len == 0U || (8U + info_off + info_len) > sizeof(resp)) {
+    if (status != 0U || info_len == 0U ||
+        info_off > (uint32_t)sizeof(resp) - 8U ||
+        info_len > (uint32_t)sizeof(resp) - 8U - info_off) {
         return -1;
     }
     if (info_len > out_max) {
@@ -439,19 +454,20 @@ static int usbnet_init_ecm(struct xhci_usb_dev *dev)
 
 void usbnet_reset(void)
 {
-    net_dev            = NULL;
-    net_rx_dma         = NULL;
-    net_tx_dma         = NULL;
-    net_int_dma        = NULL;
-    rndis_req_id       = 1U;
-    rndis_rx_xfer_size = 2048U;
-    rndis_tx_max_size  = 2048U;
-    rndis_pkt_align    = 1U;
-    rx_armed_len       = 2048U;
-    rndis_resp_pending = FALSE;
-    rndis_link_up      = TRUE;
-    rx_ring_head       = 0;
-    rx_ring_tail       = 0;
+    net_dev               = NULL;
+    net_rx_dma            = NULL;
+    net_tx_dma            = NULL;
+    net_int_dma           = NULL;
+    rndis_req_id          = 1U;
+    rndis_rx_xfer_size    = 2048U;
+    rndis_tx_max_size     = 2048U;
+    rndis_pkt_align       = 1U;
+    rx_armed_len          = 2048U;
+    rndis_resp_pending    = FALSE;
+    bulk_in_stall_pending = FALSE;
+    rndis_link_up         = TRUE;
+    rx_ring_head          = 0;
+    rx_ring_tail          = 0;
     memset(&net_info, 0, sizeof(net_info));
 }
 
@@ -473,9 +489,10 @@ void usbnet_init_device(struct xhci_usb_dev *dev)
     }
 
     memset(&net_info, 0, sizeof(net_info));
-    rx_ring_head       = 0;
-    rx_ring_tail       = 0;
-    rndis_resp_pending = FALSE;
+    rx_ring_head          = 0;
+    rx_ring_tail          = 0;
+    rndis_resp_pending    = FALSE;
+    bulk_in_stall_pending = FALSE;
 
     /* Arm Interrupt IN before RNDIS INIT so real hardware RESPONSE_AVAILABLE events don't stall */
     net_dev = dev;
@@ -496,6 +513,7 @@ void usbnet_init_device(struct xhci_usb_dev *dev)
     }
 
     net_info.present = TRUE;
+    net_info.link_up = (net_info.protocol == XHCI_NET_PROTO_RNDIS) ? rndis_link_up : TRUE;
     net_info.slot_id = dev->slot_id;
     if (net_info.mtu == 0U) {
         net_info.mtu = 1500U;
@@ -515,10 +533,11 @@ void usbnet_remove_device(struct xhci_usb_dev *dev)
 {
     if (net_dev == dev) {
         kprintf("[USBNET] USB Ethernet disconnected (slot %u)\n", (uint32_t)dev->slot_id);
-        net_dev            = NULL;
-        rndis_resp_pending = FALSE;
-        rx_ring_head       = 0;
-        rx_ring_tail       = 0;
+        net_dev               = NULL;
+        rndis_resp_pending    = FALSE;
+        bulk_in_stall_pending = FALSE;
+        rx_ring_head          = 0;
+        rx_ring_tail          = 0;
         memset(&net_info, 0, sizeof(net_info));
     }
 }
@@ -531,13 +550,15 @@ bool_t usbnet_handle_transfer_event(uint8_t slot_id, uint8_t ep_dci,
     }
 
     if (ep_dci == net_dev->int_in_dci && net_dev->int_in_dci != 0) {
-        if ((cc == 1U || cc == 13U) && net_info.protocol == XHCI_NET_PROTO_RNDIS) {
-            /* MS-RNDIS RESPONSE_AVAILABLE notification: 01 00 00 00 00 00 00 00 */
-            if (net_int_dma[0] == 0x01U && net_int_dma[1] == 0x00U) {
-                rndis_resp_pending = TRUE;
+        if (cc == 1U || cc == 13U) {
+            if (net_info.protocol == XHCI_NET_PROTO_RNDIS) {
+                /* MS-RNDIS RESPONSE_AVAILABLE notification: 01 00 00 00 00 00 00 00 */
+                if (net_int_dma[0] == 0x01U && net_int_dma[1] == 0x00U) {
+                    rndis_resp_pending = TRUE;
+                }
             }
+            usbnet_arm_int(net_dev);
         }
-        usbnet_arm_int(net_dev);
         return TRUE;
     }
 
@@ -547,7 +568,7 @@ bool_t usbnet_handle_transfer_event(uint8_t slot_id, uint8_t ep_dci,
             if (net_info.protocol == XHCI_NET_PROTO_RNDIS) {
                 uint32_t pos = 0;
                 /* Real RNDIS devices may send 0-byte or 1-byte (0x00) short-packet terminators */
-                while (pos + RNDIS_HDR_LEN <= actual_len) {
+                while (actual_len >= RNDIS_HDR_LEN && pos <= actual_len - RNDIS_HDR_LEN) {
                     uint32_t msg_type = net_read_le32(&net_rx_dma[pos + 0U]);
                     uint32_t msg_len  = net_read_le32(&net_rx_dma[pos + 4U]);
                     uint32_t data_off = net_read_le32(&net_rx_dma[pos + 8U]);
@@ -555,19 +576,28 @@ bool_t usbnet_handle_transfer_event(uint8_t slot_id, uint8_t ep_dci,
                     uint32_t pkt_off;
                     uint32_t next_pos;
 
+                    /* Overflow-safe bounds validation against DMA transfer length */
                     if (msg_type != RNDIS_MSG_PACKET || msg_len < RNDIS_HDR_LEN ||
-                        pos + msg_len > actual_len) {
+                        msg_len > actual_len - pos) {
                         break;
                     }
-                    pkt_off = pos + 8U + data_off;
-                    if (data_len >= USBNET_ETH_MIN_LEN &&
-                        pkt_off + data_len <= pos + msg_len) {
+                    if (data_off <= msg_len - 8U &&
+                        data_len >= USBNET_ETH_MIN_LEN &&
+                        data_len <= USBNET_ETH_MAX_LEN &&
+                        data_len <= (msg_len - 8U) - data_off) {
+                        pkt_off = pos + 8U + data_off;
                         usbnet_rx_push(&net_rx_dma[pkt_off], data_len);
                     }
                     next_pos = pos + msg_len;
-                    if (rndis_pkt_align > 1U && next_pos + RNDIS_HDR_LEN <= actual_len &&
+                    if (rndis_pkt_align > 1U &&
+                        actual_len >= RNDIS_HDR_LEN &&
+                        next_pos <= actual_len - RNDIS_HDR_LEN &&
                         net_read_le32(&net_rx_dma[next_pos]) != RNDIS_MSG_PACKET) {
-                        next_pos = (next_pos + (rndis_pkt_align - 1U)) & ~(rndis_pkt_align - 1U);
+                        uint32_t aligned = (next_pos + (rndis_pkt_align - 1U)) & ~(rndis_pkt_align - 1U);
+                        if (aligned < next_pos || aligned > actual_len) {
+                            break;
+                        }
+                        next_pos = aligned;
                     }
                     pos = next_pos;
                 }
@@ -576,11 +606,14 @@ bool_t usbnet_handle_transfer_event(uint8_t slot_id, uint8_t ep_dci,
                     usbnet_rx_push(net_rx_dma, actual_len);
                 }
             }
+            usbnet_arm_rx(net_dev);
         } else if (cc == 3U || cc == 4U || cc == 6U) {
-            /* Recover halted Bulk IN endpoint after Babble (3), XactErr (4), or Stall (6) */
-            xhci_clear_bulk_stall(net_dev, TRUE);
+            /* Defer Bulk IN stall/error recovery to top-level xhci_net_recv() to avoid
+             * re-entrant xhci_control_transfer() clobbering ctrl_dma_buf / ep0_ring. */
+            bulk_in_stall_pending = TRUE;
+        } else {
+            usbnet_arm_rx(net_dev);
         }
-        usbnet_arm_rx(net_dev);
         return TRUE;
     }
 
@@ -589,6 +622,7 @@ bool_t usbnet_handle_transfer_event(uint8_t slot_id, uint8_t ep_dci,
 
 int32_t xhci_net_send(const uint8_t *frame, uint32_t len)
 {
+    uint32_t wire_len;
     uint32_t msg_len;
     uint32_t xfer_len;
     int rc;
@@ -597,9 +631,15 @@ int32_t xhci_net_send(const uint8_t *frame, uint32_t len)
         len < USBNET_ETH_MIN_LEN || len > USBNET_ETH_MAX_LEN) {
         return -1;
     }
+    if (net_info.protocol == XHCI_NET_PROTO_RNDIS && !rndis_link_up) {
+        return -1;
+    }
+
+    /* Pad short Ethernet frames to IEEE 802.3 60-byte wire minimum (excluding FCS) */
+    wire_len = (len < USBNET_ETH_WIRE_MIN_LEN) ? USBNET_ETH_WIRE_MIN_LEN : len;
 
     if (net_info.protocol == XHCI_NET_PROTO_RNDIS) {
-        msg_len  = RNDIS_HDR_LEN + len;
+        msg_len  = RNDIS_HDR_LEN + wire_len;
         xfer_len = msg_len;
         if (xfer_len + 1U > rndis_tx_max_size || xfer_len + 1U > USBNET_DMA_BUF_SIZE) {
             return -1;
@@ -608,8 +648,11 @@ int32_t xhci_net_send(const uint8_t *frame, uint32_t len)
         net_write_le32(&net_tx_dma[0],  RNDIS_MSG_PACKET);
         net_write_le32(&net_tx_dma[4],  msg_len);
         net_write_le32(&net_tx_dma[8],  36U);
-        net_write_le32(&net_tx_dma[12], len);
+        net_write_le32(&net_tx_dma[12], wire_len);
         memcpy(&net_tx_dma[RNDIS_HDR_LEN], frame, len);
+        if (wire_len > len) {
+            memset(&net_tx_dma[RNDIS_HDR_LEN + len], 0, wire_len - len);
+        }
 
         /* Real RNDIS hardware (Linux rndis_host convention): append a 1-byte 0x00 pad
          * when transfer length is an exact multiple of bulk_out_mps instead of relying on ZLP */
@@ -618,8 +661,11 @@ int32_t xhci_net_send(const uint8_t *frame, uint32_t len)
             xfer_len++;
         }
     } else {
-        xfer_len = len;
+        xfer_len = wire_len;
         memcpy(net_tx_dma, frame, len);
+        if (wire_len > len) {
+            memset(&net_tx_dma[len], 0, wire_len - len);
+        }
     }
 
     rc = xhci_bulk_transfer(net_dev, FALSE, net_tx_dma, xfer_len);
@@ -638,7 +684,7 @@ int32_t xhci_net_send(const uint8_t *frame, uint32_t len)
     }
 
     net_info.tx_packets++;
-    net_info.tx_bytes += len;
+    net_info.tx_bytes += wire_len;
     return (int32_t)len;
 }
 
@@ -650,6 +696,11 @@ int32_t xhci_net_recv(uint8_t *buf, uint32_t max_len)
         return -1;
     }
     xhci_poll();
+    if (bulk_in_stall_pending && net_dev != NULL) {
+        bulk_in_stall_pending = FALSE;
+        xhci_clear_bulk_stall(net_dev, TRUE);
+        usbnet_arm_rx(net_dev);
+    }
     if (rndis_resp_pending) {
         rndis_drain_notifications();
     }

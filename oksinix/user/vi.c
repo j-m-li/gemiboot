@@ -49,18 +49,23 @@ static char    vi_cmd_buf[64];
 static int32_t vi_cmd_len   = 0;
 static char    vi_status_msg[CON_COLS + 1];
 
-static char *vi_fmt_uint(char *dst, uint32_t val)
+static char *vi_fmt_uint(char *dst, char *end, uint32_t val)
 {
     char tmp[16];
     int i = 0;
+    if (dst == NULL || end == NULL || dst > end) {
+        return dst;
+    }
     if (val == 0) {
-        *dst++ = '0';
+        if (dst < end) {
+            *dst++ = '0';
+        }
     } else {
         while (val > 0) {
             tmp[i++] = (char)('0' + (val % 10U));
             val /= 10U;
         }
-        while (i > 0) {
+        while (i > 0 && dst < end) {
             *dst++ = tmp[--i];
         }
     }
@@ -68,10 +73,15 @@ static char *vi_fmt_uint(char *dst, uint32_t val)
     return dst;
 }
 
-static char *vi_fmt_str(char *dst, const char *src)
+static char *vi_fmt_str(char *dst, char *end, const char *src)
 {
-    while (*src != '\0') {
-        *dst++ = *src++;
+    if (dst == NULL || end == NULL || dst > end) {
+        return dst;
+    }
+    if (src != NULL) {
+        while (*src != '\0' && dst < end) {
+            *dst++ = *src++;
+        }
     }
     *dst = '\0';
     return dst;
@@ -131,9 +141,10 @@ static void vi_load_file(const char *path)
     fd = vfs_open(path, VFS_O_RDONLY);
     if (fd < 0) {
         char *p = vi_status_msg;
-        p = vi_fmt_str(p, "\"");
-        p = vi_fmt_str(p, path);
-        p = vi_fmt_str(p, "\" [New File]");
+        char *end = vi_status_msg + sizeof(vi_status_msg) - 1U;
+        p = vi_fmt_str(p, end, "\"");
+        p = vi_fmt_str(p, end, path);
+        p = vi_fmt_str(p, end, "\" [New File]");
         return;
     }
 
@@ -175,13 +186,14 @@ static void vi_load_file(const char *path)
 
     {
         char *p = vi_status_msg;
-        p = vi_fmt_str(p, "\"");
-        p = vi_fmt_str(p, path);
-        p = vi_fmt_str(p, "\" ");
-        p = vi_fmt_uint(p, (uint32_t)vi_num_lines);
-        p = vi_fmt_str(p, "L, ");
-        p = vi_fmt_uint(p, total_bytes);
-        p = vi_fmt_str(p, "B");
+        char *end = vi_status_msg + sizeof(vi_status_msg) - 1U;
+        p = vi_fmt_str(p, end, "\"");
+        p = vi_fmt_str(p, end, path);
+        p = vi_fmt_str(p, end, "\" ");
+        p = vi_fmt_uint(p, end, (uint32_t)vi_num_lines);
+        p = vi_fmt_str(p, end, "L, ");
+        p = vi_fmt_uint(p, end, total_bytes);
+        p = vi_fmt_str(p, end, "B");
     }
 
     kprintf("[VI] loaded \"%s\" (%u lines, %u bytes)\n",
@@ -196,7 +208,8 @@ static int vi_save_file(const char *path)
     int fd;
 
     if (path == NULL || path[0] == '\0') {
-        (void)vi_fmt_str(vi_status_msg, "E32: No file name");
+        (void)vi_fmt_str(vi_status_msg, vi_status_msg + sizeof(vi_status_msg) - 1U,
+                         "E32: No file name");
         return -1;
     }
 
@@ -211,7 +224,8 @@ static int vi_save_file(const char *path)
 
     fd = vfs_open(path, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
     if (fd < 0) {
-        (void)vi_fmt_str(vi_status_msg, "E212: Cannot open file for writing");
+        (void)vi_fmt_str(vi_status_msg, vi_status_msg + sizeof(vi_status_msg) - 1U,
+                         "E212: Cannot open file for writing");
         return -1;
     }
 
@@ -223,13 +237,14 @@ static int vi_save_file(const char *path)
     vi_dirty = FALSE;
     {
         char *p = vi_status_msg;
-        p = vi_fmt_str(p, "\"");
-        p = vi_fmt_str(p, path);
-        p = vi_fmt_str(p, "\" ");
-        p = vi_fmt_uint(p, (uint32_t)vi_num_lines);
-        p = vi_fmt_str(p, "L, ");
-        p = vi_fmt_uint(p, pos);
-        p = vi_fmt_str(p, "B written");
+        char *end = vi_status_msg + sizeof(vi_status_msg) - 1U;
+        p = vi_fmt_str(p, end, "\"");
+        p = vi_fmt_str(p, end, path);
+        p = vi_fmt_str(p, end, "\" ");
+        p = vi_fmt_uint(p, end, (uint32_t)vi_num_lines);
+        p = vi_fmt_str(p, end, "L, ");
+        p = vi_fmt_uint(p, end, pos);
+        p = vi_fmt_str(p, end, "B written");
     }
 
     kprintf("[VI] saved \"%s\" (%u lines, %u bytes)\n",
@@ -418,8 +433,9 @@ static void vi_yank_line_range(int32_t start_row, int32_t end_row)
     vi_yank_char_len  = 0;
 
     p = vi_status_msg;
-    p = vi_fmt_uint(p, (uint32_t)cnt);
-    p = vi_fmt_str(p, (cnt == 1) ? " line yanked" : " lines yanked");
+    p = vi_fmt_uint(p, vi_status_msg + sizeof(vi_status_msg) - 1U, (uint32_t)cnt);
+    p = vi_fmt_str(p, vi_status_msg + sizeof(vi_status_msg) - 1U,
+                   (cnt == 1) ? " line yanked" : " lines yanked");
 }
 
 static void vi_yank_char_range(int32_t sr, int32_t sc, int32_t er, int32_t ec)
@@ -463,8 +479,9 @@ static void vi_yank_char_range(int32_t sr, int32_t sc, int32_t er, int32_t ec)
     vi_yank_num_lines = 0;
 
     p = vi_status_msg;
-    p = vi_fmt_uint(p, (uint32_t)out_len);
-    p = vi_fmt_str(p, (out_len == 1) ? " char yanked" : " chars yanked");
+    p = vi_fmt_uint(p, vi_status_msg + sizeof(vi_status_msg) - 1U, (uint32_t)out_len);
+    p = vi_fmt_str(p, vi_status_msg + sizeof(vi_status_msg) - 1U,
+                   (out_len == 1) ? " char yanked" : " chars yanked");
 }
 
 static void vi_delete_visual_selection(void)
@@ -667,28 +684,29 @@ static void vi_render(void)
         console_puts_at(1, CON_ROWS - 1, vi_cmd_buf);
         console_set_cursor(1 + vi_cmd_len, CON_ROWS - 1);
     } else {
+        char *end = status + sizeof(status) - 1U;
         p = status;
         if (vi_mode == VI_MODE_INSERT) {
-            p = vi_fmt_str(p, "-- INSERT -- ");
+            p = vi_fmt_str(p, end, "-- INSERT -- ");
         } else if (vi_mode == VI_MODE_VISUAL) {
-            p = vi_fmt_str(p, "-- VISUAL -- ");
+            p = vi_fmt_str(p, end, "-- VISUAL -- ");
         } else if (vi_mode == VI_MODE_VLINE) {
-            p = vi_fmt_str(p, "-- VISUAL LINE -- ");
+            p = vi_fmt_str(p, end, "-- VISUAL LINE -- ");
         } else {
-            p = vi_fmt_str(p, "[NORMAL] ");
+            p = vi_fmt_str(p, end, "[NORMAL] ");
         }
         if (vi_status_msg[0] != '\0') {
-            p = vi_fmt_str(p, vi_status_msg);
+            p = vi_fmt_str(p, end, vi_status_msg);
         } else {
-            p = vi_fmt_str(p, vi_filepath);
+            p = vi_fmt_str(p, end, vi_filepath);
             if (vi_dirty) {
-                p = vi_fmt_str(p, " [+]");
+                p = vi_fmt_str(p, end, " [+]");
             }
         }
-        p = vi_fmt_str(p, "  Ln ");
-        p = vi_fmt_uint(p, (uint32_t)(vi_cur_row + 1));
-        p = vi_fmt_str(p, ", Col ");
-        p = vi_fmt_uint(p, (uint32_t)(vi_cur_col + 1));
+        p = vi_fmt_str(p, end, "  Ln ");
+        p = vi_fmt_uint(p, end, (uint32_t)(vi_cur_row + 1));
+        p = vi_fmt_str(p, end, ", Col ");
+        p = vi_fmt_uint(p, end, (uint32_t)(vi_cur_col + 1));
 
         console_puts_at(0, CON_ROWS - 1, status);
         console_set_cursor(vi_cur_col, vi_cur_row - vi_top_row);
@@ -742,14 +760,16 @@ static int vi_execute_ex_cmd(void)
     }
     if (strcmp(cmd, "q") == 0) {
         if (vi_dirty) {
-            (void)vi_fmt_str(vi_status_msg, "E37: No write since last change (add ! to override)");
+            (void)vi_fmt_str(vi_status_msg, vi_status_msg + sizeof(vi_status_msg) - 1U,
+                             "E37: No write since last change (add ! to override)");
             vi_mode = VI_MODE_NORMAL;
             return 0;
         }
         return 1;
     }
 
-    (void)vi_fmt_str(vi_status_msg, "E492: Not an editor command");
+    (void)vi_fmt_str(vi_status_msg, vi_status_msg + sizeof(vi_status_msg) - 1U,
+                     "E492: Not an editor command");
     vi_mode = VI_MODE_NORMAL;
     return 0;
 }
@@ -1051,11 +1071,13 @@ int bin_vi_main(int argc, char **argv)
 
     if (argc > 1 && argv[1] != NULL) {
         size_t len = strlen(argv[1]);
-        if (len < sizeof(vi_filepath)) {
-            memcpy(vi_filepath, argv[1], len + 1U);
+        if (len >= sizeof(vi_filepath)) {
+            len = sizeof(vi_filepath) - 1U;
         }
+        memcpy(vi_filepath, argv[1], len);
+        vi_filepath[len] = '\0';
     } else {
-        (void)vi_fmt_str(vi_filepath, "/tmp/untitled.txt");
+        (void)vi_fmt_str(vi_filepath, vi_filepath + sizeof(vi_filepath) - 1U, "/tmp/untitled.txt");
     }
 
     console_save_screen();

@@ -24,6 +24,7 @@ static void pit_irq0_handler(struct isr_regs *regs)
 {
     (void)regs;
     pit_ticks++;
+    stack_guard_check("IRQ0");
 }
 
 static uint16_t pit_read_counter0(void)

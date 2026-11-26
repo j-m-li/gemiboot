@@ -28,9 +28,13 @@
 
 .section .bss
 .align 16
+.global kernel_stack_bottom
+.global kernel_stack_top
 stack_bottom:
+kernel_stack_bottom:
 .skip 32768 /* 32 KiB kernel stack */
 stack_top:
+kernel_stack_top:
 
 .section .text.entry, "ax"
 .code32

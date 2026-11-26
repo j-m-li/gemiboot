@@ -35,4 +35,7 @@ void     linux_call_on_kstack(void (*fn)(void), uint32_t kstack_top);
 int32_t  linux_int80(uint32_t nr, uint32_t a1, uint32_t a2,
                      uint32_t a3, uint32_t a4, uint32_t a5);
 
+void     stack_guard_init(void);
+void     stack_guard_check(const char *ctx);
+
 #endif /* OKSINIX_IO_H */

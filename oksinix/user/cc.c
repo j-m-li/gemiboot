@@ -60,16 +60,16 @@ int bin_cc_main(int argc, char *argv[])
 	int fi;
 	char oname[256];
 	char *iname;
-	if (argc != 2) {
+	if (argc != 2 || argv[1] == (void*)0) {
 		return -1;
 	}
 	iname = argv[1];
 	i = 0;
-	while (iname[i]) {
+	while (iname[i] != '\0' && i < 252) {
 		oname[i] = iname[i];
 		i += 1;
 	}
-	if (i >= 252) {
+	if (iname[i] != '\0') {
 		return -1;
 	}
 	oname[i] = '.';
