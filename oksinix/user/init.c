@@ -5,6 +5,7 @@
  */
 
 #include "user.h"
+#include "sched.h"
 #include "vfs.h"
 #include "fat32.h"
 #include "xhci.h"
@@ -181,6 +182,7 @@ int bin_init_main(int argc, char **argv)
 
     sh_argv[0] = "/bin/sh";
     sh_argv[1] = NULL;
+    sched_set_current_name("/bin/sh");
     return vfs_exec("/bin/sh", 1, sh_argv);
 }
 

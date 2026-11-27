@@ -6,6 +6,7 @@
  */
 
 #include "xhci_internal.h"
+#include "sched.h"
 #include "pci.h"
 #include "pit.h"
 #include "io.h"
@@ -337,6 +338,7 @@ void xhci_poll(void)
         return;
     }
 
+    sched_preempt_disable();
     if (xhci_ready) {
         while (max_events > 0 && xhci_pop_event(&ev)) {
             xhci_dispatch_async_event(&ev);
@@ -383,6 +385,7 @@ void xhci_poll(void)
         usbhub_poll_ports();
         ctrl_info.num_devices = (uint32_t)num_usb_devs;
     }
+    sched_preempt_enable();
 }
 
 static int xhci_send_command(uint32_t param_lo, uint32_t param_hi, uint32_t control,
@@ -422,10 +425,10 @@ static void xhci_recover_ep0(struct xhci_usb_dev *dev)
                             &ev);
 }
 
-int xhci_control_transfer(struct xhci_usb_dev *dev,
-                          uint8_t bmRequestType, uint8_t bRequest,
-                          uint16_t wValue, uint16_t wIndex, uint16_t wLength,
-                          void *data)
+static int xhci_control_transfer_locked(struct xhci_usb_dev *dev,
+                                        uint8_t bmRequestType, uint8_t bRequest,
+                                        uint16_t wValue, uint16_t wIndex, uint16_t wLength,
+                                        void *data)
 {
     uint32_t setup_lo;
     uint32_t setup_hi;
@@ -511,6 +514,18 @@ int xhci_control_transfer(struct xhci_usb_dev *dev,
     return 0;
 }
 
+int xhci_control_transfer(struct xhci_usb_dev *dev,
+                          uint8_t bmRequestType, uint8_t bRequest,
+                          uint16_t wValue, uint16_t wIndex, uint16_t wLength,
+                          void *data)
+{
+    int rc;
+    sched_preempt_disable();
+    rc = xhci_control_transfer_locked(dev, bmRequestType, bRequest, wValue, wIndex, wLength, data);
+    sched_preempt_enable();
+    return rc;
+}
+
 void xhci_clear_bulk_stall(struct xhci_usb_dev *dev, bool_t is_in)
 {
     struct xhci_ring *ring;
@@ -564,8 +579,8 @@ void xhci_clear_bulk_stall(struct xhci_usb_dev *dev, bool_t is_in)
     (void)xhci_control_transfer(dev, 0x02U, 0x01U, 0, ep_addr, 0, NULL);
 }
 
-int xhci_bulk_transfer(struct xhci_usb_dev *dev, bool_t is_in,
-                       void *buf, uint32_t len)
+static int xhci_bulk_transfer_locked(struct xhci_usb_dev *dev, bool_t is_in,
+                                     void *buf, uint32_t len)
 {
     struct xhci_ring *ring;
     uint8_t dci;
@@ -607,6 +622,16 @@ int xhci_bulk_transfer(struct xhci_usb_dev *dev, bool_t is_in,
         return -1;
     }
     return 0;
+}
+
+int xhci_bulk_transfer(struct xhci_usb_dev *dev, bool_t is_in,
+                       void *buf, uint32_t len)
+{
+    int rc;
+    sched_preempt_disable();
+    rc = xhci_bulk_transfer_locked(dev, is_in, buf, len);
+    sched_preempt_enable();
+    return rc;
 }
 
 static void xhci_setup_ep_ctx(uint8_t *ep_ctx, uint32_t ep_type, uint16_t mps,

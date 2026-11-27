@@ -88,8 +88,9 @@ IRQ_STUB 13, 45
 IRQ_STUB 14, 46
 IRQ_STUB 15, 47
 
-/* Linux x86 32-bit syscall vector 0x80 (128) */
+/* Linux x86 32-bit syscall vector 0x80 (128) and scheduler yield vector 0x81 (129) */
 ISR_NOERR 128
+ISR_NOERR 129
 
 isr_common_stub:
     pushal
@@ -105,7 +106,7 @@ isr_common_stub:
 
     pushl %esp
     call isr_dispatch
-    addl $4, %esp
+    movl %eax, %esp
 
     popl %eax
     movw %ax, %ds

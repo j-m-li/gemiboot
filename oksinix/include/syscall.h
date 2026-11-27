@@ -47,6 +47,7 @@
 #define LINUX_SYS__llseek        140
 #define LINUX_SYS_readv          145
 #define LINUX_SYS_writev         146
+#define LINUX_SYS_sched_yield    158
 #define LINUX_SYS_nanosleep      162
 #define LINUX_SYS_getcwd         183
 #define LINUX_SYS_vfork          190

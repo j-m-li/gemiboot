@@ -11,6 +11,7 @@
 #include "serial.h"
 #include "string.h"
 #include "syscall.h"
+#include "sched.h"
 
 #define IDT_ENTRIES 256
 #define IRQ_COUNT   16
@@ -70,6 +71,7 @@ extern void irq13(void);
 extern void irq14(void);
 extern void irq15(void);
 extern void isr128(void);
+extern void isr129(void);
 
 static void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags)
 {
@@ -90,21 +92,27 @@ void irq_register_handler(uint8_t irq, irq_handler_t handler)
     }
 }
 
-void isr_dispatch(struct isr_regs *regs)
+uint32_t isr_dispatch(struct isr_regs *regs)
 {
     if (regs->int_no == 0x80U) {
         syscall_dispatch(regs);
-        return;
+        return (uint32_t)(uintptr_t)regs;
+    }
+    if (regs->int_no == 0x81U) {
+        return sched_reschedule(regs);
     }
     if (regs->int_no >= IRQ_BASE && regs->int_no < IRQ_BASE + IRQ_COUNT) {
         uint8_t irq = (uint8_t)(regs->int_no - IRQ_BASE);
         if (pic_is_spurious_irq(irq)) {
-            return;
+            return (uint32_t)(uintptr_t)regs;
         }
         if (irq_handlers[irq] != NULL) {
             irq_handlers[irq](regs);
         }
         pic_send_eoi(irq);
+        if (irq == 0U) {
+            return sched_on_tick(regs);
+        }
     } else if (regs->int_no < 32) {
         kprintf("[EXCEPTION] CPU fault #%u (err=0x%x) at EIP=0x%08x\n",
                 regs->int_no, regs->err_code, regs->eip);
@@ -113,6 +121,7 @@ void isr_dispatch(struct isr_regs *regs)
             cpu_hlt();
         }
     }
+    return (uint32_t)(uintptr_t)regs;
 }
 
 void idt_init(void)
@@ -180,8 +189,9 @@ void idt_init(void)
     idt_set_gate(46, (uint32_t)(uintptr_t)irq14, KERNEL_CS, 0x8E);
     idt_set_gate(47, (uint32_t)(uintptr_t)irq15, KERNEL_CS, 0x8E);
 
-    /* Linux x86 32-bit syscall gate (int $0x80) */
+    /* Linux x86 32-bit syscall gate (int $0x80) and scheduler yield gate (int $0x81) */
     idt_set_gate(0x80, (uint32_t)(uintptr_t)isr128, KERNEL_CS, 0xEE);
+    idt_set_gate(0x81, (uint32_t)(uintptr_t)isr129, KERNEL_CS, 0x8E);
 
     idt_ptr[0] = limit;
     idt_ptr[1] = (uint16_t)(base_addr & 0xFFFFU);

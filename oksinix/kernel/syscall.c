@@ -5,6 +5,7 @@
  */
 
 #include "syscall.h"
+#include "sched.h"
 #include "acpi.h"
 #include "net.h"
 #include "vfs.h"
@@ -431,6 +432,7 @@ void stack_guard_check(const char *ctx)
             stack_guard_panic(ctx, "linux_user_stack");
         }
     }
+    sched_check_stack_guards(ctx);
 }
 
 static uint32_t page_align_up(uint32_t addr)
@@ -1540,7 +1542,9 @@ int linux_elf_execve(const char *path, int argc, char **argv, char **envp)
     kprintf("[ELF32] Launching Linux i386 binary \"%s\" (PID %d, entry=0x%08x, esp=0x%08x)\n",
             path, proc->pid, entry, user_esp);
 
+    sched_preempt_disable();
     rc = linux_enter_elf(entry, user_esp, &saved_host_esp);
+    sched_preempt_enable();
     console_refresh();
     return rc;
 }
@@ -2311,6 +2315,10 @@ void syscall_dispatch(struct isr_regs *regs)
         ret = (vfs_get_flags((int)arg1, &fl) == 0) ? 0 : -LINUX_EBADF;
         break;
     }
+
+    case LINUX_SYS_sched_yield:
+        ret = 0;
+        break;
 
     case LINUX_SYS_nanosleep: {
         const struct linux_timespec32 *req = (const struct linux_timespec32 *)(uintptr_t)arg1;

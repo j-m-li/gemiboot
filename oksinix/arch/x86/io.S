@@ -98,6 +98,12 @@ cpu_eflags:
     popl %eax
     ret
 
+.global cpu_yield
+.type cpu_yield, @function
+cpu_yield:
+    int $0x81
+    ret
+
 .global gdt_flush
 .type gdt_flush, @function
 gdt_flush:

@@ -5,6 +5,7 @@
  */
 
 #include "user.h"
+#include "sched.h"
 #include "acpi.h"
 #include "net.h"
 #include "vfs.h"
@@ -969,6 +970,78 @@ static void cmd_cd(int argc, char **argv)
     }
 }
 
+static void sh_bg_counter_task(void *arg)
+{
+    volatile uint32_t *cnt = (volatile uint32_t *)arg;
+    for (;;) {
+        (*cnt)++;
+    }
+}
+
+static void sh_bg_sleeper_task(void *arg)
+{
+    volatile uint32_t *cnt = (volatile uint32_t *)arg;
+    for (;;) {
+        (*cnt)++;
+        sched_sleep_ms(50U);
+    }
+}
+
+static volatile uint32_t sh_bg_count = 0U;
+
+static int sh_parse_int(const char *s)
+{
+    int val = 0;
+    if (s == NULL || *s == '\0') {
+        return -1;
+    }
+    while (*s != '\0') {
+        if (*s < '0' || *s > '9') {
+            return -1;
+        }
+        val = val * 10 + (int)(*s - '0');
+        s++;
+    }
+    return val;
+}
+
+static void cmd_ps(void)
+{
+    int slot;
+    struct sched_task_info ti;
+
+    sh_puts("  PID STAT   TICKS    SW  CMD\n");
+    for (slot = 0; slot < SCHED_MAX_TASKS; slot++) {
+        const char *st = "?";
+        if (sched_get_task_info(slot, &ti) != 0) {
+            continue;
+        }
+        if (ti.state == TASK_STATE_RUNNING) {
+            st = "RUN";
+        } else if (ti.state == TASK_STATE_READY) {
+            st = "RDY";
+        } else if (ti.state == TASK_STATE_SLEEPING) {
+            st = "SLP";
+        } else if (ti.state == TASK_STATE_ZOMBIE) {
+            st = "ZOM";
+        }
+        sh_puts("    ");
+        sh_print_uint((uint32_t)ti.pid);
+        sh_puts(" ");
+        sh_puts(st);
+        sh_puts("    ");
+        sh_print_uint(ti.ticks);
+        sh_puts("    ");
+        sh_print_uint(ti.switches);
+        sh_puts("  ");
+        sh_puts(ti.name);
+        sh_putc('\n');
+    }
+    sh_puts("Total context switches: ");
+    sh_print_uint(sched_get_total_switches());
+    sh_putc('\n');
+}
+
 static void sh_execute_line(char *line)
 {
     char *argv[SH_MAX_ARGS];
@@ -979,7 +1052,7 @@ static void sh_execute_line(char *line)
     }
 
     if (strcmp(argv[0], "help") == 0) {
-        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net telnet memmap acpi keymap ps uname uptime clear vi shutdown\n");
+        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net telnet memmap acpi keymap ps kill spawn schedtest uname uptime clear vi shutdown\n");
     } else if (strcmp(argv[0], "net") == 0) {
         cmd_net(argc, argv);
     } else if (strcmp(argv[0], "telnet") == 0) {
@@ -1179,9 +1252,40 @@ static void sh_execute_line(char *line)
             }
         }
     } else if (strcmp(argv[0], "ps") == 0) {
-        sh_puts("  PID TTY          STAT CMD\n");
-        sh_puts("    1 /dev/console S    /bin/init\n");
-        sh_puts("    2 /dev/console R    /bin/sh\n");
+        cmd_ps();
+    } else if (strcmp(argv[0], "kill") == 0) {
+        int pid = (argc >= 2) ? sh_parse_int(argv[1]) : -1;
+        if (pid < 0) {
+            sh_puts("usage: kill <pid>\n");
+        } else if (sched_kill(pid) < 0) {
+            sh_puts("kill: cannot terminate PID ");
+            sh_print_uint((uint32_t)pid);
+            sh_putc('\n');
+        } else {
+            sh_puts("Terminated PID ");
+            sh_print_uint((uint32_t)pid);
+            sh_putc('\n');
+        }
+    } else if (strcmp(argv[0], "spawn") == 0) {
+        int pid;
+        if (argc >= 2 && strcmp(argv[1], "sleeper") == 0) {
+            pid = sched_spawn_ex("bg_sleeper", sh_bg_sleeper_task, (void *)&sh_bg_count, TRUE);
+        } else {
+            pid = sched_spawn_ex("bg_counter", sh_bg_counter_task, (void *)&sh_bg_count, TRUE);
+        }
+        if (pid < 0) {
+            sh_puts("spawn: task table full\n");
+        } else {
+            sh_puts("Spawned background task PID ");
+            sh_print_uint((uint32_t)pid);
+            sh_putc('\n');
+        }
+    } else if (strcmp(argv[0], "schedtest") == 0) {
+        if (sched_run_selftest() == 0) {
+            sh_puts("Preemptive scheduler test PASSED.\n");
+        } else {
+            sh_puts("Preemptive scheduler test FAILED.\n");
+        }
     } else if (strcmp(argv[0], "uname") == 0) {
         sh_puts("Oksinix 0.2 i386 C90 (CC0 Public Domain)\n");
     } else if (strcmp(argv[0], "clear") == 0) {

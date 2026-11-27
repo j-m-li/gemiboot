@@ -34,8 +34,8 @@ struct isr_regs {
 
 typedef void (*irq_handler_t)(struct isr_regs *regs);
 
-void idt_init(void);
-void irq_register_handler(uint8_t irq, irq_handler_t handler);
-void isr_dispatch(struct isr_regs *regs);
+void     idt_init(void);
+void     irq_register_handler(uint8_t irq, irq_handler_t handler);
+uint32_t isr_dispatch(struct isr_regs *regs);
 
 #endif /* OKSINIX_IDT_H */

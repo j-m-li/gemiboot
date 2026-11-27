@@ -49,6 +49,7 @@ C_SRCS   := arch/x86/gdt.c \
             user/cc.c \
             lib/string.c \
             kernel/net.c \
+            kernel/sched.c \
             kernel/syscall.c \
             kernel/main.c
 

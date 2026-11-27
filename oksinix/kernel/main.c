@@ -21,6 +21,7 @@
 #include "vfs.h"
 #include "fat32.h"
 #include "syscall.h"
+#include "sched.h"
 #include "net.h"
 #include "user.h"
 
@@ -127,8 +128,10 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     devfs_init();
     (void)fat32_init();
     user_programs_init();
+    sched_init();
 
     cpu_sti();
+    (void)sched_run_selftest();
     kprintf("[KERNEL] Interrupts enabled. Launching /bin/init (PID 1)...\n");
 
     init_argv[0] = "/bin/init";

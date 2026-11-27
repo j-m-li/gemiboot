@@ -23,6 +23,7 @@ void     cpu_hlt(void);
 void     cpu_pause(void);
 void     cpu_memory_barrier(void);
 uint32_t cpu_eflags(void);
+void     cpu_yield(void);
 
 void     gdt_flush(const volatile void *gdt_ptr_addr);
 void     idt_flush(const volatile void *idt_ptr_addr);
