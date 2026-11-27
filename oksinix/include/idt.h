@@ -30,6 +30,9 @@ struct isr_regs {
     uint32_t eip;
     uint32_t cs;
     uint32_t eflags;
+    /* Pushed/popped by CPU hardware ONLY on Ring 3 <-> Ring 0 privilege transitions */
+    uint32_t user_esp;
+    uint32_t user_ss;
 };
 
 typedef void (*irq_handler_t)(struct isr_regs *regs);

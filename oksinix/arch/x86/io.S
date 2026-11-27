@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: CC0-1.0 */
 /*
  * Public Domain (CC0 1.0 Universal)
- * Oksinix x86 32-bit Port I/O & descriptor table helpers
+ * Oksinix x86 32-bit Port I/O, paging, TSS & Ring-3 transition helpers
  */
 
 .section .text
@@ -104,6 +104,55 @@ cpu_yield:
     int $0x81
     ret
 
+.global cpu_enable_paging
+.type cpu_enable_paging, @function
+cpu_enable_paging:
+    movl 4(%esp), %eax
+    /* First disable CR0.PG in case UEFI (IA32/X64) left paging enabled */
+    movl %cr0, %ecx
+    andl $0x7FFFFFFF, %ecx
+    movl %ecx, %cr0
+    jmp .Lpaging_off
+.Lpaging_off:
+    /* Reset CR4 to CR4.PSE (bit 4) only: clears PAE, PGE, LA57, PCIDE, SMEP, SMAP from UEFI/OVMF */
+    movl $0x00000010, %ecx
+    movl %ecx, %cr4
+    /* Load Page Directory physical address into CR3 */
+    movl %eax, %cr3
+    /* Enable CR0.PG (bit 31) and CR0.WP (bit 16) */
+    movl %cr0, %ecx
+    orl $0x80010000, %ecx
+    movl %ecx, %cr0
+    jmp .Lpaging_flush
+.Lpaging_flush:
+    ret
+
+.global cpu_load_cr3
+.type cpu_load_cr3, @function
+cpu_load_cr3:
+    movl 4(%esp), %eax
+    movl %eax, %cr3
+    ret
+
+.global cpu_read_cr3
+.type cpu_read_cr3, @function
+cpu_read_cr3:
+    movl %cr3, %eax
+    ret
+
+.global cpu_read_cr2
+.type cpu_read_cr2, @function
+cpu_read_cr2:
+    movl %cr2, %eax
+    ret
+
+.global cpu_invlpg
+.type cpu_invlpg, @function
+cpu_invlpg:
+    movl 4(%esp), %eax
+    invlpg (%eax)
+    ret
+
 .global gdt_flush
 .type gdt_flush, @function
 gdt_flush:
@@ -119,6 +168,13 @@ gdt_flush:
 .Lgdt_flush_done:
     ret
 
+.global tss_flush
+.type tss_flush, @function
+tss_flush:
+    movw 4(%esp), %ax
+    ltr %ax
+    ret
+
 .global idt_flush
 .type idt_flush, @function
 idt_flush:
@@ -126,35 +182,56 @@ idt_flush:
     lidt (%eax)
     ret
 
-.global linux_enter_elf
-.type linux_enter_elf, @function
-linux_enter_elf:
+/*
+ * int linux_enter_ring3(uint32_t entry, uint32_t user_esp, uint32_t *saved_esp_out)
+ * Saves callee-saved registers on host kernel stack, switches data segments to USER_DS (0x23),
+ * and executes iret into Ring 3 (USER_CS=0x1B, USER_DS=0x23, EFLAGS=0x202 with IF=1, IOPL=0).
+ */
+.global linux_enter_ring3
+.type linux_enter_ring3, @function
+linux_enter_ring3:
     pushl %ebp
     pushl %ebx
     pushl %esi
     pushl %edi
-    movl 20(%esp), %eax
-    movl 24(%esp), %ecx
-    movl 28(%esp), %edx
+    movl 20(%esp), %eax     /* entry */
+    movl 24(%esp), %ecx     /* user_esp */
+    movl 28(%esp), %edx     /* saved_esp_out */
     testl %edx, %edx
     jz .Lno_save_esp
     movl %esp, (%edx)
 .Lno_save_esp:
-    movl %ecx, %esp
+    cli
+    movw $0x23, %bx
+    movw %bx, %ds
+    movw %bx, %es
+    movw %bx, %fs
+    movw %bx, %gs
+    pushl $0x23             /* user SS (USER_DS) */
+    pushl %ecx              /* user ESP */
+    pushl $0x00000202       /* EFLAGS: IF=1, reserved bit 1=1, IOPL=0 */
+    pushl $0x1B             /* user CS (USER_CS) */
+    pushl %eax              /* user EIP */
+    xorl %eax, %eax
     xorl %ebx, %ebx
     xorl %ecx, %ecx
     xorl %edx, %edx
     xorl %esi, %esi
     xorl %edi, %edi
     xorl %ebp, %ebp
-    sti
-    jmpl *%eax
+    iret
 
 .global linux_return_to_host
 .type linux_return_to_host, @function
 linux_return_to_host:
+    cli
     movl 4(%esp), %ecx
     movl 8(%esp), %eax
+    movw $0x10, %dx
+    movw %dx, %ds
+    movw %dx, %es
+    movw %dx, %fs
+    movw %dx, %gs
     movl %ecx, %esp
     popl %edi
     popl %esi
@@ -166,26 +243,8 @@ linux_return_to_host:
 .global linux_resume_regs
 .type linux_resume_regs, @function
 linux_resume_regs:
-    movl 4(%esp), %esp
-    popl %eax
-    movw %ax, %ds
-    movw %ax, %es
-    movw %ax, %fs
-    movw %ax, %gs
-    popal
-    addl $8, %esp
-    iret
-
-.global linux_restore_and_resume
-.type linux_restore_and_resume, @function
-linux_restore_and_resume:
     cli
-    movl 4(%esp), %edi
-    movl 8(%esp), %esi
-    movl 12(%esp), %ecx
-    movl 16(%esp), %esp
-    cld
-    rep movsl
+    movl 4(%esp), %esp
     popl %eax
     movw %ax, %ds
     movw %ax, %es
@@ -204,25 +263,5 @@ linux_call_on_kstack:
     movl %ecx, %esp
     call *%eax
 1:  jmp 1b
-
-.global linux_int80
-.type linux_int80, @function
-linux_int80:
-    pushl %ebp
-    pushl %ebx
-    pushl %esi
-    pushl %edi
-    movl 20(%esp), %eax
-    movl 24(%esp), %ebx
-    movl 28(%esp), %ecx
-    movl 32(%esp), %edx
-    movl 36(%esp), %esi
-    movl 40(%esp), %edi
-    int $0x80
-    popl %edi
-    popl %esi
-    popl %ebx
-    popl %ebp
-    ret
 
 .section .note.GNU-stack,"",@progbits

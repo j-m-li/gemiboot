@@ -11,6 +11,7 @@
 #include "serial.h"
 #include "gdt.h"
 #include "idt.h"
+#include "vm.h"
 #include "acpi.h"
 #include "pic.h"
 #include "pit.h"
@@ -93,7 +94,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     }
 
     gdt_init();
-    kprintf("[CPU] GDT initialized (flat 32-bit segments)\n");
+    kprintf("[CPU] GDT & 32-bit TSS initialized (Ring 0 + Ring 3 segments, I/O bitmap denied)\n");
 
     idt_init();
     kprintf("[CPU] IDT & 8259 PIC initialized (IRQs mapped to 32..47)\n");
@@ -101,6 +102,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
     acpi_init(magic, mbi_addr);
     syscall_init();
     stack_guard_init();
+    vm_init();
     net_init();
 
     pit_init();
@@ -132,6 +134,7 @@ void kernel_main(uint32_t magic, uint32_t mbi_addr)
 
     cpu_sti();
     (void)sched_run_selftest();
+    (void)sched_run_prot_selftest();
     kprintf("[KERNEL] Interrupts enabled. Launching /bin/init (PID 1)...\n");
 
     init_argv[0] = "/bin/init";

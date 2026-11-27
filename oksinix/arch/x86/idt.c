@@ -96,6 +96,9 @@ uint32_t isr_dispatch(struct isr_regs *regs)
 {
     if (regs->int_no == 0x80U) {
         syscall_dispatch(regs);
+        if (sched_current_needs_resched()) {
+            return sched_reschedule(regs);
+        }
         return (uint32_t)(uintptr_t)regs;
     }
     if (regs->int_no == 0x81U) {
@@ -113,9 +116,22 @@ uint32_t isr_dispatch(struct isr_regs *regs)
         if (irq == 0U) {
             return sched_on_tick(regs);
         }
-    } else if (regs->int_no < 32) {
-        kprintf("[EXCEPTION] CPU fault #%u (err=0x%x) at EIP=0x%08x\n",
-                regs->int_no, regs->err_code, regs->eip);
+    } else if (regs->int_no < 32U) {
+        uint32_t cr2 = (regs->int_no == 14U) ? cpu_read_cr2() : 0U;
+
+        /* Hardware Ring-3 fault isolation: kill offending user task instead of panicking kernel */
+        if ((regs->cs & 3U) == 3U) {
+            kprintf("[TRAP] User Ring-3 fault #%u (err=0x%x, cr2=0x%08x, eip=0x%08x, esp=0x%08x) -> killing task\n",
+                    regs->int_no, regs->err_code, cr2, regs->eip, regs->user_esp);
+            if (syscall_is_elf_running()) {
+                syscall_handle_user_fault(regs, cr2);
+                return (uint32_t)(uintptr_t)regs;
+            }
+            return sched_handle_user_fault(regs, cr2);
+        }
+
+        kprintf("[EXCEPTION] Kernel Ring-0 fault #%u (err=0x%x, cr2=0x%08x) at EIP=0x%08x\n",
+                regs->int_no, regs->err_code, cr2, regs->eip);
         cpu_cli();
         for (;;) {
             cpu_hlt();
@@ -189,7 +205,7 @@ void idt_init(void)
     idt_set_gate(46, (uint32_t)(uintptr_t)irq14, KERNEL_CS, 0x8E);
     idt_set_gate(47, (uint32_t)(uintptr_t)irq15, KERNEL_CS, 0x8E);
 
-    /* Linux x86 32-bit syscall gate (int $0x80) and scheduler yield gate (int $0x81) */
+    /* Linux x86 32-bit syscall gate (int $0x80, DPL=3) and kernel yield gate (int $0x81, DPL=0) */
     idt_set_gate(0x80, (uint32_t)(uintptr_t)isr128, KERNEL_CS, 0xEE);
     idt_set_gate(0x81, (uint32_t)(uintptr_t)isr129, KERNEL_CS, 0x8E);
 

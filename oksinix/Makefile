@@ -48,6 +48,7 @@ C_SRCS   := arch/x86/gdt.c \
             user/vi.c \
             user/cc.c \
             lib/string.c \
+            kernel/vm.c \
             kernel/net.c \
             kernel/sched.c \
             kernel/syscall.c \
@@ -63,6 +64,7 @@ LINUX_ELF  := user/linux_hello.elf
 SHLIB_OBJ  := user/libtest.o
 SHLIB_SO   := user/libtest.so
 LIBC_OBJ   := user/libc_stub.o
+LIBC_ASM   := user/libc_syscall.o
 LIBC_SO    := user/libc.so.6
 DYN_OBJ    := user/linux_dyn.o
 DYN_ELF    := user/linux_dyn.elf
@@ -92,25 +94,28 @@ $(LINUX_ELF): $(LINUX_OBJ)
 	$(LD) -m elf_i386 -pie --hash-style=sysv --strip-all -nostdlib -o $@ $<
 
 $(SHLIB_OBJ): user/libtest.c
-	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -fPIC -O2 -c $< -o $@
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -O2 -c $< -o $@
 
 $(SHLIB_SO): $(SHLIB_OBJ)
 	$(LD) -m elf_i386 -shared -soname=libtest.so --hash-style=sysv --strip-all -nostdlib -o $@ $<
 
 $(LIBC_OBJ): user/libc_stub.c
-	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -fPIC -O2 -c $< -o $@
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -O2 -c $< -o $@
 
-$(LIBC_SO): $(LIBC_OBJ)
-	$(LD) -m elf_i386 -shared -soname=libc.so.6 --hash-style=sysv --strip-all -nostdlib -o $@ $<
+$(LIBC_ASM): user/libc_syscall.S
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(LIBC_SO): $(LIBC_OBJ) $(LIBC_ASM)
+	$(LD) -m elf_i386 -shared -soname=libc.so.6 --hash-style=sysv --strip-all -nostdlib -o $@ $(LIBC_OBJ) $(LIBC_ASM)
 
 $(DYN_OBJ): user/linux_dyn.c
-	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -fPIC -O2 -c $< -o $@
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -O2 -c $< -o $@
 
 $(DYN_ELF): $(DYN_OBJ) $(SHLIB_SO) $(LIBC_SO)
 	$(LD) -m elf_i386 -pie -dynamic-linker /lib/ld-linux.so.2 --hash-style=sysv --strip-all -nostdlib -o $@ $(DYN_OBJ) $(SHLIB_SO) $(LIBC_SO)
 
-$(BOOT_IMG): $(MBR_BIN) $(KERNEL_BIN) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) scripts/mkdisk.py
-	python3 scripts/mkdisk.py $(MBR_BIN) $(KERNEL_BIN) $(BOOT_IMG) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO)
+$(BOOT_IMG): $(MBR_BIN) $(KERNEL_BIN) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) scripts/mkdisk.py
+	python3 scripts/mkdisk.py $(MBR_BIN) $(KERNEL_BIN) $(BOOT_IMG) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO)
 
 $(USB_DISK): $(BOOT_IMG)
 	cp $(BOOT_IMG) $(USB_DISK)
@@ -149,4 +154,4 @@ test: $(KERNEL_ELF) $(BOOT_IMG) $(USB_DISK)
 	python3 tests/test_qemu.py $(BOOT_IMG) $(USB_DISK) $(KERNEL_ELF)
 
 clean:
-	rm -f $(OBJS) *.img $(MBR_OBJ) $(MBR_BIN) $(LINUX_OBJ) $(LINUX_ELF) $(SHLIB_OBJ) $(SHLIB_SO) $(LIBC_OBJ) $(LIBC_SO) $(DYN_OBJ) $(DYN_ELF) $(KERNEL_ELF) $(KERNEL_BIN) tests/*.ppm
+	rm -f $(OBJS) *.img $(MBR_OBJ) $(MBR_BIN) $(LINUX_OBJ) $(LINUX_ELF) $(SHLIB_OBJ) $(SHLIB_SO) $(LIBC_OBJ) $(LIBC_ASM) $(LIBC_SO) $(DYN_OBJ) $(DYN_ELF) $(KERNEL_ELF) $(KERNEL_BIN) tests/*.ppm

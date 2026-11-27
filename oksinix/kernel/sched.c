@@ -2,27 +2,40 @@
 /*
  * Public Domain (CC0 1.0 Universal)
  * Oksinix x86 32-bit kernel - Preemptive Round-Robin Multitasking Scheduler
+ * with xv6-style per-task page directories, Ring-3 isolation & hardware stack guard pages
  */
 
 #include "sched.h"
 #include "gdt.h"
+#include "vm.h"
 #include "pit.h"
 #include "io.h"
 #include "serial.h"
 #include "string.h"
 
-#define TASK_STACK_DWORDS 4096U /* 16 KiB per spawned kernel task */
-#define TASK_GUARD_W0     0xDEADBEEFUL
-#define TASK_GUARD_W1     0xCAFEBABEUL
-#define TASK_GUARD_W2     0x57AC4600UL
-#define TASK_GUARD_W3     0xBADC0FFEUL
+#define TASK_KSTACK_PAGES   4U    /* 16 KiB Ring-0 kernel stack per spawned task */
+#define TASK_KSTACK_BYTES   (TASK_KSTACK_PAGES * VM_PAGE_SIZE)
+#define TASK_SLOT_PAGES     (1U + TASK_KSTACK_PAGES) /* 1 guard page + 4 stack pages */
+#define TASK_MAX_OWNED_PGS  4
+
+#define TASK_GUARD_W0       0xDEADBEEFUL
+#define TASK_GUARD_W1       0xCAFEBABEUL
+#define TASK_GUARD_W2       0x57AC4600UL
+#define TASK_GUARD_W3       0xBADC0FFEUL
 
 struct sched_task {
     int            pid;
     uint32_t       state;
     bool_t         is_idle;
+    bool_t         is_user;
     bool_t         detached;
+    bool_t         need_resched;
     int            exit_code;
+    uint32_t       fault_vec;
+    uint32_t       fault_cr2;
+    uint32_t      *pgdir;
+    uint32_t       owned_pages[TASK_MAX_OWNED_PGS];
+    int            owned_page_count;
     uint32_t       saved_esp;
     uint32_t       stack_base;
     uint32_t       stack_top;
@@ -38,7 +51,8 @@ extern uint32_t kernel_stack_bottom[];
 extern uint32_t kernel_stack_top[];
 
 static struct sched_task task_table[SCHED_MAX_TASKS];
-static uint32_t          task_stacks[SCHED_MAX_TASKS][TASK_STACK_DWORDS];
+static uint8_t           task_stacks_raw[(SCHED_MAX_TASKS * TASK_SLOT_PAGES + 1U) * VM_PAGE_SIZE];
+static uint32_t         *task_stack_bases[SCHED_MAX_TASKS];
 static int               cur_task_idx = -1;
 static int               next_task_pid = 2;
 static volatile bool_t   sched_enabled = FALSE;
@@ -76,6 +90,43 @@ static bool_t sched_guard_ok(const uint32_t *base)
             base[3] == TASK_GUARD_W3) ? TRUE : FALSE;
 }
 
+/* Free VM resources of a non-current slot (must be called with interrupts disabled) */
+static void sched_release_slot_vm(int slot)
+{
+    struct sched_task *t = &task_table[slot];
+    int i;
+
+    if (slot == cur_task_idx) {
+        return;
+    }
+    if (t->pgdir != NULL && t->pgdir != vm_get_kernel_pgdir()) {
+        vm_destroy_user_pgdir(t->pgdir);
+    }
+    t->pgdir = NULL;
+    for (i = 0; i < t->owned_page_count; i++) {
+        if (t->owned_pages[i] != 0U) {
+            vm_free_user_page(t->owned_pages[i]);
+            t->owned_pages[i] = 0U;
+        }
+    }
+    t->owned_page_count = 0;
+}
+
+/* Clean up any detached zombie tasks so their VM resources and slots can be reused */
+static void sched_reap_detached(void)
+{
+    int i;
+    for (i = 2; i < SCHED_MAX_TASKS; i++) {
+        if (i != cur_task_idx &&
+            task_table[i].state == TASK_STATE_ZOMBIE &&
+            task_table[i].detached) {
+            sched_release_slot_vm(i);
+            task_table[i].state = TASK_STATE_UNUSED;
+            task_table[i].pid   = 0;
+        }
+    }
+}
+
 static void sched_task_trampoline(void)
 {
     sched_entry_t entry = NULL;
@@ -106,6 +157,7 @@ void sched_init(void)
     struct sched_task *boot_t;
     struct sched_task *idle_t;
     struct isr_regs *regs;
+    uint32_t aligned_base;
     uint32_t top_addr;
 
     memset(task_table, 0, sizeof(task_table));
@@ -115,20 +167,33 @@ void sched_init(void)
     cur_slice_ticks    = 0U;
     total_ctx_switches = 0U;
 
+    /* Align task kernel stacks on 4 KiB boundaries and unmap a 4 KiB guard page below each */
+    aligned_base = ((uint32_t)(uintptr_t)task_stacks_raw + (VM_PAGE_SIZE - 1U)) & VM_PAGE_MASK;
+    for (i = 0; i < SCHED_MAX_TASKS; i++) {
+        uint32_t slot_base = aligned_base + (uint32_t)i * TASK_SLOT_PAGES * VM_PAGE_SIZE;
+        uint32_t stack_start = slot_base + VM_PAGE_SIZE;
+        task_stack_bases[i] = (uint32_t *)(uintptr_t)stack_start;
+        if (i >= 1) {
+            vm_unmap_kernel_page(slot_base);
+        }
+    }
+
     /* Slot 0: primary boot / init / shell task running on boot kernel_stack */
     boot_t = &task_table[0];
     boot_t->pid        = 1;
     boot_t->state      = TASK_STATE_RUNNING;
     boot_t->is_idle    = FALSE;
+    boot_t->is_user    = FALSE;
     boot_t->detached   = FALSE;
+    boot_t->pgdir      = vm_get_kernel_pgdir();
     boot_t->stack_base = (uint32_t)(uintptr_t)kernel_stack_bottom;
     boot_t->stack_top  = (uint32_t)(uintptr_t)kernel_stack_top;
     sched_copy_name(boot_t->name, "/bin/init");
 
     /* Slot 1: lowest-priority idle task (PID 0), scheduled only when no other task is READY */
     idle_t = &task_table[1];
-    sched_arm_guard(task_stacks[1]);
-    top_addr = (uint32_t)(uintptr_t)&task_stacks[1][TASK_STACK_DWORDS];
+    sched_arm_guard(task_stack_bases[1]);
+    top_addr = (uint32_t)(uintptr_t)task_stack_bases[1] + TASK_KSTACK_BYTES;
     top_addr &= ~0x0FUL;
     regs = (struct isr_regs *)(uintptr_t)(top_addr - (uint32_t)sizeof(struct isr_regs));
     memset(regs, 0, sizeof(*regs));
@@ -140,9 +205,11 @@ void sched_init(void)
     idle_t->pid        = 0;
     idle_t->state      = TASK_STATE_READY;
     idle_t->is_idle    = TRUE;
+    idle_t->is_user    = FALSE;
     idle_t->detached   = TRUE;
+    idle_t->pgdir      = vm_get_kernel_pgdir();
     idle_t->saved_esp  = (uint32_t)(uintptr_t)regs;
-    idle_t->stack_base = (uint32_t)(uintptr_t)task_stacks[1];
+    idle_t->stack_base = (uint32_t)(uintptr_t)task_stack_bases[1];
     idle_t->stack_top  = top_addr;
     idle_t->entry      = sched_idle_entry;
     idle_t->arg        = NULL;
@@ -152,10 +219,11 @@ void sched_init(void)
         task_table[i].state = TASK_STATE_UNUSED;
     }
 
+    tss_set_esp0(boot_t->stack_top);
     sched_enabled = TRUE;
-    kprintf("[SCHED] Preemptive multitasking initialized (max_tasks=%u, quantum=%ums, stack=%uKiB)\n",
+    kprintf("[SCHED] Preemptive multitasking initialized (max_tasks=%u, quantum=%ums, kstack=%uKiB + 4KiB hw guard)\n",
             (uint32_t)SCHED_MAX_TASKS, (uint32_t)SCHED_QUANTUM_TICKS,
-            (uint32_t)((TASK_STACK_DWORDS * 4U) / 1024U));
+            (uint32_t)(TASK_KSTACK_BYTES / 1024U));
 }
 
 bool_t sched_is_enabled(void)
@@ -195,6 +263,53 @@ int sched_getpid(void)
     return 0;
 }
 
+bool_t sched_current_is_user(void)
+{
+    if (cur_task_idx >= 0 && cur_task_idx < SCHED_MAX_TASKS) {
+        return task_table[cur_task_idx].is_user;
+    }
+    return FALSE;
+}
+
+uint32_t *sched_current_pgdir(void)
+{
+    if (cur_task_idx >= 0 && cur_task_idx < SCHED_MAX_TASKS &&
+        task_table[cur_task_idx].pgdir != NULL) {
+        return task_table[cur_task_idx].pgdir;
+    }
+    return vm_get_kernel_pgdir();
+}
+
+bool_t sched_current_needs_resched(void)
+{
+    if (cur_task_idx >= 0 && cur_task_idx < SCHED_MAX_TASKS) {
+        if (task_table[cur_task_idx].need_resched ||
+            task_table[cur_task_idx].state != TASK_STATE_RUNNING) {
+            task_table[cur_task_idx].need_resched = FALSE;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+void sched_mark_current_exit_isr(int exit_code)
+{
+    if (cur_task_idx <= 1 || cur_task_idx >= SCHED_MAX_TASKS) {
+        return;
+    }
+    task_table[cur_task_idx].exit_code    = exit_code;
+    task_table[cur_task_idx].state        = TASK_STATE_ZOMBIE;
+    task_table[cur_task_idx].need_resched = TRUE;
+    preempt_lock_depth = 0;
+}
+
+void sched_mark_current_yield_isr(void)
+{
+    if (cur_task_idx >= 0 && cur_task_idx < SCHED_MAX_TASKS) {
+        task_table[cur_task_idx].need_resched = TRUE;
+    }
+}
+
 int sched_spawn_ex(const char *name, sched_entry_t entry, void *arg, bool_t detached)
 {
     uint32_t eflags = cpu_eflags();
@@ -210,6 +325,7 @@ int sched_spawn_ex(const char *name, sched_entry_t entry, void *arg, bool_t deta
     }
 
     cpu_cli();
+    sched_reap_detached();
     for (i = 2; i < SCHED_MAX_TASKS; i++) {
         if (task_table[i].state == TASK_STATE_UNUSED) {
             slot = i;
@@ -225,10 +341,10 @@ int sched_spawn_ex(const char *name, sched_entry_t entry, void *arg, bool_t deta
 
     t = &task_table[slot];
     memset(t, 0, sizeof(*t));
-    memset(task_stacks[slot], 0, sizeof(task_stacks[slot]));
-    sched_arm_guard(task_stacks[slot]);
+    memset(task_stack_bases[slot], 0, TASK_KSTACK_BYTES);
+    sched_arm_guard(task_stack_bases[slot]);
 
-    top_addr = (uint32_t)(uintptr_t)&task_stacks[slot][TASK_STACK_DWORDS];
+    top_addr = (uint32_t)(uintptr_t)task_stack_bases[slot] + TASK_KSTACK_BYTES;
     top_addr &= ~0x0FUL;
     regs = (struct isr_regs *)(uintptr_t)(top_addr - (uint32_t)sizeof(struct isr_regs));
     memset(regs, 0, sizeof(*regs));
@@ -241,10 +357,12 @@ int sched_spawn_ex(const char *name, sched_entry_t entry, void *arg, bool_t deta
     t->pid        = pid;
     t->state      = TASK_STATE_READY;
     t->is_idle    = FALSE;
+    t->is_user    = FALSE;
     t->detached   = detached;
     t->exit_code  = 0;
+    t->pgdir      = vm_get_kernel_pgdir();
     t->saved_esp  = (uint32_t)(uintptr_t)regs;
-    t->stack_base = (uint32_t)(uintptr_t)task_stacks[slot];
+    t->stack_base = (uint32_t)(uintptr_t)task_stack_bases[slot];
     t->stack_top  = top_addr;
     t->entry      = entry;
     t->arg        = arg;
@@ -259,6 +377,117 @@ int sched_spawn_ex(const char *name, sched_entry_t entry, void *arg, bool_t deta
 int sched_spawn(const char *name, sched_entry_t entry, void *arg)
 {
     return sched_spawn_ex(name, entry, arg, FALSE);
+}
+
+int sched_spawn_user_code(const char *name, const void *code, uint32_t code_len,
+                          uint32_t arg_val, bool_t detached)
+{
+    uint32_t eflags = cpu_eflags();
+    int slot = -1;
+    int i;
+    int pid;
+    uint32_t *pgdir = NULL;
+    uint32_t code_pa = 0U;
+    uint32_t data_pa = 0U;
+    uint32_t stack_pa = 0U;
+    struct sched_task *t;
+    struct isr_regs *regs;
+    uint32_t top_addr;
+
+    if (!sched_enabled || !vm_is_enabled() || code == NULL ||
+        code_len == 0U || code_len > VM_PAGE_SIZE) {
+        return -1;
+    }
+
+    cpu_cli();
+    sched_reap_detached();
+    for (i = 2; i < SCHED_MAX_TASKS; i++) {
+        if (task_table[i].state == TASK_STATE_UNUSED) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        goto fail;
+    }
+
+    pgdir    = vm_create_user_pgdir();
+    code_pa  = vm_alloc_user_page();
+    data_pa  = vm_alloc_user_page();
+    stack_pa = vm_alloc_user_page();
+    if (pgdir == NULL || code_pa == 0U || data_pa == 0U || stack_pa == 0U) {
+        goto fail;
+    }
+
+    memcpy((void *)(uintptr_t)code_pa, code, code_len);
+    *(uint32_t *)(uintptr_t)data_pa = arg_val;
+
+    /* Map user code (R-X, no W), user data (RW), unmapped stack guard, and user stack (RW) */
+    if (vm_map_user_page(pgdir, VM_UTASK_CODE_VA, code_pa, VM_PTE_U) < 0 ||
+        vm_map_user_page(pgdir, VM_UTASK_DATA_VA, data_pa, VM_PTE_U | VM_PTE_W) < 0 ||
+        vm_unmap_user_page(pgdir, VM_UTASK_GUARD_VA) < 0 ||
+        vm_map_user_page(pgdir, VM_UTASK_STACK_VA, stack_pa, VM_PTE_U | VM_PTE_W) < 0) {
+        goto fail;
+    }
+
+    t = &task_table[slot];
+    memset(t, 0, sizeof(*t));
+    memset(task_stack_bases[slot], 0, TASK_KSTACK_BYTES);
+    sched_arm_guard(task_stack_bases[slot]);
+
+    top_addr = (uint32_t)(uintptr_t)task_stack_bases[slot] + TASK_KSTACK_BYTES;
+    top_addr &= ~0x0FUL;
+    regs = (struct isr_regs *)(uintptr_t)(top_addr - (uint32_t)sizeof(struct isr_regs));
+    memset(regs, 0, sizeof(*regs));
+    regs->ds       = USER_DS;
+    regs->ebx      = arg_val;
+    regs->eip      = VM_UTASK_CODE_VA;
+    regs->cs       = USER_CS;
+    regs->eflags   = 0x00000202UL; /* IF=1, IOPL=0 (Ring 3 cannot cli/sti/in/out) */
+    regs->user_esp = VM_UTASK_STACK_TOP - 16U;
+    regs->user_ss  = USER_DS;
+
+    pid = next_task_pid++;
+    t->pid              = pid;
+    t->state            = TASK_STATE_READY;
+    t->is_idle          = FALSE;
+    t->is_user          = TRUE;
+    t->detached         = detached;
+    t->exit_code        = 0;
+    t->fault_vec        = 0U;
+    t->fault_cr2        = 0U;
+    t->pgdir            = pgdir;
+    t->owned_pages[0]   = code_pa;
+    t->owned_pages[1]   = data_pa;
+    t->owned_pages[2]   = stack_pa;
+    t->owned_page_count = 3;
+    t->saved_esp        = (uint32_t)(uintptr_t)regs;
+    t->stack_base       = (uint32_t)(uintptr_t)task_stack_bases[slot];
+    t->stack_top        = top_addr;
+    sched_copy_name(t->name, name);
+
+    if ((eflags & 0x0200UL) != 0UL) {
+        cpu_sti();
+    }
+    return pid;
+
+fail:
+    if (pgdir != NULL) {
+        vm_destroy_user_pgdir(pgdir);
+    }
+    if (code_pa != 0U) {
+        vm_free_user_page(code_pa);
+    }
+    if (data_pa != 0U) {
+        vm_free_user_page(data_pa);
+    }
+    if (stack_pa != 0U) {
+        vm_free_user_page(stack_pa);
+    }
+    if ((eflags & 0x0200UL) != 0UL) {
+        cpu_sti();
+    }
+    return -1;
 }
 
 void sched_yield(void)
@@ -306,9 +535,7 @@ void sched_exit(int exit_code)
 
     cpu_cli();
     task_table[cur_task_idx].exit_code = exit_code;
-    task_table[cur_task_idx].state     = task_table[cur_task_idx].detached
-                                             ? TASK_STATE_UNUSED
-                                             : TASK_STATE_ZOMBIE;
+    task_table[cur_task_idx].state     = TASK_STATE_ZOMBIE;
     preempt_lock_depth = 0;
     cpu_yield();
 
@@ -338,9 +565,13 @@ int sched_kill(int pid)
                 sched_exit(128 + 9);
             }
             task_table[i].exit_code = 128 + 9;
-            task_table[i].state     = task_table[i].detached
-                                          ? TASK_STATE_UNUSED
-                                          : TASK_STATE_ZOMBIE;
+            if (task_table[i].detached) {
+                sched_release_slot_vm(i);
+                task_table[i].state = TASK_STATE_UNUSED;
+                task_table[i].pid   = 0;
+            } else {
+                task_table[i].state = TASK_STATE_ZOMBIE;
+            }
             rc = 0;
             break;
         }
@@ -351,7 +582,8 @@ int sched_kill(int pid)
     return rc;
 }
 
-int sched_wait(int pid, int *out_exit_code)
+int sched_wait_ex(int pid, int *out_exit_code,
+                  uint32_t *out_fault_vec, uint32_t *out_fault_cr2)
 {
     if (!sched_enabled || pid <= 1) {
         return -1;
@@ -368,10 +600,19 @@ int sched_wait(int pid, int *out_exit_code)
                 found = 1;
                 if (task_table[i].state == TASK_STATE_ZOMBIE) {
                     int code = task_table[i].exit_code;
+                    uint32_t fvec = task_table[i].fault_vec;
+                    uint32_t fcr2 = task_table[i].fault_cr2;
+                    sched_release_slot_vm(i);
                     task_table[i].state = TASK_STATE_UNUSED;
                     task_table[i].pid   = 0;
                     if (out_exit_code != NULL) {
                         *out_exit_code = code;
+                    }
+                    if (out_fault_vec != NULL) {
+                        *out_fault_vec = fvec;
+                    }
+                    if (out_fault_cr2 != NULL) {
+                        *out_fault_cr2 = fcr2;
                     }
                     if ((eflags & 0x0200UL) != 0UL) {
                         cpu_sti();
@@ -389,6 +630,11 @@ int sched_wait(int pid, int *out_exit_code)
         }
         sched_yield();
     }
+}
+
+int sched_wait(int pid, int *out_exit_code)
+{
+    return sched_wait_ex(pid, out_exit_code, NULL, NULL);
 }
 
 static int sched_pick_next(void)
@@ -443,7 +689,34 @@ static uint32_t sched_switch_to(struct isr_regs *regs, int next_idx)
     cur_slice_ticks = 0U;
     total_ctx_switches++;
 
+    /* xv6 switchuvm/switchkvm: update hardware TSS ESP0 and CR3 page directory */
+    tss_set_esp0(task_table[next_idx].stack_top);
+    vm_switch(task_table[next_idx].pgdir);
+
     return task_table[next_idx].saved_esp;
+}
+
+uint32_t sched_handle_user_fault(struct isr_regs *regs, uint32_t cr2)
+{
+    int sig = 11; /* SIGSEGV */
+    int next_idx;
+
+    if (regs->int_no == 0U) {
+        sig = 8; /* SIGFPE */
+    } else if (regs->int_no == 6U) {
+        sig = 4; /* SIGILL */
+    }
+
+    if (cur_task_idx > 1 && cur_task_idx < SCHED_MAX_TASKS) {
+        task_table[cur_task_idx].fault_vec = regs->int_no;
+        task_table[cur_task_idx].fault_cr2 = cr2;
+        task_table[cur_task_idx].exit_code = 128 + sig;
+        task_table[cur_task_idx].state     = TASK_STATE_ZOMBIE;
+        preempt_lock_depth = 0;
+    }
+
+    next_idx = sched_pick_next();
+    return sched_switch_to(regs, next_idx);
 }
 
 uint32_t sched_reschedule(struct isr_regs *regs)
@@ -508,7 +781,7 @@ void sched_check_stack_guards(const char *ctx)
         return;
     }
     for (i = 1; i < SCHED_MAX_TASKS; i++) {
-        if (task_table[i].state != TASK_STATE_UNUSED && !sched_guard_ok(task_stacks[i])) {
+        if (task_table[i].state != TASK_STATE_UNUSED && !sched_guard_ok(task_stack_bases[i])) {
             cpu_cli();
             kprintf("\n[PANIC] Task stack overflow detected in %s: PID %d (%s) guard corrupted!\n",
                     ctx, task_table[i].pid, task_table[i].name);
@@ -542,6 +815,7 @@ int sched_get_task_info(int slot, struct sched_task_info *out)
 
     eflags = cpu_eflags();
     cpu_cli();
+    sched_reap_detached();
     t = &task_table[slot];
     if (t->state == TASK_STATE_UNUSED) {
         if ((eflags & 0x0200UL) != 0UL) {
@@ -551,6 +825,8 @@ int sched_get_task_info(int slot, struct sched_task_info *out)
     }
     out->pid        = t->pid;
     out->state      = t->state;
+    out->is_user    = t->is_user;
+    out->pgdir_phys = (uint32_t)(uintptr_t)t->pgdir;
     out->ticks      = t->ticks;
     out->switches   = t->switches;
     out->stack_size = t->stack_top - t->stack_base;
@@ -649,5 +925,170 @@ int sched_run_selftest(void)
 
     kprintf("[TEST] Preemptive multitasking self-test PASSED (A=%u B=%u interleaves=%u ctx_sw=%u)\n",
             st_state.work_a, st_state.work_b, st_state.interleaves, sw_delta);
+    return 0;
+}
+
+/*
+ * xv6-style hardware task protection self-test:
+ * Verifies Ring-3 syscalls, kernel-memory #PF isolation, read-only code #PF,
+ * privileged instruction #GP, unmapped stack guard page #PF, per-task CR3 memory
+ * isolation, and syscall kernel-pointer rejection (-EFAULT).
+ */
+int sched_run_prot_selftest(void)
+{
+    /* 1. Valid Ring-3 task: SYS_getpid (20), verify > 0, SYS_exit (1, 42) */
+    static const uint8_t code_valid[] = {
+        0xB8U, 0x14U, 0x00U, 0x00U, 0x00U, /* mov $20, %eax (SYS_getpid) */
+        0xCDU, 0x80U,                      /* int $0x80 */
+        0x85U, 0xC0U,                      /* test %eax, %eax */
+        0x7EU, 0x0CU,                      /* jle fail */
+        0xBBU, 0x2AU, 0x00U, 0x00U, 0x00U, /* mov $42, %ebx */
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U, /* mov $1, %eax (SYS_exit) */
+        0xCDU, 0x80U,                      /* int $0x80 */
+        /* fail: */
+        0xBBU, 0x01U, 0x00U, 0x00U, 0x00U, /* mov $1, %ebx */
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U, /* mov $1, %eax */
+        0xCDU, 0x80U                       /* int $0x80 */
+    };
+
+    /* 2. Ring-3 illegal read of kernel .text at 0x00100000 -> hardware #PF (14) */
+    static const uint8_t code_kread[] = {
+        0xA1U, 0x00U, 0x00U, 0x10U, 0x00U, /* mov 0x00100000, %eax */
+        0xBBU, 0x00U, 0x00U, 0x00U, 0x00U, /* mov $0, %ebx */
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U, /* mov $1, %eax */
+        0xCDU, 0x80U                       /* int $0x80 */
+    };
+
+    /* 3. Ring-3 illegal write to read-only user code page 0x40000000 -> hardware #PF (14) */
+    static const uint8_t code_rowrite[] = {
+        0xC7U, 0x05U, 0x00U, 0x00U, 0x00U, 0x40U, 0x78U, 0x56U, 0x34U, 0x12U,
+                                           /* movl $0x12345678, 0x40000000 */
+        0xBBU, 0x00U, 0x00U, 0x00U, 0x00U,
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U,
+        0xCDU, 0x80U
+    };
+
+    /* 4. Ring-3 privileged instruction (cli) -> hardware #GP (13) */
+    static const uint8_t code_priv[] = {
+        0xFAU,                             /* cli (DPL0/IOPL0 required -> #GP) */
+        0xBBU, 0x00U, 0x00U, 0x00U, 0x00U,
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U,
+        0xCDU, 0x80U
+    };
+
+    /* 5. Ring-3 user stack overflow into unmapped guard page 0x40002FFC -> hardware #PF (14) */
+    static const uint8_t code_guard[] = {
+        0xC7U, 0x05U, 0xFCU, 0x2FU, 0x00U, 0x40U, 0xEFU, 0xBEU, 0xADU, 0xDEU,
+                                           /* movl $0xDEADBEEF, 0x40002FFC */
+        0xBBU, 0x00U, 0x00U, 0x00U, 0x00U,
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U,
+        0xCDU, 0x80U
+    };
+
+    /*
+     * 6. Concurrent Ring-3 isolation + syscall pointer validation:
+     *    - Reads unique arg from %ebx (also stored at 0x40001000)
+     *    - Loops 8 times calling SYS_sched_yield (158) and checking 0x40001000 == %esi
+     *    - Calls SYS_write(1, 0x00100000, 16) and verifies return == -14 (-EFAULT)
+     *    - Exits with 0 on success, 1 on failure
+     */
+    static const uint8_t code_iso[] = {
+        0x89U, 0xDEU,                               /* mov %ebx, %esi (save magic) */
+        0x89U, 0x35U, 0x00U, 0x10U, 0x00U, 0x40U,   /* mov %esi, 0x40001000 */
+        0xBFU, 0x08U, 0x00U, 0x00U, 0x00U,          /* mov $8, %edi (8 yields) */
+        /* loop (offset 13): */
+        0xB8U, 0x9EU, 0x00U, 0x00U, 0x00U,          /* mov $158, %eax (SYS_sched_yield) */
+        0xCDU, 0x80U,                               /* int $0x80 */
+        0x3BU, 0x35U, 0x00U, 0x10U, 0x00U, 0x40U,   /* cmp 0x40001000, %esi */
+        0x75U, 0x27U,                               /* jne fail (+39 -> offset 67) */
+        0x4FU,                                      /* dec %edi */
+        0x75U, 0xEEU,                               /* jnz loop (-18 -> offset 13) */
+        /* Test syscall rejection of kernel pointer: write(1, 0x00100000, 16) -> -14 (-EFAULT) */
+        0xB8U, 0x04U, 0x00U, 0x00U, 0x00U,          /* mov $4, %eax (SYS_write) */
+        0xBBU, 0x01U, 0x00U, 0x00U, 0x00U,          /* mov $1, %ebx (stdout) */
+        0xB9U, 0x00U, 0x00U, 0x10U, 0x00U,          /* mov $0x00100000, %ecx (kernel addr!) */
+        0xBAU, 0x10U, 0x00U, 0x00U, 0x00U,          /* mov $16, %edx */
+        0xCDU, 0x80U,                               /* int $0x80 */
+        0x83U, 0xF8U, 0xF2U,                        /* cmp $-14, %eax (-LINUX_EFAULT) */
+        0x75U, 0x09U,                               /* jne fail (+9 -> offset 67) */
+        0x31U, 0xDBU,                               /* xor %ebx, %ebx (exit 0) */
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U,          /* mov $1, %eax (SYS_exit) */
+        0xCDU, 0x80U,                               /* int $0x80 */
+        /* fail (offset 67): */
+        0xBBU, 0x01U, 0x00U, 0x00U, 0x00U,          /* mov $1, %ebx */
+        0xB8U, 0x01U, 0x00U, 0x00U, 0x00U,          /* mov $1, %eax */
+        0xCDU, 0x80U                                /* int $0x80 */
+    };
+
+    int pid, pid2;
+    int rc = -1, rc2 = -1;
+    uint32_t fvec = 0U, fcr2 = 0U;
+    uint32_t fvec2 = 0U, fcr22 = 0U;
+
+    if (!sched_enabled || !vm_is_enabled()) {
+        return -1;
+    }
+
+    /* 1. Valid Ring-3 execution */
+    pid = sched_spawn_user_code("u_valid", code_valid, (uint32_t)sizeof(code_valid), 0U, FALSE);
+    if (pid < 0 || sched_wait_ex(pid, &rc, &fvec, &fcr2) < 0 || rc != 42 || fvec != 0U) {
+        kprintf("[TEST] Task protection #1 (Ring-3 syscall) FAILED (rc=%d vec=%u)\n", rc, fvec);
+        return -1;
+    }
+
+    /* 2. Kernel memory read from Ring 3 -> #PF at 0x00100000 */
+    pid = sched_spawn_user_code("u_kread", code_kread, (uint32_t)sizeof(code_kread), 0U, FALSE);
+    if (pid < 0 || sched_wait_ex(pid, &rc, &fvec, &fcr2) < 0 || fvec != 14U || fcr2 != 0x00100000UL) {
+        kprintf("[TEST] Task protection #2 (kernel read #PF) FAILED (rc=%d vec=%u cr2=0x%08x)\n",
+                rc, fvec, fcr2);
+        return -1;
+    }
+
+    /* 3. Write to read-only code page from Ring 3 -> #PF at 0x40000000 */
+    pid = sched_spawn_user_code("u_rowr", code_rowrite, (uint32_t)sizeof(code_rowrite), 0U, FALSE);
+    if (pid < 0 || sched_wait_ex(pid, &rc, &fvec, &fcr2) < 0 || fvec != 14U || fcr2 != VM_UTASK_CODE_VA) {
+        kprintf("[TEST] Task protection #3 (RO code #PF) FAILED (rc=%d vec=%u cr2=0x%08x)\n",
+                rc, fvec, fcr2);
+        return -1;
+    }
+
+    /* 4. Privileged instruction (cli) from Ring 3 -> #GP (13) */
+    pid = sched_spawn_user_code("u_priv", code_priv, (uint32_t)sizeof(code_priv), 0U, FALSE);
+    if (pid < 0 || sched_wait_ex(pid, &rc, &fvec, &fcr2) < 0 || fvec != 13U) {
+        kprintf("[TEST] Task protection #4 (priv cli #GP) FAILED (rc=%d vec=%u)\n", rc, fvec);
+        return -1;
+    }
+
+    /* 5. Stack overflow into unmapped guard page -> #PF at 0x40002FFC */
+    pid = sched_spawn_user_code("u_guard", code_guard, (uint32_t)sizeof(code_guard), 0U, FALSE);
+    if (pid < 0 || sched_wait_ex(pid, &rc, &fvec, &fcr2) < 0 || fvec != 14U || fcr2 != 0x40002FFCUL) {
+        kprintf("[TEST] Task protection #5 (stack guard #PF) FAILED (rc=%d vec=%u cr2=0x%08x)\n",
+                rc, fvec, fcr2);
+        return -1;
+    }
+
+    /* 6. Concurrent per-task CR3 address-space isolation + syscall -EFAULT check */
+    pid  = sched_spawn_user_code("u_isoA", code_iso, (uint32_t)sizeof(code_iso), 0x1111AAAAUL, FALSE);
+    pid2 = sched_spawn_user_code("u_isoB", code_iso, (uint32_t)sizeof(code_iso), 0x2222BBBBUL, FALSE);
+    if (pid < 0 || pid2 < 0) {
+        if (pid >= 0) {
+            (void)sched_kill(pid);
+            (void)sched_wait(pid, NULL);
+        }
+        if (pid2 >= 0) {
+            (void)sched_kill(pid2);
+            (void)sched_wait(pid2, NULL);
+        }
+        return -1;
+    }
+    (void)sched_wait_ex(pid, &rc, &fvec, &fcr2);
+    (void)sched_wait_ex(pid2, &rc2, &fvec2, &fcr22);
+    if (rc != 0 || fvec != 0U || rc2 != 0 || fvec2 != 0U) {
+        kprintf("[TEST] Task protection #6 (CR3 isolation + EFAULT) FAILED (A=%d/%u B=%d/%u)\n",
+                rc, fvec, rc2, fvec2);
+        return -1;
+    }
+
+    kprintf("[TEST] xv6-style hardware task protection self-test PASSED (6/6: Ring-3 syscall, kread #PF, RO-code #PF, priv #GP, stack-guard #PF, CR3 isolation + EFAULT)\n");
     return 0;
 }

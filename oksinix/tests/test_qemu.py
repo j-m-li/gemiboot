@@ -283,6 +283,7 @@ def main():
             wait_for_serial(serial_log_path, "[ACPI] S5 poweroff ready")
             wait_for_serial(serial_log_path, "[ACPI-MMAP] #0:")
             wait_for_serial(serial_log_path, "[ACPI-MMAP] Source: ACPI E820 (INT 15h)")
+            wait_for_serial(serial_log_path, "[VM] x86 32-bit paging enabled")
             wait_for_serial(serial_log_path, "[PIT] 8254 timer initialized at 1000 Hz")
             wait_for_serial(serial_log_path, "[FB] Linear Framebuffer active via VESA VBE 2.0 BIOS")
             wait_for_serial(serial_log_path, "[VGA] Mode 12h framebuffer initialized (640x480x16 at 0x")
@@ -311,6 +312,8 @@ def main():
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media1")
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media2")
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media3")
+            wait_for_serial(serial_log_path, "[TEST] Preemptive multitasking self-test PASSED")
+            wait_for_serial(serial_log_path, "[TEST] xv6-style hardware task protection self-test PASSED")
             wait_for_serial(serial_log_path, "oksinix:/# ")
             print("[PASS] 1/12 Boot, VGA 640x480, PCI xHCI, USB Hub, 4x USB storage auto-mounted (/mnt, /media1..3)")
 
@@ -417,7 +420,9 @@ def main():
             wait_for_serial(serial_log_path, "at 0x01500000")
             wait_for_serial(serial_log_path, "[DYN] PT_INTERP \"/lib/ld-linux.so.2\" loaded at 0x01600000")
             wait_for_serial(serial_log_path, "[LINUX-DYN] Shared library LIBTEST.SO + libc.so.6 + PT_INTERP PASSED!")
-            print("[PASS] 7/10 Linux x86 32-bit static (/mnt/LINUX.ELF) & dynamic (/mnt/DYN.ELF + LIBTEST.SO + ld-linux.so.2) binaries verified")
+            send_keys_str(sock, "prottest\n")
+            wait_for_serial(serial_log_path, "Hardware task protection test (Ring 3 / paging / TSS) PASSED.")
+            print("[PASS] 7/10 Linux x86 32-bit Ring-3 static (/mnt/LINUX.ELF), dynamic (/mnt/DYN.ELF + LIBTEST.SO + libc.so.6) & 'prottest' verified")
 
             # 8. Test xHCI USB Ethernet (RNDIS) DHCP, ARP + ICMP Echo ping to QEMU SLIRP gateway 10.0.2.2
             send_keys_str(sock, "net\n")

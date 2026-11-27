@@ -27,14 +27,27 @@
 .long 0
 
 .section .bss
-.align 16
+.align 4096
+.global kernel_stack_guard
 .global kernel_stack_bottom
 .global kernel_stack_top
+kernel_stack_guard:
+.skip 4096  /* 4 KiB unmapped hardware guard page below boot kernel stack */
 stack_bottom:
 kernel_stack_bottom:
 .skip 32768 /* 32 KiB kernel stack */
 stack_top:
 kernel_stack_top:
+
+.align 4096
+.global exec_kstack_guard
+.global exec_kstack_bottom
+.global exec_kstack_top
+exec_kstack_guard:
+.skip 4096  /* 4 KiB unmapped hardware guard page below ELF syscall/execve kernel stack */
+exec_kstack_bottom:
+.skip 32768 /* 32 KiB dedicated Ring-0 kernel stack for Ring-3 Linux ELF syscalls/execve */
+exec_kstack_top:
 
 .section .text.entry, "ax"
 .code32

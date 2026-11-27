@@ -1010,7 +1010,7 @@ static void cmd_ps(void)
     int slot;
     struct sched_task_info ti;
 
-    sh_puts("  PID STAT   TICKS    SW  CMD\n");
+    sh_puts("  PID RING STAT   TICKS    SW  CMD\n");
     for (slot = 0; slot < SCHED_MAX_TASKS; slot++) {
         const char *st = "?";
         if (sched_get_task_info(slot, &ti) != 0) {
@@ -1027,7 +1027,7 @@ static void cmd_ps(void)
         }
         sh_puts("    ");
         sh_print_uint((uint32_t)ti.pid);
-        sh_puts(" ");
+        sh_puts(ti.is_user ? "   R3  " : "   R0  ");
         sh_puts(st);
         sh_puts("    ");
         sh_print_uint(ti.ticks);
@@ -1052,7 +1052,7 @@ static void sh_execute_line(char *line)
     }
 
     if (strcmp(argv[0], "help") == 0) {
-        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net telnet memmap acpi keymap ps kill spawn schedtest uname uptime clear vi shutdown\n");
+        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net telnet memmap acpi keymap ps kill spawn schedtest prottest uname uptime clear vi shutdown\n");
     } else if (strcmp(argv[0], "net") == 0) {
         cmd_net(argc, argv);
     } else if (strcmp(argv[0], "telnet") == 0) {
@@ -1285,6 +1285,12 @@ static void sh_execute_line(char *line)
             sh_puts("Preemptive scheduler test PASSED.\n");
         } else {
             sh_puts("Preemptive scheduler test FAILED.\n");
+        }
+    } else if (strcmp(argv[0], "prottest") == 0) {
+        if (sched_run_prot_selftest() == 0) {
+            sh_puts("Hardware task protection test (Ring 3 / paging / TSS) PASSED.\n");
+        } else {
+            sh_puts("Hardware task protection test FAILED.\n");
         }
     } else if (strcmp(argv[0], "uname") == 0) {
         sh_puts("Oksinix 0.2 i386 C90 (CC0 Public Domain)\n");

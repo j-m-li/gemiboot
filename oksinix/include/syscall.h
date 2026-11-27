@@ -81,8 +81,10 @@
 #define LINUX_SYS_statx          383
 #define LINUX_SYS_clock_gettime64 403
 
-void syscall_init(void);
-void syscall_dispatch(struct isr_regs *regs);
-int  linux_elf_execve(const char *path, int argc, char **argv, char **envp);
+void   syscall_init(void);
+void   syscall_dispatch(struct isr_regs *regs);
+int    linux_elf_execve(const char *path, int argc, char **argv, char **envp);
+bool_t syscall_is_elf_running(void);
+void   syscall_handle_user_fault(struct isr_regs *regs, uint32_t cr2);
 
 #endif /* OKSINIX_SYSCALL_H */

@@ -52,7 +52,8 @@ def make_dirent_lfn(long_name, name83, attr, cluster, size):
     return out
 
 
-def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", shlib_so_bytes=b""):
+def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
+                          shlib_so_bytes=b"", libc_so_bytes=b""):
     part = bytearray(part_sectors * 512)
 
     bytes_per_sec = 512
@@ -129,6 +130,7 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
     elf_start_clus = alloc_chain(linux_elf_bytes)
     dyn_start_clus = alloc_chain(dyn_elf_bytes)
     shlib_start_clus = alloc_chain(shlib_so_bytes)
+    libc_start_clus = alloc_chain(libc_so_bytes)
 
     for idx, val in enumerate(fat_entries):
         struct.pack_into("<I", fat, idx * 4, val)
@@ -165,6 +167,10 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
     if shlib_so_bytes:
         root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"LIBTEST SO ", 0x20, shlib_start_clus, len(shlib_so_bytes))
         dir_pos += 32
+    if libc_so_bytes:
+        libc_ents = make_dirent_lfn("libc.so.6", b"LIBC_S~1SO ", 0x20, libc_start_clus, len(libc_so_bytes))
+        root_dir[dir_pos:dir_pos + len(libc_ents)] = libc_ents
+        dir_pos += len(libc_ents)
     part[clus_off(2):clus_off(2) + 512] = root_dir
 
     # Populate Cluster 3 (README.TXT)
@@ -195,6 +201,8 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"", 
         part[clus_off(dyn_start_clus):clus_off(dyn_start_clus) + len(dyn_elf_bytes)] = dyn_elf_bytes
     if shlib_so_bytes:
         part[clus_off(shlib_start_clus):clus_off(shlib_start_clus) + len(shlib_so_bytes)] = shlib_so_bytes
+    if libc_so_bytes:
+        part[clus_off(libc_start_clus):clus_off(libc_start_clus) + len(libc_so_bytes)] = libc_so_bytes
 
     return part
 
@@ -233,6 +241,7 @@ def main():
     linux_elf_bytes = b""
     dyn_elf_bytes = b""
     shlib_so_bytes = b""
+    libc_so_bytes = b""
     if len(sys.argv) >= 5:
         with open(sys.argv[4], "rb") as f:
             linux_elf_bytes = f.read()
@@ -242,8 +251,12 @@ def main():
     if len(sys.argv) >= 7:
         with open(sys.argv[6], "rb") as f:
             shlib_so_bytes = f.read()
+    if len(sys.argv) >= 8:
+        with open(sys.argv[7], "rb") as f:
+            libc_so_bytes = f.read()
 
-    fat32_part = build_fat32_partition(part_sectors, linux_elf_bytes, dyn_elf_bytes, shlib_so_bytes)
+    fat32_part = build_fat32_partition(part_sectors, linux_elf_bytes, dyn_elf_bytes,
+                                       shlib_so_bytes, libc_so_bytes)
 
     image = bytearray(total_size)
     image[0:512] = mbr_data

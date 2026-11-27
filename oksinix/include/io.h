@@ -25,16 +25,19 @@ void     cpu_memory_barrier(void);
 uint32_t cpu_eflags(void);
 void     cpu_yield(void);
 
+void     cpu_enable_paging(uint32_t pgdir_phys);
+void     cpu_load_cr3(uint32_t pgdir_phys);
+uint32_t cpu_read_cr3(void);
+uint32_t cpu_read_cr2(void);
+void     cpu_invlpg(uint32_t vaddr);
+
 void     gdt_flush(const volatile void *gdt_ptr_addr);
+void     tss_flush(uint16_t tss_selector);
 void     idt_flush(const volatile void *idt_ptr_addr);
-int      linux_enter_elf(uint32_t entry, uint32_t user_esp, uint32_t *saved_esp_out);
+int      linux_enter_ring3(uint32_t entry, uint32_t user_esp, uint32_t *saved_esp_out);
 void     linux_return_to_host(uint32_t saved_esp, int exit_code);
 void     linux_resume_regs(uint32_t regs_esp);
-void     linux_restore_and_resume(uint32_t dst_stack, const void *src_stack,
-                                  uint32_t stack_dwords, uint32_t parent_regs_esp);
 void     linux_call_on_kstack(void (*fn)(void), uint32_t kstack_top);
-int32_t  linux_int80(uint32_t nr, uint32_t a1, uint32_t a2,
-                     uint32_t a3, uint32_t a4, uint32_t a5);
 
 void     stack_guard_init(void);
 void     stack_guard_check(const char *ctx);

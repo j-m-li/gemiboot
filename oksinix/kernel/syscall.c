@@ -6,6 +6,8 @@
 
 #include "syscall.h"
 #include "sched.h"
+#include "gdt.h"
+#include "vm.h"
 #include "acpi.h"
 #include "net.h"
 #include "vfs.h"
@@ -336,26 +338,30 @@ struct linux_siginfo {
 #define MAX_PROCS    8
 
 struct linux_proc {
-    int      state;
-    int      pid;
-    int      ppid;
-    int      exit_code;
-    bool_t   is_cloned_child;
-    uint32_t load_low;
-    uint32_t brk_start;
-    uint32_t brk_cur;
-    uint32_t mmap_cur;
-    uint32_t saved_regs_esp;
-    uint32_t saved_image_len;
-    uint32_t saved_mmap_len;
-    char     cwd[VFS_MAX_PATH];
-    char     exe_path[VFS_MAX_PATH];
+    int             state;
+    int             pid;
+    int             ppid;
+    int             exit_code;
+    bool_t          is_cloned_child;
+    uint32_t        load_low;
+    uint32_t        brk_start;
+    uint32_t        brk_cur;
+    uint32_t        mmap_cur;
+    struct isr_regs saved_regs;
+    uint32_t        saved_image_len;
+    uint32_t        saved_mmap_len;
+    char            cwd[VFS_MAX_PATH];
+    char            exe_path[VFS_MAX_PATH];
 };
 
 static struct linux_proc proc_table[MAX_PROCS];
 static int               cur_proc_idx = -1;
 static int               next_pid = 100;
 static uint32_t          saved_host_esp = 0;
+static uint32_t         *elf_pgdir = NULL;
+static uint32_t          elf_saved_esp0 = 0U;
+static volatile bool_t   elf_running = FALSE;
+static struct isr_regs   elf_resume_frame;
 
 /* Temporary kernel storage for sys_execve arguments across image replacement */
 #define STACK_GUARD_W0 0xDEADBEEFUL
@@ -365,8 +371,9 @@ static uint32_t          saved_host_esp = 0;
 
 extern uint32_t          kernel_stack_bottom[];
 extern uint32_t          kernel_stack_top[];
+extern uint32_t          exec_kstack_bottom[];
+extern uint32_t          exec_kstack_top[];
 
-static uint32_t          exec_kstack[8192]; /* 32 KiB dedicated execve kernel stack */
 static volatile bool_t   stack_guards_armed = FALSE;
 static volatile bool_t   user_stack_guard_armed = FALSE;
 static int               exec_argc_saved = 0;
@@ -405,7 +412,7 @@ static void stack_guard_panic(const char *ctx, const char *which)
 void stack_guard_init(void)
 {
     stack_guard_write(kernel_stack_bottom);
-    stack_guard_write(exec_kstack);
+    stack_guard_write(exec_kstack_bottom);
     user_stack_guard_armed = FALSE;
     stack_guards_armed = TRUE;
 }
@@ -424,7 +431,7 @@ void stack_guard_check(const char *ctx)
     if (!stack_guard_intact(kernel_stack_bottom)) {
         stack_guard_panic(ctx, "kernel_stack");
     }
-    if (!stack_guard_intact(exec_kstack)) {
+    if (!stack_guard_intact(exec_kstack_bottom)) {
         stack_guard_panic(ctx, "exec_kstack");
     }
     if (cur_proc_idx >= 0 && user_stack_guard_armed) {
@@ -620,242 +627,6 @@ static void fill_linux_statx(struct linux_statx *sx, const struct vfs_dirent *de
     sx->stx_rdev_minor  = de->rdev_minor;
     sx->stx_dev_major   = 0U;
     sx->stx_dev_minor   = 1U;
-}
-
-/*
- * Built-in user-space libc.so.6 functions invoked via PLT/GOT by dynamically
- * linked Linux i386 binaries (all system operations go through int $0x80).
- */
-static int user_errno_val = 0;
-
-static int *user_libc_errno_location(void)
-{
-    return &user_errno_val;
-}
-
-static size_t user_libc_strlen(const char *s)
-{
-    return (s != NULL) ? strlen(s) : 0U;
-}
-
-static int user_libc_strcmp(const char *a, const char *b)
-{
-    return strcmp(a, b);
-}
-
-static int user_libc_strncmp(const char *a, const char *b, size_t n)
-{
-    return strncmp(a, b, n);
-}
-
-static char *user_libc_strcpy(char *dst, const char *src)
-{
-    size_t len = strlen(src) + 1U;
-    memcpy(dst, src, len);
-    return dst;
-}
-
-static void *user_libc_memcpy(void *dst, const void *src, size_t n)
-{
-    return memcpy(dst, src, n);
-}
-
-static void *user_libc_memset(void *dst, int c, size_t n)
-{
-    return memset(dst, c, n);
-}
-
-static int32_t user_libc_write(int fd, const void *buf, uint32_t count)
-{
-    return linux_int80(LINUX_SYS_write, (uint32_t)fd, (uint32_t)(uintptr_t)buf, count, 0, 0);
-}
-
-static int32_t user_libc_read(int fd, void *buf, uint32_t count)
-{
-    return linux_int80(LINUX_SYS_read, (uint32_t)fd, (uint32_t)(uintptr_t)buf, count, 0, 0);
-}
-
-static int user_libc_open(const char *path, int flags, int mode)
-{
-    return (int)linux_int80(LINUX_SYS_openat, (uint32_t)LINUX_AT_FDCWD,
-                            (uint32_t)(uintptr_t)path, (uint32_t)flags, (uint32_t)mode, 0);
-}
-
-static int user_libc_close(int fd)
-{
-    return (int)linux_int80(LINUX_SYS_close, (uint32_t)fd, 0, 0, 0, 0);
-}
-
-static int32_t user_libc_lseek(int fd, int32_t offset, int whence)
-{
-    return linux_int80(LINUX_SYS_lseek, (uint32_t)fd, (uint32_t)offset, (uint32_t)whence, 0, 0);
-}
-
-static int user_libc_getpid(void)
-{
-    return (int)linux_int80(LINUX_SYS_getpid, 0, 0, 0, 0, 0);
-}
-
-static int user_libc_puts(const char *s)
-{
-    char nl = '\n';
-    size_t len;
-    if (s == NULL) {
-        s = "(null)";
-    }
-    len = strlen(s);
-    if (len > 0) {
-        (void)user_libc_write(1, s, (uint32_t)len);
-    }
-    (void)user_libc_write(1, &nl, 1U);
-    return (int)(len + 1U);
-}
-
-static int user_libc_putchar(int c)
-{
-    char ch = (char)c;
-    (void)user_libc_write(1, &ch, 1U);
-    return c;
-}
-
-static void *user_libc_malloc(size_t size)
-{
-    uint32_t cur_brk;
-    uint32_t new_brk;
-    uint32_t aligned = ((uint32_t)size + 15U) & ~15U;
-    if (aligned == 0) {
-        aligned = 16U;
-    }
-    cur_brk = (uint32_t)linux_int80(LINUX_SYS_brk, 0, 0, 0, 0, 0);
-    new_brk = (uint32_t)linux_int80(LINUX_SYS_brk, cur_brk + aligned, 0, 0, 0, 0);
-    if (new_brk < cur_brk + aligned) {
-        return NULL;
-    }
-    return (void *)(uintptr_t)cur_brk;
-}
-
-static void *user_libc_calloc(size_t nmemb, size_t size)
-{
-    size_t total = nmemb * size;
-    void *p = user_libc_malloc(total);
-    if (p != NULL) {
-        memset(p, 0, total);
-    }
-    return p;
-}
-
-static void user_libc_free(void *ptr)
-{
-    (void)ptr;
-}
-
-static void user_libc_exit(int status)
-{
-    (void)linux_int80(LINUX_SYS_exit_group, (uint32_t)status, 0, 0, 0, 0);
-}
-
-static void user_libc_cxa_finalize(void *d)
-{
-    (void)d;
-}
-
-typedef int (*libc_main_fn)(int, char **, char **);
-typedef void (*libc_init_fn)(void);
-
-static int user_libc_start_main(libc_main_fn main_fn, int argc, char **ubp_av,
-                                libc_init_fn init_fn, libc_init_fn fini_fn,
-                                libc_init_fn rtld_fini_fn, void *stack_end)
-{
-    char **envp;
-    int rc;
-
-    (void)fini_fn;
-    (void)rtld_fini_fn;
-    (void)stack_end;
-
-    if (init_fn != NULL) {
-        init_fn();
-    }
-    envp = (ubp_av != NULL) ? &ubp_av[argc + 1] : NULL;
-    rc = main_fn(argc, ubp_av, envp);
-    user_libc_exit(rc);
-    return rc;
-}
-
-struct libc_export {
-    const char *name;
-    uint32_t    addr;
-};
-
-static uint32_t lookup_builtin_libc_symbol(const char *name)
-{
-    if (name == NULL || name[0] == '\0') {
-        return 0;
-    }
-    if (strcmp(name, "__libc_start_main") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_start_main;
-    }
-    if (strcmp(name, "puts") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_puts;
-    }
-    if (strcmp(name, "putchar") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_putchar;
-    }
-    if (strcmp(name, "write") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_write;
-    }
-    if (strcmp(name, "read") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_read;
-    }
-    if (strcmp(name, "open") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_open;
-    }
-    if (strcmp(name, "close") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_close;
-    }
-    if (strcmp(name, "lseek") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_lseek;
-    }
-    if (strcmp(name, "getpid") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_getpid;
-    }
-    if (strcmp(name, "malloc") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_malloc;
-    }
-    if (strcmp(name, "calloc") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_calloc;
-    }
-    if (strcmp(name, "free") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_free;
-    }
-    if (strcmp(name, "strlen") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_strlen;
-    }
-    if (strcmp(name, "strcmp") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_strcmp;
-    }
-    if (strcmp(name, "strncmp") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_strncmp;
-    }
-    if (strcmp(name, "strcpy") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_strcpy;
-    }
-    if (strcmp(name, "memcpy") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_memcpy;
-    }
-    if (strcmp(name, "memset") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_memset;
-    }
-    if (strcmp(name, "exit") == 0 || strcmp(name, "_exit") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_exit;
-    }
-    if (strcmp(name, "__cxa_finalize") == 0 || strcmp(name, "__gmon_start__") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_cxa_finalize;
-    }
-    if (strcmp(name, "__errno_location") == 0) {
-        return (uint32_t)(uintptr_t)user_libc_errno_location;
-    }
-    return 0;
 }
 
 /* Populate /lib/ld-linux.so.2 in VFS as a valid 111-byte ET_DYN ELF32 interpreter */
@@ -1088,7 +859,6 @@ static uint32_t resolve_dyn_symbol(const char *sym_name, const struct elf_dyn_mo
                                    int num_mods, int start_mod, uint32_t *out_size)
 {
     int m;
-    uint32_t builtin;
 
     if (sym_name == NULL || sym_name[0] == '\0') {
         return 0;
@@ -1116,11 +886,7 @@ static uint32_t resolve_dyn_symbol(const char *sym_name, const struct elf_dyn_mo
         }
     }
 
-    builtin = lookup_builtin_libc_symbol(sym_name);
-    if (builtin != 0 && out_size != NULL) {
-        *out_size = 4U;
-    }
-    return builtin;
+    return 0;
 }
 
 static void apply_elf32_reloc_table(const struct elf_dyn_mod *mod,
@@ -1367,8 +1133,7 @@ static int load_elf32_into_proc(struct linux_proc *proc, const char *path,
         if (dyn_mods[0].strtab != NULL) {
             for (n_idx = 0; n_idx < dyn_mods[0].needed_cnt && num_mods < MAX_DYN_MODS; n_idx++) {
                 const char *soname = &dyn_mods[0].strtab[dyn_mods[0].needed_offs[n_idx]];
-                if (strcmp(soname, "libc.so.6") == 0 ||
-                    strcmp(soname, "ld-linux.so.2") == 0 ||
+                if (strcmp(soname, "ld-linux.so.2") == 0 ||
                     strcmp(soname, "/lib/ld-linux.so.2") == 0) {
                     continue;
                 }
@@ -1487,6 +1252,43 @@ static int load_elf32_into_proc(struct linux_proc *proc, const char *path,
     return 0;
 }
 
+static int setup_elf_user_pgdir(void)
+{
+    uint32_t *pgdir;
+
+    if (elf_pgdir != NULL) {
+        vm_switch(vm_get_kernel_pgdir());
+        vm_destroy_user_pgdir(elf_pgdir);
+        elf_pgdir = NULL;
+    }
+
+    pgdir = vm_create_user_pgdir();
+    if (pgdir == NULL) {
+        return -1;
+    }
+
+    /* Map Linux process address space [LINUX_VA_BASE .. LINUX_STACK_TOP) as Ring-3 RW */
+    if (vm_map_user_range(pgdir, LINUX_VA_BASE, LINUX_VA_BASE,
+                          LINUX_STACK_TOP - LINUX_VA_BASE, VM_PTE_U | VM_PTE_W) < 0) {
+        vm_destroy_user_pgdir(pgdir);
+        return -1;
+    }
+
+    /* Unmap 4 KiB hardware guard page immediately below LINUX_STACK_BOTTOM */
+    if (vm_unmap_user_page(pgdir, LINUX_STACK_BOTTOM - VM_PAGE_SIZE) < 0) {
+        vm_destroy_user_pgdir(pgdir);
+        return -1;
+    }
+
+    elf_pgdir = pgdir;
+    return 0;
+}
+
+bool_t syscall_is_elf_running(void)
+{
+    return elf_running;
+}
+
 int linux_elf_execve(const char *path, int argc, char **argv, char **envp)
 {
     int idx = -1;
@@ -1538,12 +1340,22 @@ int linux_elf_execve(const char *path, int argc, char **argv, char **envp)
         return -1;
     }
 
+    if (setup_elf_user_pgdir() < 0) {
+        kprintf("[ELF32] Failed to create Ring-3 page directory for \"%s\"\n", path);
+        proc->state = PROC_UNUSED;
+        return -1;
+    }
+
     cur_proc_idx = idx;
-    kprintf("[ELF32] Launching Linux i386 binary \"%s\" (PID %d, entry=0x%08x, esp=0x%08x)\n",
-            path, proc->pid, entry, user_esp);
+    kprintf("[ELF32] Launching Linux i386 binary \"%s\" in Ring 3 (PID %d, entry=0x%08x, esp=0x%08x, cr3=0x%08x)\n",
+            path, proc->pid, entry, user_esp, (uint32_t)(uintptr_t)elf_pgdir);
 
     sched_preempt_disable();
-    rc = linux_enter_elf(entry, user_esp, &saved_host_esp);
+    elf_saved_esp0 = tss_get_esp0();
+    tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
+    elf_running = TRUE;
+    vm_switch(elf_pgdir);
+    rc = linux_enter_ring3(entry, user_esp, &saved_host_esp);
     sched_preempt_enable();
     console_refresh();
     return rc;
@@ -1554,6 +1366,13 @@ static void handle_process_exit(int exit_code)
     struct linux_proc *proc;
 
     if (cur_proc_idx < 0 || cur_proc_idx >= MAX_PROCS) {
+        elf_running = FALSE;
+        vm_switch(vm_get_kernel_pgdir());
+        if (elf_pgdir != NULL) {
+            vm_destroy_user_pgdir(elf_pgdir);
+            elf_pgdir = NULL;
+        }
+        tss_set_esp0(elf_saved_esp0);
         linux_return_to_host(saved_host_esp, exit_code);
         return;
     }
@@ -1576,16 +1395,10 @@ static void handle_process_exit(int exit_code)
 
         if (parent_idx >= 0) {
             struct linux_proc *parent = &proc_table[parent_idx];
-            struct isr_regs *saved_regs_in_snap;
-            uint32_t regs_off;
 
-            if (parent->saved_regs_esp < LINUX_STACK_BOTTOM + 16U ||
-                parent->saved_regs_esp > LINUX_STACK_TOP - (uint32_t)sizeof(struct isr_regs)) {
-                stack_guard_panic("handle_process_exit", "parent_saved_regs_esp");
-            }
             cur_proc_idx = parent_idx;
 
-            /* Restore parent's code/data/brk and mmap regions */
+            /* Restore parent's code/data/brk, mmap, and Ring-3 stack safely from Ring-0 exec_kstack */
             if (parent->saved_image_len > 0) {
                 memcpy((void *)(uintptr_t)parent->load_low,
                        (const void *)(uintptr_t)SNAP_IMAGE_BASE,
@@ -1596,26 +1409,43 @@ static void handle_process_exit(int exit_code)
                        (const void *)(uintptr_t)SNAP_MMAP_BASE,
                        parent->saved_mmap_len);
             }
+            memcpy((void *)(uintptr_t)LINUX_STACK_BOTTOM,
+                   (const void *)(uintptr_t)SNAP_STACK_BASE,
+                   LINUX_STACK_SIZE);
 
-            /* Set parent's return value (eax = child_pid) in saved stack snapshot */
-            regs_off = parent->saved_regs_esp - LINUX_STACK_BOTTOM;
-            saved_regs_in_snap = (struct isr_regs *)(uintptr_t)(SNAP_STACK_BASE + regs_off);
-            saved_regs_in_snap->eax = (uint32_t)proc->pid;
-
-            /* Restore parent stack and iret directly into parent */
-            linux_restore_and_resume(LINUX_STACK_BOTTOM,
-                                     (const void *)(uintptr_t)SNAP_STACK_BASE,
-                                     LINUX_STACK_SIZE / 4U,
-                                     parent->saved_regs_esp);
+            /* Resume parent in Ring 3 with eax = child_pid */
+            elf_resume_frame     = parent->saved_regs;
+            elf_resume_frame.eax = (uint32_t)proc->pid;
+            tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
+            linux_resume_regs((uint32_t)(uintptr_t)&elf_resume_frame);
         }
     }
 
-    /* Clean up any remaining processes and return to host kernel (/bin/sh) */
+    /* Clean up Ring-3 address space, restore kernel CR3 & TSS ESP0, return to /bin/sh */
+    elf_running = FALSE;
     user_stack_guard_armed = FALSE;
+    vm_switch(vm_get_kernel_pgdir());
+    if (elf_pgdir != NULL) {
+        vm_destroy_user_pgdir(elf_pgdir);
+        elf_pgdir = NULL;
+    }
+    tss_set_esp0(elf_saved_esp0);
     net_close_all_user_sockets();
     memset(proc_table, 0, sizeof(proc_table));
     cur_proc_idx = -1;
     linux_return_to_host(saved_host_esp, exit_code);
+}
+
+void syscall_handle_user_fault(struct isr_regs *regs, uint32_t cr2)
+{
+    int sig = 11; /* SIGSEGV */
+    (void)cr2;
+    if (regs->int_no == 0U) {
+        sig = 8; /* SIGFPE */
+    } else if (regs->int_no == 6U) {
+        sig = 4; /* SIGILL */
+    }
+    handle_process_exit(128 + sig);
 }
 
 static int32_t do_openat(struct linux_proc *proc, int dirfd, const char *upath, uint32_t lflags)
@@ -1625,7 +1455,7 @@ static int32_t do_openat(struct linux_proc *proc, int dirfd, const char *upath, 
     int fd;
 
     (void)dirfd;
-    if (upath == NULL) {
+    if (upath == NULL || !vm_user_str_ok(elf_pgdir, (uint32_t)(uintptr_t)upath, VFS_MAX_PATH)) {
         return -LINUX_EFAULT;
     }
     resolve_user_path(proc->cwd, upath, abs_path, sizeof(abs_path));
@@ -1711,14 +1541,15 @@ static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32
         return -LINUX_ENOMEM;
     }
 
-    /* Snapshot parent's load+brk region, mmap region, and stack */
+    /* Snapshot parent's load+brk region, mmap region, user stack, and Ring-3 trapframe */
     parent->saved_image_len = parent->brk_cur - parent->load_low;
     parent->saved_mmap_len  = parent->mmap_cur - LINUX_MMAP_BASE;
-    if ((uint32_t)(uintptr_t)regs < LINUX_STACK_BOTTOM + 16U ||
-        (uint32_t)(uintptr_t)regs > LINUX_STACK_TOP - (uint32_t)sizeof(struct isr_regs)) {
+    if ((regs->cs & 3U) != 3U ||
+        regs->user_esp < LINUX_STACK_BOTTOM + 4096U ||
+        regs->user_esp > LINUX_STACK_TOP) {
         return -LINUX_EFAULT;
     }
-    parent->saved_regs_esp  = (uint32_t)(uintptr_t)regs;
+    parent->saved_regs = *regs;
 
     if (parent->saved_image_len > 0) {
         memcpy((void *)(uintptr_t)SNAP_IMAGE_BASE,
@@ -1745,13 +1576,9 @@ static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32
     cur_proc_idx = child_idx;
 
     if (child_stack != 0 &&
-        child_stack >= LINUX_VA_BASE + sizeof(struct isr_regs) &&
+        child_stack >= LINUX_VA_BASE + 4096U &&
         child_stack <= LINUX_STACK_TOP) {
-        uint32_t new_regs_esp = child_stack - (uint32_t)sizeof(struct isr_regs);
-        struct isr_regs *child_regs = (struct isr_regs *)(uintptr_t)new_regs_esp;
-        *child_regs = *regs;
-        child_regs->eax = 0U;
-        linux_resume_regs(new_regs_esp);
+        regs->user_esp = child_stack;
     }
 
     return 0; /* Child receives 0 in %eax */
@@ -1774,9 +1601,10 @@ static void do_execve_on_kstack(void)
         return;
     }
 
-    kprintf("[SYSCALL] SYS_execve(\"%s\") in PID %d -> entry=0x%08x\n",
+    kprintf("[SYSCALL] SYS_execve(\"%s\") in PID %d -> Ring 3 entry=0x%08x\n",
             exec_path_buf, proc->pid, entry);
-    (void)linux_enter_elf(entry, user_esp, NULL);
+    tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
+    (void)linux_enter_ring3(entry, user_esp, NULL);
 }
 
 static int32_t do_execve(struct linux_proc *proc, const char *ufilename,
@@ -1785,7 +1613,7 @@ static int32_t do_execve(struct linux_proc *proc, const char *ufilename,
     int argc = 0;
     int envc = 0;
 
-    if (ufilename == NULL) {
+    if (ufilename == NULL || !vm_user_str_ok(elf_pgdir, (uint32_t)(uintptr_t)ufilename, VFS_MAX_PATH)) {
         return -LINUX_EFAULT;
     }
 
@@ -1806,29 +1634,51 @@ static int32_t do_execve(struct linux_proc *proc, const char *ufilename,
     }
 
     if (uargv != NULL) {
-        while (uargv[argc] != NULL && argc < 16) {
-            size_t len = strlen(uargv[argc]);
-            if (len >= 63U) {
-                len = 63U;
+        while (argc < 16) {
+            if (!vm_user_range_ok(elf_pgdir, (uint32_t)(uintptr_t)&uargv[argc], 4U, FALSE)) {
+                return -LINUX_EFAULT;
             }
-            memcpy(exec_arg_Pool[argc], uargv[argc], len);
-            exec_arg_Pool[argc][len] = '\0';
-            exec_argv_ptrs[argc] = exec_arg_Pool[argc];
-            argc++;
+            if (uargv[argc] == NULL) {
+                break;
+            }
+            if (!vm_user_str_ok(elf_pgdir, (uint32_t)(uintptr_t)uargv[argc], 256U)) {
+                return -LINUX_EFAULT;
+            }
+            {
+                size_t len = strlen(uargv[argc]);
+                if (len >= 63U) {
+                    len = 63U;
+                }
+                memcpy(exec_arg_Pool[argc], uargv[argc], len);
+                exec_arg_Pool[argc][len] = '\0';
+                exec_argv_ptrs[argc] = exec_arg_Pool[argc];
+                argc++;
+            }
         }
     }
     exec_argv_ptrs[argc] = NULL;
 
     if (uenvp != NULL) {
-        while (uenvp[envc] != NULL && envc < 8) {
-            size_t len = strlen(uenvp[envc]);
-            if (len >= 63U) {
-                len = 63U;
+        while (envc < 8) {
+            if (!vm_user_range_ok(elf_pgdir, (uint32_t)(uintptr_t)&uenvp[envc], 4U, FALSE)) {
+                return -LINUX_EFAULT;
             }
-            memcpy(exec_env_Pool[envc], uenvp[envc], len);
-            exec_env_Pool[envc][len] = '\0';
-            exec_envp_ptrs[envc] = exec_env_Pool[envc];
-            envc++;
+            if (uenvp[envc] == NULL) {
+                break;
+            }
+            if (!vm_user_str_ok(elf_pgdir, (uint32_t)(uintptr_t)uenvp[envc], 256U)) {
+                return -LINUX_EFAULT;
+            }
+            {
+                size_t len = strlen(uenvp[envc]);
+                if (len >= 63U) {
+                    len = 63U;
+                }
+                memcpy(exec_env_Pool[envc], uenvp[envc], len);
+                exec_env_Pool[envc][len] = '\0';
+                exec_envp_ptrs[envc] = exec_env_Pool[envc];
+                envc++;
+            }
         }
     }
     exec_envp_ptrs[envc] = NULL;
@@ -1836,14 +1686,67 @@ static int32_t do_execve(struct linux_proc *proc, const char *ufilename,
     exec_argc_saved = argc;
     exec_envc_saved = envc;
 
-    linux_call_on_kstack(do_execve_on_kstack,
-                         (uint32_t)(uintptr_t)&exec_kstack[sizeof(exec_kstack) / sizeof(exec_kstack[0])]);
+    linux_call_on_kstack(do_execve_on_kstack, (uint32_t)(uintptr_t)exec_kstack_top);
     return 0;
+}
+
+/* Lightweight syscall handler for preemptively scheduled Ring-3 user tasks */
+static void syscall_dispatch_utask(struct isr_regs *regs)
+{
+    uint32_t *pgdir = sched_current_pgdir();
+    uint32_t nr   = regs->eax;
+    uint32_t arg1 = regs->ebx;
+    uint32_t arg2 = regs->ecx;
+    uint32_t arg3 = regs->edx;
+    int32_t  ret  = -LINUX_ENOSYS;
+
+    switch (nr) {
+    case LINUX_SYS_exit:
+    case LINUX_SYS_exit_group:
+        sched_mark_current_exit_isr((int)arg1);
+        ret = 0;
+        break;
+    case LINUX_SYS_getpid:
+        ret = sched_getpid();
+        break;
+    case LINUX_SYS_sched_yield:
+        sched_mark_current_yield_isr();
+        ret = 0;
+        break;
+    case LINUX_SYS_write:
+        if (arg3 == 0U) {
+            ret = 0;
+        } else if (!vm_user_range_ok(pgdir, arg2, arg3, FALSE)) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = vfs_write((int)arg1, (const void *)(uintptr_t)arg2, arg3);
+            if (ret < 0) {
+                ret = -LINUX_EBADF;
+            }
+        }
+        break;
+    case LINUX_SYS_read:
+        if (arg3 == 0U) {
+            ret = 0;
+        } else if (!vm_user_range_ok(pgdir, arg2, arg3, TRUE)) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = vfs_read((int)arg1, (void *)(uintptr_t)arg2, arg3);
+            if (ret < 0) {
+                ret = -LINUX_EBADF;
+            }
+        }
+        break;
+    default:
+        ret = -LINUX_ENOSYS;
+        break;
+    }
+
+    regs->eax = (uint32_t)ret;
 }
 
 void syscall_dispatch(struct isr_regs *regs)
 {
-    uint32_t regs_addr = (uint32_t)(uintptr_t)regs;
     uint32_t nr   = regs->eax;
     uint32_t arg1 = regs->ebx;
     uint32_t arg2 = regs->ecx;
@@ -1856,13 +1759,22 @@ void syscall_dispatch(struct isr_regs *regs)
 
     stack_guard_check("syscall");
 
-    /* Verify user %esp lies within the Linux process space with >=4 KiB headroom above guard */
-    if (regs_addr < LINUX_VA_BASE + 4096U ||
-        regs_addr > LINUX_STACK_TOP - (uint32_t)sizeof(struct isr_regs) ||
-        (regs_addr >= LINUX_STACK_BOTTOM && regs_addr < LINUX_STACK_BOTTOM + 4096U)) {
-        kprintf("[SYSCALL] Stack bounds violation (esp=0x%08x, nr=%u)\n", regs_addr, nr);
-        handle_process_exit(128 + 11);
+    /* Dispatch syscalls from isolated preemptive Ring-3 tasks */
+    if (!elf_running && sched_current_is_user()) {
+        syscall_dispatch_utask(regs);
         return;
+    }
+
+    /* Verify Ring-3 user %esp lies within the Linux process space with >=4 KiB headroom above guard */
+    if ((regs->cs & 3U) == 3U) {
+        uint32_t uesp = regs->user_esp;
+        if (uesp < LINUX_VA_BASE + 4096U ||
+            uesp > LINUX_STACK_TOP ||
+            (uesp >= LINUX_STACK_BOTTOM && uesp < LINUX_STACK_BOTTOM + 4096U)) {
+            kprintf("[SYSCALL] Ring-3 stack bounds violation (user_esp=0x%08x, nr=%u)\n", uesp, nr);
+            handle_process_exit(128 + 11);
+            return;
+        }
     }
 
     if (cur_proc_idx < 0 || cur_proc_idx >= MAX_PROCS) {
@@ -1886,7 +1798,7 @@ void syscall_dispatch(struct isr_regs *regs)
         char *buf = (char *)(uintptr_t)arg1;
         uint32_t size = arg2;
         size_t len = strlen(proc->cwd) + 1U;
-        if (buf == NULL) {
+        if (buf == NULL || !vm_user_range_ok(elf_pgdir, arg1, size, TRUE)) {
             ret = -LINUX_EFAULT;
         } else if (size < len) {
             ret = -LINUX_ERANGE;
@@ -1968,12 +1880,20 @@ void syscall_dispatch(struct isr_regs *regs)
         }
         if (req == LINUX_TIOCGWINSZ && arg3 != 0) {
             struct linux_winsize *ws = (struct linux_winsize *)(uintptr_t)arg3;
+            if (!vm_user_range_ok(elf_pgdir, arg3, (uint32_t)sizeof(*ws), TRUE)) {
+                ret = -LINUX_EFAULT;
+                break;
+            }
             ws->ws_row    = CON_ROWS;
             ws->ws_col    = CON_COLS;
             ws->ws_xpixel = (uint16_t)(CON_COLS * CON_CELL_W);
             ws->ws_ypixel = (uint16_t)(CON_ROWS * CON_CELL_H);
             ret = 0;
         } else if (req == LINUX_TCGETS && arg3 != 0) {
+            if (!vm_user_range_ok(elf_pgdir, arg3, 36U, TRUE)) {
+                ret = -LINUX_EFAULT;
+                break;
+            }
             memset((void *)(uintptr_t)arg3, 0, 36);
             ret = 0;
         } else if (req == LINUX_TCSETS || req == LINUX_TCSETSW ||
@@ -1988,7 +1908,7 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_unlink: {
         char abs_path[VFS_MAX_PATH];
-        if (arg1 == 0) {
+        if (arg1 == 0 || !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -1999,7 +1919,7 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_unlinkat: {
         char abs_path[VFS_MAX_PATH];
-        if (arg2 == 0) {
+        if (arg2 == 0 || !vm_user_str_ok(elf_pgdir, arg2, VFS_MAX_PATH)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2015,7 +1935,7 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_access: {
         char abs_path[VFS_MAX_PATH];
-        if (arg1 == 0) {
+        if (arg1 == 0 || !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2026,7 +1946,7 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_faccessat: {
         char abs_path[VFS_MAX_PATH];
-        if (arg2 == 0) {
+        if (arg2 == 0 || !vm_user_str_ok(elf_pgdir, arg2, VFS_MAX_PATH)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2065,6 +1985,10 @@ void syscall_dispatch(struct isr_regs *regs)
         } else {
             if (arg4 != 0) {
                 uint32_t *res64 = (uint32_t *)(uintptr_t)arg4;
+                if (!vm_user_range_ok(elf_pgdir, arg4, 8U, TRUE)) {
+                    ret = -LINUX_EFAULT;
+                    break;
+                }
                 res64[0] = (uint32_t)pos;
                 res64[1] = 0U;
             }
@@ -2076,6 +2000,8 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_read:
         if (arg3 == 0) {
             ret = 0;
+        } else if (!vm_user_range_ok(elf_pgdir, arg2, arg3, TRUE)) {
+            ret = -LINUX_EFAULT;
         } else if (net_is_socket_fd((int)arg1)) {
             ret = net_recv((int)arg1, (void *)(uintptr_t)arg2, arg3, 0U);
         } else {
@@ -2089,6 +2015,8 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_write:
         if (arg3 == 0) {
             ret = 0;
+        } else if (!vm_user_range_ok(elf_pgdir, arg2, arg3, FALSE)) {
+            ret = -LINUX_EFAULT;
         } else if (net_is_socket_fd((int)arg1)) {
             ret = net_send((int)arg1, (const void *)(uintptr_t)arg2, arg3, 0U);
         } else {
@@ -2105,14 +2033,22 @@ void syscall_dispatch(struct isr_regs *regs)
         int i;
         int32_t total = 0;
         bool_t is_sock = net_is_socket_fd((int)arg1);
-        if (iov == NULL || iovcnt < 0) {
+        if (iov == NULL || iovcnt < 0 || iovcnt > 64) {
             ret = -LINUX_EINVAL;
+            break;
+        }
+        if (iovcnt > 0 && !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)iovcnt * (uint32_t)sizeof(struct linux_iovec), FALSE)) {
+            ret = -LINUX_EFAULT;
             break;
         }
         for (i = 0; i < iovcnt; i++) {
             int32_t n;
             if (iov[i].iov_len == 0) {
                 continue;
+            }
+            if (!vm_user_range_ok(elf_pgdir, iov[i].iov_base, iov[i].iov_len, TRUE)) {
+                total = -LINUX_EFAULT;
+                break;
             }
             if (is_sock) {
                 n = net_recv((int)arg1, (void *)(uintptr_t)iov[i].iov_base, iov[i].iov_len,
@@ -2141,14 +2077,22 @@ void syscall_dispatch(struct isr_regs *regs)
         int i;
         int32_t total = 0;
         bool_t is_sock = net_is_socket_fd((int)arg1);
-        if (iov == NULL || iovcnt < 0) {
+        if (iov == NULL || iovcnt < 0 || iovcnt > 64) {
             ret = -LINUX_EINVAL;
+            break;
+        }
+        if (iovcnt > 0 && !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)iovcnt * (uint32_t)sizeof(struct linux_iovec), FALSE)) {
+            ret = -LINUX_EFAULT;
             break;
         }
         for (i = 0; i < iovcnt; i++) {
             int32_t n;
             if (iov[i].iov_len == 0) {
                 continue;
+            }
+            if (!vm_user_range_ok(elf_pgdir, iov[i].iov_base, iov[i].iov_len, FALSE)) {
+                total = -LINUX_EFAULT;
+                break;
             }
             if (is_sock) {
                 n = net_send((int)arg1, (const void *)(uintptr_t)iov[i].iov_base,
@@ -2172,7 +2116,9 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_lstat: {
         char abs_path[VFS_MAX_PATH];
         struct vfs_dirent de;
-        if (arg1 == 0 || arg2 == 0) {
+        if (arg1 == 0 || arg2 == 0 ||
+            !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH) ||
+            !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)sizeof(struct linux_stat), TRUE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2190,7 +2136,9 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_lstat64: {
         char abs_path[VFS_MAX_PATH];
         struct vfs_dirent de;
-        if (arg1 == 0 || arg2 == 0) {
+        if (arg1 == 0 || arg2 == 0 ||
+            !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH) ||
+            !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)sizeof(struct linux_stat64), TRUE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2208,7 +2156,9 @@ void syscall_dispatch(struct isr_regs *regs)
         char abs_path[VFS_MAX_PATH];
         struct vfs_dirent de;
         const char *upath = (const char *)(uintptr_t)arg2;
-        if (upath == NULL || arg3 == 0) {
+        if (upath == NULL || arg3 == 0 ||
+            !vm_user_str_ok(elf_pgdir, arg2, VFS_MAX_PATH) ||
+            !vm_user_range_ok(elf_pgdir, arg3, (uint32_t)sizeof(struct linux_stat64), TRUE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2231,7 +2181,7 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_fstat: {
         struct vfs_dirent de;
-        if (arg2 == 0) {
+        if (arg2 == 0 || !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)sizeof(struct linux_stat), TRUE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2256,7 +2206,7 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_fstat64: {
         struct vfs_dirent de;
-        if (arg2 == 0) {
+        if (arg2 == 0 || !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)sizeof(struct linux_stat64), TRUE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2284,7 +2234,11 @@ void syscall_dispatch(struct isr_regs *regs)
         char abs_path[VFS_MAX_PATH];
         struct vfs_dirent de;
         const char *upath = (const char *)(uintptr_t)arg2;
-        if (arg5 == 0) {
+        if (arg5 == 0 || !vm_user_range_ok(elf_pgdir, arg5, (uint32_t)sizeof(struct linux_statx), TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        if (upath != NULL && !vm_user_str_ok(elf_pgdir, arg2, VFS_MAX_PATH)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2324,7 +2278,15 @@ void syscall_dispatch(struct isr_regs *regs)
         const struct linux_timespec32 *req = (const struct linux_timespec32 *)(uintptr_t)arg1;
         struct linux_timespec32 *rem = (struct linux_timespec32 *)(uintptr_t)arg2;
         uint32_t ms;
-        if (req == NULL || req->tv_sec < 0 || req->tv_nsec < 0) {
+        if (req == NULL || !vm_user_range_ok(elf_pgdir, arg1, (uint32_t)sizeof(*req), FALSE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        if (rem != NULL && !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)sizeof(*rem), TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        if (req->tv_sec < 0 || req->tv_nsec < 0) {
             ret = -LINUX_EINVAL;
             break;
         }
@@ -2348,7 +2310,7 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_clock_gettime: {
         struct linux_timespec32 *tp = (struct linux_timespec32 *)(uintptr_t)arg2;
         uint32_t ticks = pit_get_ticks();
-        if (tp == NULL) {
+        if (tp == NULL || !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)sizeof(*tp), TRUE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2361,7 +2323,7 @@ void syscall_dispatch(struct isr_regs *regs)
     case LINUX_SYS_clock_gettime64: {
         struct linux_timespec64 *tp = (struct linux_timespec64 *)(uintptr_t)arg2;
         uint32_t ticks = pit_get_ticks();
-        if (tp == NULL) {
+        if (tp == NULL || !vm_user_range_ok(elf_pgdir, arg2, (uint32_t)sizeof(*tp), TRUE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2378,10 +2340,18 @@ void syscall_dispatch(struct isr_regs *regs)
         uint32_t *tz = (uint32_t *)(uintptr_t)arg2;
         uint32_t ticks = pit_get_ticks();
         if (tv != NULL) {
+            if (!vm_user_range_ok(elf_pgdir, arg1, (uint32_t)sizeof(*tv), TRUE)) {
+                ret = -LINUX_EFAULT;
+                break;
+            }
             tv->tv_sec  = (int32_t)(ticks / 1000U);
             tv->tv_usec = (int32_t)((ticks % 1000U) * 1000U);
         }
         if (tz != NULL) {
+            if (!vm_user_range_ok(elf_pgdir, arg2, 8U, TRUE)) {
+                ret = -LINUX_EFAULT;
+                break;
+            }
             tz[0] = 0U;
             tz[1] = 0U;
         }
@@ -2446,7 +2416,7 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_mmap: {
         const uint32_t *margs = (const uint32_t *)(uintptr_t)arg1;
-        if (margs == NULL) {
+        if (margs == NULL || !vm_user_range_ok(elf_pgdir, arg1, 24U, FALSE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2509,6 +2479,14 @@ void syscall_dispatch(struct isr_regs *regs)
             ret = -LINUX_ECHILD;
             break;
         }
+        if (wstatus != NULL && !vm_user_range_ok(elf_pgdir, arg2, 4U, TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        if (nr == LINUX_SYS_wait4 && rusage != NULL && !vm_user_range_ok(elf_pgdir, arg4, 72U, TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
         ret = proc_table[found_idx].pid;
         if (wstatus != NULL) {
             *wstatus = (proc_table[found_idx].exit_code & 0xFF) << 8;
@@ -2544,6 +2522,10 @@ void syscall_dispatch(struct isr_regs *regs)
             break;
         }
         if (infop != NULL) {
+            if (!vm_user_range_ok(elf_pgdir, arg3, (uint32_t)sizeof(*infop), TRUE)) {
+                ret = -LINUX_EFAULT;
+                break;
+            }
             memset(infop, 0, sizeof(*infop));
             infop->si_signo  = 17; /* SIGCHLD */
             infop->si_code   = 1;  /* CLD_EXITED */
@@ -2552,6 +2534,10 @@ void syscall_dispatch(struct isr_regs *regs)
             infop->si_status = proc_table[found_idx].exit_code;
         }
         if (rusage != NULL) {
+            if (!vm_user_range_ok(elf_pgdir, arg5, 72U, TRUE)) {
+                ret = -LINUX_EFAULT;
+                break;
+            }
             memset(rusage, 0, 72);
         }
         if ((options & LINUX_WNOWAIT) == 0) {
@@ -2569,36 +2555,67 @@ void syscall_dispatch(struct isr_regs *regs)
         break;
 
     case LINUX_SYS_bind:
-        ret = net_bind((int)arg1, (const struct sockaddr *)(uintptr_t)arg2, arg3);
+        if (arg2 == 0 || !vm_user_range_ok(elf_pgdir, arg2, arg3, FALSE)) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = net_bind((int)arg1, (const struct sockaddr *)(uintptr_t)arg2, arg3);
+        }
         break;
 
     case LINUX_SYS_connect:
-        ret = net_connect((int)arg1, (const struct sockaddr *)(uintptr_t)arg2, arg3);
+        if (arg2 == 0 || !vm_user_range_ok(elf_pgdir, arg2, arg3, FALSE)) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = net_connect((int)arg1, (const struct sockaddr *)(uintptr_t)arg2, arg3);
+        }
         break;
 
     case LINUX_SYS_getsockname:
-        ret = net_getsockname((int)arg1, (struct sockaddr *)(uintptr_t)arg2,
-                              (uint32_t *)(uintptr_t)arg3);
+        if (arg2 == 0 || arg3 == 0 ||
+            !vm_user_range_ok(elf_pgdir, arg3, 4U, TRUE) ||
+            !vm_user_range_ok(elf_pgdir, arg2, *(const uint32_t *)(uintptr_t)arg3, TRUE)) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = net_getsockname((int)arg1, (struct sockaddr *)(uintptr_t)arg2,
+                                  (uint32_t *)(uintptr_t)arg3);
+        }
         break;
 
     case LINUX_SYS_getpeername:
-        ret = net_getpeername((int)arg1, (struct sockaddr *)(uintptr_t)arg2,
-                              (uint32_t *)(uintptr_t)arg3);
+        if (arg2 == 0 || arg3 == 0 ||
+            !vm_user_range_ok(elf_pgdir, arg3, 4U, TRUE) ||
+            !vm_user_range_ok(elf_pgdir, arg2, *(const uint32_t *)(uintptr_t)arg3, TRUE)) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = net_getpeername((int)arg1, (struct sockaddr *)(uintptr_t)arg2,
+                                  (uint32_t *)(uintptr_t)arg3);
+        }
         break;
 
     case LINUX_SYS_sendto:
-        ret = net_sendto((int)arg1, (const void *)(uintptr_t)arg2, arg3, arg4,
-                         (const struct sockaddr *)(uintptr_t)arg5, arg6);
+        if ((arg3 > 0 && !vm_user_range_ok(elf_pgdir, arg2, arg3, FALSE)) ||
+            (arg5 != 0 && !vm_user_range_ok(elf_pgdir, arg5, arg6, FALSE))) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = net_sendto((int)arg1, (const void *)(uintptr_t)arg2, arg3, arg4,
+                             (const struct sockaddr *)(uintptr_t)arg5, arg6);
+        }
         break;
 
     case LINUX_SYS_recvfrom:
-        ret = net_recvfrom((int)arg1, (void *)(uintptr_t)arg2, arg3, arg4,
-                           (struct sockaddr *)(uintptr_t)arg5, (uint32_t *)(uintptr_t)arg6);
+        if ((arg3 > 0 && !vm_user_range_ok(elf_pgdir, arg2, arg3, TRUE)) ||
+            (arg6 != 0 && !vm_user_range_ok(elf_pgdir, arg6, 4U, TRUE)) ||
+            (arg5 != 0 && arg6 != 0 && !vm_user_range_ok(elf_pgdir, arg5, *(const uint32_t *)(uintptr_t)arg6, TRUE))) {
+            ret = -LINUX_EFAULT;
+        } else {
+            ret = net_recvfrom((int)arg1, (void *)(uintptr_t)arg2, arg3, arg4,
+                               (struct sockaddr *)(uintptr_t)arg5, (uint32_t *)(uintptr_t)arg6);
+        }
         break;
 
     case LINUX_SYS_socketcall: {
         const uint32_t *a = (const uint32_t *)(uintptr_t)arg2;
-        if (a == NULL) {
+        if (a == NULL || !vm_user_range_ok(elf_pgdir, arg2, 24U, FALSE)) {
             ret = -LINUX_EFAULT;
             break;
         }
@@ -2610,32 +2627,71 @@ void syscall_dispatch(struct isr_regs *regs)
             }
             break;
         case 2: /* SYS_BIND */
-            ret = net_bind((int)a[0], (const struct sockaddr *)(uintptr_t)a[1], a[2]);
+            if (a[1] == 0 || !vm_user_range_ok(elf_pgdir, a[1], a[2], FALSE)) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_bind((int)a[0], (const struct sockaddr *)(uintptr_t)a[1], a[2]);
+            }
             break;
         case 3: /* SYS_CONNECT */
-            ret = net_connect((int)a[0], (const struct sockaddr *)(uintptr_t)a[1], a[2]);
+            if (a[1] == 0 || !vm_user_range_ok(elf_pgdir, a[1], a[2], FALSE)) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_connect((int)a[0], (const struct sockaddr *)(uintptr_t)a[1], a[2]);
+            }
             break;
         case 6: /* SYS_GETSOCKNAME */
-            ret = net_getsockname((int)a[0], (struct sockaddr *)(uintptr_t)a[1],
-                                  (uint32_t *)(uintptr_t)a[2]);
+            if (a[1] == 0 || a[2] == 0 ||
+                !vm_user_range_ok(elf_pgdir, a[2], 4U, TRUE) ||
+                !vm_user_range_ok(elf_pgdir, a[1], *(const uint32_t *)(uintptr_t)a[2], TRUE)) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_getsockname((int)a[0], (struct sockaddr *)(uintptr_t)a[1],
+                                      (uint32_t *)(uintptr_t)a[2]);
+            }
             break;
         case 7: /* SYS_GETPEERNAME */
-            ret = net_getpeername((int)a[0], (struct sockaddr *)(uintptr_t)a[1],
-                                  (uint32_t *)(uintptr_t)a[2]);
+            if (a[1] == 0 || a[2] == 0 ||
+                !vm_user_range_ok(elf_pgdir, a[2], 4U, TRUE) ||
+                !vm_user_range_ok(elf_pgdir, a[1], *(const uint32_t *)(uintptr_t)a[2], TRUE)) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_getpeername((int)a[0], (struct sockaddr *)(uintptr_t)a[1],
+                                      (uint32_t *)(uintptr_t)a[2]);
+            }
             break;
         case 9: /* SYS_SEND */
-            ret = net_send((int)a[0], (const void *)(uintptr_t)a[1], a[2], a[3]);
+            if (a[2] > 0 && !vm_user_range_ok(elf_pgdir, a[1], a[2], FALSE)) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_send((int)a[0], (const void *)(uintptr_t)a[1], a[2], a[3]);
+            }
             break;
         case 10: /* SYS_RECV */
-            ret = net_recv((int)a[0], (void *)(uintptr_t)a[1], a[2], a[3]);
+            if (a[2] > 0 && !vm_user_range_ok(elf_pgdir, a[1], a[2], TRUE)) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_recv((int)a[0], (void *)(uintptr_t)a[1], a[2], a[3]);
+            }
             break;
         case 11: /* SYS_SENDTO */
-            ret = net_sendto((int)a[0], (const void *)(uintptr_t)a[1], a[2], a[3],
-                             (const struct sockaddr *)(uintptr_t)a[4], a[5]);
+            if ((a[2] > 0 && !vm_user_range_ok(elf_pgdir, a[1], a[2], FALSE)) ||
+                (a[4] != 0 && !vm_user_range_ok(elf_pgdir, a[4], a[5], FALSE))) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_sendto((int)a[0], (const void *)(uintptr_t)a[1], a[2], a[3],
+                                 (const struct sockaddr *)(uintptr_t)a[4], a[5]);
+            }
             break;
         case 12: /* SYS_RECVFROM */
-            ret = net_recvfrom((int)a[0], (void *)(uintptr_t)a[1], a[2], a[3],
-                               (struct sockaddr *)(uintptr_t)a[4], (uint32_t *)(uintptr_t)a[5]);
+            if ((a[2] > 0 && !vm_user_range_ok(elf_pgdir, a[1], a[2], TRUE)) ||
+                (a[5] != 0 && !vm_user_range_ok(elf_pgdir, a[5], 4U, TRUE)) ||
+                (a[4] != 0 && a[5] != 0 && !vm_user_range_ok(elf_pgdir, a[4], *(const uint32_t *)(uintptr_t)a[5], TRUE))) {
+                ret = -LINUX_EFAULT;
+            } else {
+                ret = net_recvfrom((int)a[0], (void *)(uintptr_t)a[1], a[2], a[3],
+                                   (struct sockaddr *)(uintptr_t)a[4], (uint32_t *)(uintptr_t)a[5]);
+            }
             break;
         case 13: /* SYS_SHUTDOWN */
             ret = net_is_socket_fd((int)a[0]) ? 0 : -LINUX_EBADF;
