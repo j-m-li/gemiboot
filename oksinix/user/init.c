@@ -186,11 +186,13 @@ int bin_init_main(int argc, char **argv)
     return vfs_exec("/bin/sh", 1, sh_argv);
 }
 
+extern const uint8_t bin_sh_elf_start[];
+extern const uint8_t bin_sh_elf_end[];
+
 void user_programs_init(void)
 {
+    uint32_t sh_size = (uint32_t)(bin_sh_elf_end - bin_sh_elf_start);
     (void)vfs_register_exec("/bin/init", bin_init_main, "Oksinix PID 1 init");
-    (void)vfs_register_exec("/bin/sh",   bin_sh_main,   "Oksinix interactive shell");
-    (void)vfs_register_exec("/bin/vi",   bin_vi_main,   "Oksinix modal vi editor");
-    (void)vfs_register_exec("/bin/cc",   bin_cc_main,   "c compiler");
-    kprintf("[VFS] Registered executables: /bin/init, /bin/sh, /bin/vi\n");
+    (void)vfs_register_rofile("/bin/sh", bin_sh_elf_start, sh_size);
+    kprintf("[VFS] Registered /bin/init (kernel) and /bin/sh (Ring-3 ELF32, %u bytes)\n", sh_size);
 }

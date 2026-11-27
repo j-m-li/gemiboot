@@ -52,6 +52,7 @@ void      sched_set_current_name(const char *name);
 
 bool_t    sched_current_is_user(void);
 uint32_t *sched_current_pgdir(void);
+void      sched_set_current_elf_vm(uint32_t *pgdir, uint32_t tss_esp0);
 bool_t    sched_current_needs_resched(void);
 void      sched_mark_current_exit_isr(int exit_code);
 void      sched_mark_current_yield_isr(void);

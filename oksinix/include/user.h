@@ -11,8 +11,5 @@
 
 void user_programs_init(void);
 int  bin_init_main(int argc, char **argv);
-int  bin_sh_main(int argc, char **argv);
-int  bin_vi_main(int argc, char **argv);
-int  bin_cc_main(int argc, char **argv);
 
 #endif /* OKSINIX_USER_H */

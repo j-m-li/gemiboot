@@ -11,6 +11,8 @@
 #include "acpi.h"
 #include "net.h"
 #include "vfs.h"
+#include "fat32.h"
+#include "xhci.h"
 #include "pit.h"
 #include "console.h"
 #include "serial.h"
@@ -139,10 +141,16 @@ static uint32_t linux_phys_base = 0x01000000U;
 #define LINUX_STACK_TOP      (linux_phys_base + 0x007F0000U)
 #define LINUX_STACK_SIZE     0x00020000U
 
-/* Snapshot buffers in upper 8 MiB of Linux physical window (+8 MiB .. +16 MiB) */
-#define SNAP_IMAGE_BASE      (linux_phys_base + 0x00800000U)
-#define SNAP_MMAP_BASE       (linux_phys_base + 0x00C00000U)
-#define SNAP_STACK_BASE      (linux_phys_base + 0x00F00000U)
+/* Multi-level snapshot slots in upper 8 MiB of Linux physical window (+8 MiB .. +16 MiB):
+ * 4 independent 2 MiB slots allow nested fork() + execve() (e.g. Ring-3 /bin/sh -> LINUX.ELF -> clone). */
+#define SNAP_MAX_SLOTS       4
+#define SNAP_SLOT_STRIDE     0x00200000U /* 2 MiB per slot */
+#define SNAP_IMAGE_MAX       0x00160000U /* 1408 KiB max image+brk per snapshot */
+#define SNAP_MMAP_MAX        0x00080000U /* 512 KiB max mmap per snapshot */
+#define SNAP_SLOT_BASE(s)    (linux_phys_base + 0x00800000U + (uint32_t)(s) * SNAP_SLOT_STRIDE)
+#define SNAP_IMAGE_ADDR(s)   (SNAP_SLOT_BASE(s) + 0x000000U)
+#define SNAP_MMAP_ADDR(s)    (SNAP_SLOT_BASE(s) + 0x160000U)
+#define SNAP_STACK_ADDR(s)   (SNAP_SLOT_BASE(s) + 0x1E0000U)
 
 struct elf32_ehdr {
     uint8_t  e_ident[16];
@@ -342,6 +350,7 @@ struct linux_proc {
     int             pid;
     int             ppid;
     int             exit_code;
+    int             snap_slot;
     bool_t          is_cloned_child;
     uint32_t        load_low;
     uint32_t        brk_start;
@@ -355,6 +364,7 @@ struct linux_proc {
 };
 
 static struct linux_proc proc_table[MAX_PROCS];
+static bool_t            snap_slot_used[SNAP_MAX_SLOTS];
 static int               cur_proc_idx = -1;
 static int               next_pid = 100;
 static uint32_t          saved_host_esp = 0;
@@ -957,6 +967,7 @@ void syscall_init(void)
     linux_phys_base = acpi_find_usable_ram(0x01000000U, 0x01000000U, 0x00100000U);
 
     memset(proc_table, 0, sizeof(proc_table));
+    memset(snap_slot_used, 0, sizeof(snap_slot_used));
     cur_proc_idx = -1;
 
     kprintf("[SYSCALL] Linux i386 ELF32 & int 0x80 ABI initialized (flat physical RAM: 0x%08x - 0x%08x via ACPI mmap)\n",
@@ -1310,13 +1321,14 @@ int linux_elf_execve(const char *path, int argc, char **argv, char **envp)
 
     proc = &proc_table[idx];
     memset(proc, 0, sizeof(*proc));
-    proc->state = PROC_RUNNING;
-    proc->pid   = next_pid++;
-    proc->ppid  = 2; /* /bin/sh */
+    proc->state           = PROC_RUNNING;
+    proc->pid             = next_pid++;
+    proc->ppid            = 1; /* /bin/init */
+    proc->snap_slot       = -1;
     proc->is_cloned_child = FALSE;
-    proc->cwd[0] = '/';
-    proc->cwd[1] = '\0';
-    if (path != NULL && path[0] == '/') {
+    proc->cwd[0]          = '/';
+    proc->cwd[1]          = '\0';
+    if (path != NULL && path[0] == '/' && strcmp(path, "/bin/sh") != 0) {
         const char *last_slash = NULL;
         const char *p = path;
         while (*p != '\0') {
@@ -1347,16 +1359,14 @@ int linux_elf_execve(const char *path, int argc, char **argv, char **envp)
     }
 
     cur_proc_idx = idx;
+    memset(snap_slot_used, 0, sizeof(snap_slot_used));
     kprintf("[ELF32] Launching Linux i386 binary \"%s\" in Ring 3 (PID %d, entry=0x%08x, esp=0x%08x, cr3=0x%08x)\n",
             path, proc->pid, entry, user_esp, (uint32_t)(uintptr_t)elf_pgdir);
 
-    sched_preempt_disable();
     elf_saved_esp0 = tss_get_esp0();
-    tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
     elf_running = TRUE;
-    vm_switch(elf_pgdir);
+    sched_set_current_elf_vm(elf_pgdir, (uint32_t)(uintptr_t)exec_kstack_top);
     rc = linux_enter_ring3(entry, user_esp, &saved_host_esp);
-    sched_preempt_enable();
     console_refresh();
     return rc;
 }
@@ -1365,14 +1375,16 @@ static void handle_process_exit(int exit_code)
 {
     struct linux_proc *proc;
 
+    sched_preempt_disable();
+
     if (cur_proc_idx < 0 || cur_proc_idx >= MAX_PROCS) {
         elf_running = FALSE;
-        vm_switch(vm_get_kernel_pgdir());
+        sched_set_current_elf_vm(vm_get_kernel_pgdir(), elf_saved_esp0);
         if (elf_pgdir != NULL) {
             vm_destroy_user_pgdir(elf_pgdir);
             elf_pgdir = NULL;
         }
-        tss_set_esp0(elf_saved_esp0);
+        sched_preempt_enable();
         linux_return_to_host(saved_host_esp, exit_code);
         return;
     }
@@ -1380,6 +1392,10 @@ static void handle_process_exit(int exit_code)
     proc = &proc_table[cur_proc_idx];
     kprintf("[SYSCALL] Process PID %d exited with code %d\n", proc->pid, exit_code);
     net_close_pid_sockets(proc->pid);
+    if (proc->snap_slot >= 0 && proc->snap_slot < SNAP_MAX_SLOTS) {
+        snap_slot_used[proc->snap_slot] = FALSE;
+        proc->snap_slot = -1;
+    }
 
     if (proc->is_cloned_child) {
         int parent_idx = -1;
@@ -1395,44 +1411,52 @@ static void handle_process_exit(int exit_code)
 
         if (parent_idx >= 0) {
             struct linux_proc *parent = &proc_table[parent_idx];
+            int slot = parent->snap_slot;
 
-            cur_proc_idx = parent_idx;
+            if (slot >= 0 && slot < SNAP_MAX_SLOTS) {
+                cur_proc_idx = parent_idx;
 
-            /* Restore parent's code/data/brk, mmap, and Ring-3 stack safely from Ring-0 exec_kstack */
-            if (parent->saved_image_len > 0) {
-                memcpy((void *)(uintptr_t)parent->load_low,
-                       (const void *)(uintptr_t)SNAP_IMAGE_BASE,
-                       parent->saved_image_len);
+                /* Restore parent's code/data/brk, mmap, and Ring-3 stack safely from Ring-0 exec_kstack */
+                if (parent->saved_image_len > 0) {
+                    memcpy((void *)(uintptr_t)parent->load_low,
+                           (const void *)(uintptr_t)SNAP_IMAGE_ADDR(slot),
+                           parent->saved_image_len);
+                }
+                if (parent->saved_mmap_len > 0) {
+                    memcpy((void *)(uintptr_t)LINUX_MMAP_BASE,
+                           (const void *)(uintptr_t)SNAP_MMAP_ADDR(slot),
+                           parent->saved_mmap_len);
+                }
+                memcpy((void *)(uintptr_t)LINUX_STACK_BOTTOM,
+                       (const void *)(uintptr_t)SNAP_STACK_ADDR(slot),
+                       LINUX_STACK_SIZE);
+
+                snap_slot_used[slot] = FALSE;
+                parent->snap_slot    = -1;
+
+                /* Resume parent in Ring 3 with eax = child_pid */
+                elf_resume_frame     = parent->saved_regs;
+                elf_resume_frame.eax = (uint32_t)proc->pid;
+                tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
+                sched_preempt_enable();
+                linux_resume_regs((uint32_t)(uintptr_t)&elf_resume_frame);
             }
-            if (parent->saved_mmap_len > 0) {
-                memcpy((void *)(uintptr_t)LINUX_MMAP_BASE,
-                       (const void *)(uintptr_t)SNAP_MMAP_BASE,
-                       parent->saved_mmap_len);
-            }
-            memcpy((void *)(uintptr_t)LINUX_STACK_BOTTOM,
-                   (const void *)(uintptr_t)SNAP_STACK_BASE,
-                   LINUX_STACK_SIZE);
-
-            /* Resume parent in Ring 3 with eax = child_pid */
-            elf_resume_frame     = parent->saved_regs;
-            elf_resume_frame.eax = (uint32_t)proc->pid;
-            tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
-            linux_resume_regs((uint32_t)(uintptr_t)&elf_resume_frame);
         }
     }
 
-    /* Clean up Ring-3 address space, restore kernel CR3 & TSS ESP0, return to /bin/sh */
+    /* Clean up Ring-3 address space, restore kernel CR3 & TSS ESP0, return to /bin/init */
     elf_running = FALSE;
     user_stack_guard_armed = FALSE;
-    vm_switch(vm_get_kernel_pgdir());
+    sched_set_current_elf_vm(vm_get_kernel_pgdir(), elf_saved_esp0);
     if (elf_pgdir != NULL) {
         vm_destroy_user_pgdir(elf_pgdir);
         elf_pgdir = NULL;
     }
-    tss_set_esp0(elf_saved_esp0);
     net_close_all_user_sockets();
     memset(proc_table, 0, sizeof(proc_table));
+    memset(snap_slot_used, 0, sizeof(snap_slot_used));
     cur_proc_idx = -1;
+    sched_preempt_enable();
     linux_return_to_host(saved_host_esp, exit_code);
 }
 
@@ -1528,8 +1552,11 @@ static int32_t do_mmap(struct linux_proc *proc, uint32_t addr, uint32_t len,
 static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32_t child_stack)
 {
     int child_idx = -1;
+    int slot = -1;
     int i;
     struct linux_proc *child;
+
+    sched_preempt_disable();
 
     for (i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_UNUSED) {
@@ -1537,7 +1564,14 @@ static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32
             break;
         }
     }
-    if (child_idx < 0) {
+    for (i = 0; i < SNAP_MAX_SLOTS; i++) {
+        if (!snap_slot_used[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (child_idx < 0 || slot < 0) {
+        sched_preempt_enable();
         return -LINUX_ENOMEM;
     }
 
@@ -1546,22 +1580,28 @@ static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32
     parent->saved_mmap_len  = parent->mmap_cur - LINUX_MMAP_BASE;
     if ((regs->cs & 3U) != 3U ||
         regs->user_esp < LINUX_STACK_BOTTOM + 4096U ||
-        regs->user_esp > LINUX_STACK_TOP) {
+        regs->user_esp > LINUX_STACK_TOP ||
+        parent->saved_image_len > SNAP_IMAGE_MAX ||
+        parent->saved_mmap_len > SNAP_MMAP_MAX) {
+        sched_preempt_enable();
         return -LINUX_EFAULT;
     }
-    parent->saved_regs = *regs;
+
+    snap_slot_used[slot] = TRUE;
+    parent->snap_slot    = slot;
+    parent->saved_regs   = *regs;
 
     if (parent->saved_image_len > 0) {
-        memcpy((void *)(uintptr_t)SNAP_IMAGE_BASE,
+        memcpy((void *)(uintptr_t)SNAP_IMAGE_ADDR(slot),
                (const void *)(uintptr_t)parent->load_low,
                parent->saved_image_len);
     }
     if (parent->saved_mmap_len > 0) {
-        memcpy((void *)(uintptr_t)SNAP_MMAP_BASE,
+        memcpy((void *)(uintptr_t)SNAP_MMAP_ADDR(slot),
                (const void *)(uintptr_t)LINUX_MMAP_BASE,
                parent->saved_mmap_len);
     }
-    memcpy((void *)(uintptr_t)SNAP_STACK_BASE,
+    memcpy((void *)(uintptr_t)SNAP_STACK_ADDR(slot),
            (const void *)(uintptr_t)LINUX_STACK_BOTTOM,
            LINUX_STACK_SIZE);
 
@@ -1571,6 +1611,7 @@ static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32
     child->pid             = next_pid++;
     child->ppid            = parent->pid;
     child->exit_code       = 0;
+    child->snap_slot       = -1;
     child->is_cloned_child = TRUE;
 
     cur_proc_idx = child_idx;
@@ -1581,6 +1622,7 @@ static int32_t do_clone(struct linux_proc *parent, struct isr_regs *regs, uint32
         regs->user_esp = child_stack;
     }
 
+    sched_preempt_enable();
     return 0; /* Child receives 0 in %eax */
 }
 
@@ -1597,13 +1639,15 @@ static void do_execve_on_kstack(void)
                               (exec_envc_saved > 0) ? exec_envp_ptrs : NULL,
                               &entry, &user_esp);
     if (rc < 0) {
+        sched_preempt_enable();
         handle_process_exit(127);
         return;
     }
 
-    kprintf("[SYSCALL] SYS_execve(\"%s\") in PID %d -> Ring 3 entry=0x%08x\n",
-            exec_path_buf, proc->pid, entry);
+    kprintf("[ELF32] Launching Linux i386 binary \"%s\" in Ring 3 (PID %d, entry=0x%08x, esp=0x%08x, cr3=0x%08x)\n",
+            exec_path_buf, proc->pid, entry, user_esp, (uint32_t)(uintptr_t)elf_pgdir);
     tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
+    sched_preempt_enable();
     (void)linux_enter_ring3(entry, user_esp, NULL);
 }
 
@@ -1618,10 +1662,7 @@ static int32_t do_execve(struct linux_proc *proc, const char *ufilename,
     }
 
     resolve_user_path(proc->cwd, ufilename, exec_path_buf, sizeof(exec_path_buf));
-    if ((strcmp(exec_path_buf, "/proc/self/exe") == 0 ||
-         strcmp(exec_path_buf, "/mnt/LINUX.ELF") == 0 ||
-         vfs_lookup(exec_path_buf) == NULL) &&
-        proc->exe_path[0] != '\0') {
+    if (strcmp(exec_path_buf, "/proc/self/exe") == 0 && proc->exe_path[0] != '\0') {
         size_t elen = strlen(proc->exe_path);
         if (elen >= sizeof(exec_path_buf)) {
             elen = sizeof(exec_path_buf) - 1U;
@@ -1686,6 +1727,7 @@ static int32_t do_execve(struct linux_proc *proc, const char *ufilename,
     exec_argc_saved = argc;
     exec_envc_saved = envc;
 
+    sched_preempt_disable();
     linux_call_on_kstack(do_execve_on_kstack, (uint32_t)(uintptr_t)exec_kstack_top);
     return 0;
 }
@@ -1759,8 +1801,8 @@ void syscall_dispatch(struct isr_regs *regs)
 
     stack_guard_check("syscall");
 
-    /* Dispatch syscalls from isolated preemptive Ring-3 tasks */
-    if (!elf_running && sched_current_is_user()) {
+    /* Dispatch syscalls from isolated preemptive Ring-3 tasks (must check BEFORE elf_running!) */
+    if (sched_current_is_user()) {
         syscall_dispatch_utask(regs);
         return;
     }
@@ -1808,6 +1850,91 @@ void syscall_dispatch(struct isr_regs *regs)
         }
         break;
     }
+
+    case LINUX_SYS_chdir: {
+        char abs_path[VFS_MAX_PATH];
+        struct vfs_dirent de;
+        if (arg1 == 0 || !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        resolve_user_path(proc->cwd, (const char *)(uintptr_t)arg1, abs_path, sizeof(abs_path));
+        if (vfs_stat(abs_path, &de) < 0 || de.type != VFS_TYPE_DIR) {
+            ret = -LINUX_ENOENT;
+            break;
+        }
+        {
+            size_t len = strlen(abs_path);
+            if (len >= sizeof(proc->cwd)) {
+                len = sizeof(proc->cwd) - 1U;
+            }
+            memcpy(proc->cwd, abs_path, len);
+            proc->cwd[len] = '\0';
+        }
+        ret = 0;
+        break;
+    }
+
+    case LINUX_SYS_mkdir: {
+        char abs_path[VFS_MAX_PATH];
+        if (arg1 == 0 || !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        resolve_user_path(proc->cwd, (const char *)(uintptr_t)arg1, abs_path, sizeof(abs_path));
+        ret = (vfs_mkdir(abs_path) == 0) ? 0 : -LINUX_EINVAL;
+        break;
+    }
+
+    case LINUX_SYS_mount: {
+        char src_path[VFS_MAX_PATH];
+        char dst_path[VFS_MAX_PATH];
+        int disk_idx = -1;
+        int mount_idx = -1;
+        int m;
+        if (arg1 == 0 || arg2 == 0 ||
+            !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH) ||
+            !vm_user_str_ok(elf_pgdir, arg2, VFS_MAX_PATH)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        devfs_sync_usb_storage();
+        resolve_user_path(proc->cwd, (const char *)(uintptr_t)arg1, src_path, sizeof(src_path));
+        resolve_user_path(proc->cwd, (const char *)(uintptr_t)arg2, dst_path, sizeof(dst_path));
+        if (strncmp(src_path, "/dev/sd", 7) == 0 && src_path[7] >= 'a' &&
+            src_path[7] < (char)('a' + XHCI_MAX_MSC_DEVS)) {
+            disk_idx = (int)(src_path[7] - 'a');
+        }
+        for (m = 0; m < FAT32_MAX_MOUNTS; m++) {
+            if (strcmp(dst_path, fat32_get_mount_point(m)) == 0) {
+                mount_idx = m;
+                break;
+            }
+        }
+        if (disk_idx < 0 || mount_idx < 0 || fat32_mount_disk(disk_idx, mount_idx) < 0) {
+            ret = -LINUX_EINVAL;
+        } else {
+            ret = 0;
+        }
+        break;
+    }
+
+    case LINUX_SYS_umount2: {
+        char dst_path[VFS_MAX_PATH];
+        if (arg1 == 0 || !vm_user_str_ok(elf_pgdir, arg1, VFS_MAX_PATH)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        resolve_user_path(proc->cwd, (const char *)(uintptr_t)arg1, dst_path, sizeof(dst_path));
+        ret = (fat32_umount_path(dst_path) == 0) ? 0 : -LINUX_EINVAL;
+        break;
+    }
+
+    case LINUX_SYS_reboot:
+        console_refresh();
+        acpi_shutdown();
+        ret = 0;
+        break;
 
     case LINUX_SYS_dup:
         ret = vfs_dup((int)arg1);
@@ -2383,6 +2510,9 @@ void syscall_dispatch(struct isr_regs *regs)
                 break;
             }
         }
+        if (!found && sched_kill(target_pid) == 0) {
+            found = 1;
+        }
         ret = found ? 0 : -LINUX_ESRCH;
         break;
     }
@@ -2709,6 +2839,10 @@ void syscall_dispatch(struct isr_regs *regs)
 
     case LINUX_SYS_set_tid_address:
         ret = proc->pid;
+        break;
+
+    case OKSINIX_SYS_ctl:
+        ret = oksinix_ctl_dispatch(elf_pgdir, proc->cwd, arg1, arg2, arg3, arg4);
         break;
 
     default:

@@ -314,6 +314,7 @@ def main():
             wait_for_serial(serial_log_path, "[/bin/init] Mounted FAT32 filesystem on /media3")
             wait_for_serial(serial_log_path, "[TEST] Preemptive multitasking self-test PASSED")
             wait_for_serial(serial_log_path, "[TEST] xv6-style hardware task protection self-test PASSED")
+            wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/bin/sh\" in Ring 3")
             wait_for_serial(serial_log_path, "oksinix:/# ")
             print("[PASS] 1/12 Boot, VGA 640x480, PCI xHCI, USB Hub, 4x USB storage auto-mounted (/mnt, /media1..3)")
 
@@ -369,16 +370,17 @@ def main():
             wait_for_serial(serial_log_path, "lfn-write-ok")
             print("[PASS] 4/11 FAT32 8.3 & VFAT LFN file/directory creation, 'cp', write & readback verified")
 
-            # 5. Test modal 'vi' editor: insert, visual 'v' + 'y' + 'p', join 'J', 'yy' + 'p', ':wq'
+            # 5. Test modal 'vi' editor (standalone Ring-3 /mnt/VI.ELF): insert, visual 'v' + 'y' + 'p', join 'J', 'yy' + 'p', ':wq'
             send_keys_str(sock, "vi /mnt/VITEST.TXT\n")
-            time.sleep(0.25)
+            wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/mnt/VI.ELF\" in Ring 3")
+            time.sleep(0.15)
             send_keys_str(sock, "iEdited with Oksinix vi!\nLine2\x1b0vlllyllllpkJyyp:wq\n")
             wait_for_serial(serial_log_path, '[VI] saved "/mnt/VITEST.TXT"')
             send_keys_str(sock, "cat /mnt/VITEST.TXT\n")
             serial_out = wait_for_serial(serial_log_path, "Edited with Oksinix vi! Line2Line")
             if serial_out.count("Edited with Oksinix vi! Line2Line") < 2:
                 raise RuntimeError("Expected 'yy' + 'p' to duplicate joined line in /mnt/VITEST.TXT")
-            print("[PASS] 5/11 Modal 'vi' editor (Insert, Visual 'v', 'y'/'yy', 'p', 'J', ':wq') verified on FAT32")
+            print("[PASS] 5/11 Modal 'vi' editor (Ring-3 /mnt/VI.ELF: Insert, Visual 'v', 'y'/'yy', 'p', 'J', ':wq') verified on FAT32")
 
             # 6. Verify 4x USB Mass Storage mounts (/mnt, /media1..3), raw /dev/sda..sdb, manual umount/mount, and hot-unplug auto-umount + hot-replug auto-mount
             send_keys_str(sock, "cat /dev/sda\n")
@@ -420,9 +422,12 @@ def main():
             wait_for_serial(serial_log_path, "at 0x01500000")
             wait_for_serial(serial_log_path, "[DYN] PT_INTERP \"/lib/ld-linux.so.2\" loaded at 0x01600000")
             wait_for_serial(serial_log_path, "[LINUX-DYN] Shared library LIBTEST.SO + libc.so.6 + PT_INTERP PASSED!")
+            send_keys_str(sock, "cc /mnt/HELLO.C\n")
+            wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/mnt/CC.ELF\" in Ring 3")
+            wait_for_serial(serial_log_path, "int main() {return 0;}")
             send_keys_str(sock, "prottest\n")
             wait_for_serial(serial_log_path, "Hardware task protection test (Ring 3 / paging / TSS) PASSED.")
-            print("[PASS] 7/10 Linux x86 32-bit Ring-3 static (/mnt/LINUX.ELF), dynamic (/mnt/DYN.ELF + LIBTEST.SO + libc.so.6) & 'prottest' verified")
+            print("[PASS] 7/10 Linux x86 32-bit Ring-3 static (/mnt/LINUX.ELF, /mnt/CC.ELF), dynamic (/mnt/DYN.ELF + LIBTEST.SO + libc.so.6) & 'prottest' verified")
 
             # 8. Test xHCI USB Ethernet (RNDIS) DHCP, ARP + ICMP Echo ping to QEMU SLIRP gateway 10.0.2.2
             send_keys_str(sock, "net\n")
@@ -434,10 +439,11 @@ def main():
             wait_for_serial(serial_log_path, "ICMP echo reply from 10.0.2.2: seq=1 OK")
             print("[PASS] 8/13 xHCI USB Ethernet (RNDIS) MAC query, DHCPv4 lease, ARP & ICMP ping to 10.0.2.2 verified")
 
-            # 8b. Test TCP + 'telnet [host [port]]' against local TCP server via QEMU SLIRP 10.0.2.2
+            # 8b. Test TCP + standalone Ring-3 'telnet [host [port]]' (/mnt/TELNET.ELF) against local TCP server via QEMU SLIRP 10.0.2.2
             telnet_port, telnet_srv, telnet_thr = start_mock_telnet_server()
             try:
                 send_keys_str(sock, f"telnet 10.0.2.2 {telnet_port}\n")
+                wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/mnt/TELNET.ELF\" in Ring 3")
                 wait_for_serial(serial_log_path, f"Connected to 10.0.2.2 (10.0.2.2:{telnet_port}).")
                 wait_for_serial(serial_log_path, "WELCOME TO OKSINIX TELNET TEST")
                 send_keys_str(sock, "hello-telnet\n")
@@ -449,7 +455,7 @@ def main():
                 time.sleep(0.15)
             finally:
                 telnet_thr.join(timeout=2.0)
-            print(f"[PASS] 8b/14 TCP client & 'telnet 10.0.2.2 {telnet_port}' (IAC negotiation, send/recv, FIN close) verified")
+            print(f"[PASS] 8b/14 Ring-3 TCP client '/mnt/TELNET.ELF' ('telnet 10.0.2.2 {telnet_port}': IAC negotiation, send/recv, FIN close, REPL) verified")
 
             # 9. Test xHCI USB Mouse (on Hub port 1.2) movement & button clicks
             send_hmp_cmd(sock, "mouse_move 35 -15", delay=0.1)

@@ -42,18 +42,19 @@ typedef int32_t (*vfs_write_fn)(struct vfs_node *node, uint32_t offset, uint32_t
 typedef int     (*vfs_exec_fn)(int argc, char **argv);
 
 struct vfs_node {
-    char         name[VFS_MAX_NAME];
-    uint32_t     inode;
-    uint32_t     type;
-    uint32_t     mode;
-    uint32_t     size;
-    uint16_t     rdev_major;
-    uint16_t     rdev_minor;
-    int32_t      parent_idx;
-    vfs_read_fn  read_op;
-    vfs_write_fn write_op;
-    vfs_exec_fn  exec_op;
-    uint8_t      data[VFS_MAX_FILE_SZ];
+    char           name[VFS_MAX_NAME];
+    uint32_t       inode;
+    uint32_t       type;
+    uint32_t       mode;
+    uint32_t       size;
+    uint16_t       rdev_major;
+    uint16_t       rdev_minor;
+    int32_t        parent_idx;
+    vfs_read_fn    read_op;
+    vfs_write_fn   write_op;
+    vfs_exec_fn    exec_op;
+    const uint8_t *ro_data;
+    uint8_t        data[VFS_MAX_FILE_SZ];
 };
 
 struct vfs_dirent {
@@ -73,6 +74,7 @@ void             devfs_sync_usb_storage(void);
 struct vfs_node *vfs_lookup(const char *path);
 int              vfs_mkdir(const char *path);
 int              vfs_create_file(const char *path, const char *content, uint32_t size);
+int              vfs_register_rofile(const char *path, const uint8_t *data, uint32_t size);
 int              vfs_register_chardev(const char *path, uint16_t major, uint16_t minor,
                                       vfs_read_fn read_op, vfs_write_fn write_op);
 int              vfs_register_blockdev(const char *path, uint16_t major, uint16_t minor,

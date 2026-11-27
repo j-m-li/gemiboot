@@ -352,6 +352,46 @@ int vfs_register_blockdev(const char *path, uint16_t major, uint16_t minor,
     return 0;
 }
 
+static int32_t vfs_rofile_read(struct vfs_node *node, uint32_t offset, uint32_t size, uint8_t *buf)
+{
+    uint32_t avail;
+    if (node == NULL || node->ro_data == NULL || offset >= node->size) {
+        return 0;
+    }
+    avail = node->size - offset;
+    if (size > avail) {
+        size = avail;
+    }
+    memcpy(buf, &node->ro_data[offset], size);
+    return (int32_t)size;
+}
+
+int vfs_register_rofile(const char *path, const uint8_t *data, uint32_t size)
+{
+    int32_t parent_idx;
+    char leaf[VFS_MAX_NAME];
+    int32_t idx;
+
+    if (data == NULL || split_parent_and_name(path, &parent_idx, leaf) < 0) {
+        return -1;
+    }
+    idx = find_child(parent_idx, leaf, strlen(leaf));
+    if (idx < 0) {
+        idx = alloc_node(leaf, VFS_TYPE_FILE, parent_idx);
+        if (idx < 0) {
+            return -1;
+        }
+    }
+    nodes[idx].type     = VFS_TYPE_FILE;
+    nodes[idx].mode     = 0755U;
+    nodes[idx].size     = size;
+    nodes[idx].ro_data  = data;
+    nodes[idx].read_op  = vfs_rofile_read;
+    nodes[idx].write_op = NULL;
+    nodes[idx].exec_op  = NULL;
+    return 0;
+}
+
 int vfs_register_exec(const char *path, vfs_exec_fn exec_op, const char *desc)
 {
     int32_t parent_idx;

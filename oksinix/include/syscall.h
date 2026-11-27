@@ -20,20 +20,25 @@
 #define LINUX_SYS_waitpid        7
 #define LINUX_SYS_unlink         10
 #define LINUX_SYS_execve         11
+#define LINUX_SYS_chdir          12
 #define LINUX_SYS_lseek          19
 #define LINUX_SYS_getpid         20
+#define LINUX_SYS_mount          21
 #define LINUX_SYS_getuid         24
 #define LINUX_SYS_access         33
 #define LINUX_SYS_kill           37
+#define LINUX_SYS_mkdir          39
 #define LINUX_SYS_dup            41
 #define LINUX_SYS_brk            45
 #define LINUX_SYS_getgid         47
 #define LINUX_SYS_geteuid        49
 #define LINUX_SYS_getegid        50
+#define LINUX_SYS_umount2        52
 #define LINUX_SYS_ioctl          54
 #define LINUX_SYS_fcntl          55
 #define LINUX_SYS_dup2           63
 #define LINUX_SYS_gettimeofday   78
+#define LINUX_SYS_reboot         88
 #define LINUX_SYS_mmap           90
 #define LINUX_SYS_munmap         91
 #define LINUX_SYS_ftruncate      93
@@ -81,10 +86,39 @@
 #define LINUX_SYS_statx          383
 #define LINUX_SYS_clock_gettime64 403
 
-void   syscall_init(void);
-void   syscall_dispatch(struct isr_regs *regs);
-int    linux_elf_execve(const char *path, int argc, char **argv, char **envp);
-bool_t syscall_is_elf_running(void);
-void   syscall_handle_user_fault(struct isr_regs *regs, uint32_t cr2);
+/* Oksinix kernel control syscall (for standalone Ring-3 system utilities) */
+#define OKSINIX_SYS_ctl          500
+
+#define OKS_CTL_SYNC_USB         1U
+#define OKS_CTL_STATUS_BAR       2U
+#define OKS_CTL_LSUSB            3U
+#define OKS_CTL_MEMMAP           4U
+#define OKS_CTL_NET              5U
+#define OKS_CTL_KEYMAP           6U
+#define OKS_CTL_MOUNT_LIST       7U
+#define OKS_CTL_MOUNT_ALL        8U
+#define OKS_CTL_PS               9U
+#define OKS_CTL_SPAWN            10U
+#define OKS_CTL_SCHEDTEST        11U
+#define OKS_CTL_PROTTEST         12U
+#define OKS_CTL_READDIR          13U
+#define OKS_CTL_STAT             14U
+
+struct oks_dirent_user {
+    char     name[128];
+    uint32_t inode;
+    uint32_t type;
+    uint32_t size;
+    uint16_t rdev_major;
+    uint16_t rdev_minor;
+};
+
+void    syscall_init(void);
+void    syscall_dispatch(struct isr_regs *regs);
+int     linux_elf_execve(const char *path, int argc, char **argv, char **envp);
+bool_t  syscall_is_elf_running(void);
+void    syscall_handle_user_fault(struct isr_regs *regs, uint32_t cr2);
+int32_t oksinix_ctl_dispatch(uint32_t *pgdir, const char *cwd, uint32_t op,
+                             uint32_t a1, uint32_t a2, uint32_t a3);
 
 #endif /* OKSINIX_SYSCALL_H */

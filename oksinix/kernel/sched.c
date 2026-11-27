@@ -39,6 +39,7 @@ struct sched_task {
     uint32_t       saved_esp;
     uint32_t       stack_base;
     uint32_t       stack_top;
+    uint32_t       tss_esp0;
     uint32_t       wake_tick;
     uint32_t       ticks;
     uint32_t       switches;
@@ -188,6 +189,7 @@ void sched_init(void)
     boot_t->pgdir      = vm_get_kernel_pgdir();
     boot_t->stack_base = (uint32_t)(uintptr_t)kernel_stack_bottom;
     boot_t->stack_top  = (uint32_t)(uintptr_t)kernel_stack_top;
+    boot_t->tss_esp0   = boot_t->stack_top;
     sched_copy_name(boot_t->name, "/bin/init");
 
     /* Slot 1: lowest-priority idle task (PID 0), scheduled only when no other task is READY */
@@ -211,6 +213,7 @@ void sched_init(void)
     idle_t->saved_esp  = (uint32_t)(uintptr_t)regs;
     idle_t->stack_base = (uint32_t)(uintptr_t)task_stack_bases[1];
     idle_t->stack_top  = top_addr;
+    idle_t->tss_esp0   = top_addr;
     idle_t->entry      = sched_idle_entry;
     idle_t->arg        = NULL;
     sched_copy_name(idle_t->name, "kidle");
@@ -278,6 +281,21 @@ uint32_t *sched_current_pgdir(void)
         return task_table[cur_task_idx].pgdir;
     }
     return vm_get_kernel_pgdir();
+}
+
+void sched_set_current_elf_vm(uint32_t *pgdir, uint32_t tss_esp0)
+{
+    uint32_t eflags = cpu_eflags();
+    cpu_cli();
+    if (cur_task_idx >= 0 && cur_task_idx < SCHED_MAX_TASKS) {
+        task_table[cur_task_idx].pgdir    = (pgdir != NULL) ? pgdir : vm_get_kernel_pgdir();
+        task_table[cur_task_idx].tss_esp0 = (tss_esp0 != 0U) ? tss_esp0 : task_table[cur_task_idx].stack_top;
+        tss_set_esp0(task_table[cur_task_idx].tss_esp0);
+        vm_switch(task_table[cur_task_idx].pgdir);
+    }
+    if ((eflags & 0x0200UL) != 0UL) {
+        cpu_sti();
+    }
 }
 
 bool_t sched_current_needs_resched(void)
@@ -364,6 +382,7 @@ int sched_spawn_ex(const char *name, sched_entry_t entry, void *arg, bool_t deta
     t->saved_esp  = (uint32_t)(uintptr_t)regs;
     t->stack_base = (uint32_t)(uintptr_t)task_stack_bases[slot];
     t->stack_top  = top_addr;
+    t->tss_esp0   = top_addr;
     t->entry      = entry;
     t->arg        = arg;
     sched_copy_name(t->name, name);
@@ -464,6 +483,7 @@ int sched_spawn_user_code(const char *name, const void *code, uint32_t code_len,
     t->saved_esp        = (uint32_t)(uintptr_t)regs;
     t->stack_base       = (uint32_t)(uintptr_t)task_stack_bases[slot];
     t->stack_top        = top_addr;
+    t->tss_esp0         = top_addr;
     sched_copy_name(t->name, name);
 
     if ((eflags & 0x0200UL) != 0UL) {
@@ -690,7 +710,7 @@ static uint32_t sched_switch_to(struct isr_regs *regs, int next_idx)
     total_ctx_switches++;
 
     /* xv6 switchuvm/switchkvm: update hardware TSS ESP0 and CR3 page directory */
-    tss_set_esp0(task_table[next_idx].stack_top);
+    tss_set_esp0(task_table[next_idx].tss_esp0);
     vm_switch(task_table[next_idx].pgdir);
 
     return task_table[next_idx].saved_esp;

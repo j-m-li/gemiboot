@@ -123,6 +123,9 @@ uint32_t isr_dispatch(struct isr_regs *regs)
         if ((regs->cs & 3U) == 3U) {
             kprintf("[TRAP] User Ring-3 fault #%u (err=0x%x, cr2=0x%08x, eip=0x%08x, esp=0x%08x) -> killing task\n",
                     regs->int_no, regs->err_code, cr2, regs->eip, regs->user_esp);
+            if (sched_current_is_user()) {
+                return sched_handle_user_fault(regs, cr2);
+            }
             if (syscall_is_elf_running()) {
                 syscall_handle_user_fault(regs, cr2);
                 return (uint32_t)(uintptr_t)regs;

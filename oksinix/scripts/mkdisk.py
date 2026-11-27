@@ -53,7 +53,8 @@ def make_dirent_lfn(long_name, name83, attr, cluster, size):
 
 
 def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
-                          shlib_so_bytes=b"", libc_so_bytes=b""):
+                          shlib_so_bytes=b"", libc_so_bytes=b"", cc_elf_bytes=b"",
+                          vi_elf_bytes=b"", telnet_elf_bytes=b"", sh_elf_bytes=b""):
     part = bytearray(part_sectors * 512)
 
     bytes_per_sec = 512
@@ -131,6 +132,10 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
     dyn_start_clus = alloc_chain(dyn_elf_bytes)
     shlib_start_clus = alloc_chain(shlib_so_bytes)
     libc_start_clus = alloc_chain(libc_so_bytes)
+    cc_start_clus = alloc_chain(cc_elf_bytes)
+    vi_start_clus = alloc_chain(vi_elf_bytes)
+    telnet_start_clus = alloc_chain(telnet_elf_bytes)
+    sh_start_clus = alloc_chain(sh_elf_bytes)
 
     for idx, val in enumerate(fat_entries):
         struct.pack_into("<I", fat, idx * 4, val)
@@ -171,6 +176,18 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
         libc_ents = make_dirent_lfn("libc.so.6", b"LIBC_S~1SO ", 0x20, libc_start_clus, len(libc_so_bytes))
         root_dir[dir_pos:dir_pos + len(libc_ents)] = libc_ents
         dir_pos += len(libc_ents)
+    if cc_elf_bytes:
+        root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"CC      ELF", 0x20, cc_start_clus, len(cc_elf_bytes))
+        dir_pos += 32
+    if vi_elf_bytes:
+        root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"VI      ELF", 0x20, vi_start_clus, len(vi_elf_bytes))
+        dir_pos += 32
+    if telnet_elf_bytes:
+        root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"TELNET  ELF", 0x20, telnet_start_clus, len(telnet_elf_bytes))
+        dir_pos += 32
+    if sh_elf_bytes:
+        root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"SH      ELF", 0x20, sh_start_clus, len(sh_elf_bytes))
+        dir_pos += 32
     part[clus_off(2):clus_off(2) + 512] = root_dir
 
     # Populate Cluster 3 (README.TXT)
@@ -203,6 +220,14 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
         part[clus_off(shlib_start_clus):clus_off(shlib_start_clus) + len(shlib_so_bytes)] = shlib_so_bytes
     if libc_so_bytes:
         part[clus_off(libc_start_clus):clus_off(libc_start_clus) + len(libc_so_bytes)] = libc_so_bytes
+    if cc_elf_bytes:
+        part[clus_off(cc_start_clus):clus_off(cc_start_clus) + len(cc_elf_bytes)] = cc_elf_bytes
+    if vi_elf_bytes:
+        part[clus_off(vi_start_clus):clus_off(vi_start_clus) + len(vi_elf_bytes)] = vi_elf_bytes
+    if telnet_elf_bytes:
+        part[clus_off(telnet_start_clus):clus_off(telnet_start_clus) + len(telnet_elf_bytes)] = telnet_elf_bytes
+    if sh_elf_bytes:
+        part[clus_off(sh_start_clus):clus_off(sh_start_clus) + len(sh_elf_bytes)] = sh_elf_bytes
 
     return part
 
@@ -242,6 +267,10 @@ def main():
     dyn_elf_bytes = b""
     shlib_so_bytes = b""
     libc_so_bytes = b""
+    cc_elf_bytes = b""
+    vi_elf_bytes = b""
+    telnet_elf_bytes = b""
+    sh_elf_bytes = b""
     if len(sys.argv) >= 5:
         with open(sys.argv[4], "rb") as f:
             linux_elf_bytes = f.read()
@@ -254,9 +283,22 @@ def main():
     if len(sys.argv) >= 8:
         with open(sys.argv[7], "rb") as f:
             libc_so_bytes = f.read()
+    if len(sys.argv) >= 9:
+        with open(sys.argv[8], "rb") as f:
+            cc_elf_bytes = f.read()
+    if len(sys.argv) >= 10:
+        with open(sys.argv[9], "rb") as f:
+            vi_elf_bytes = f.read()
+    if len(sys.argv) >= 11:
+        with open(sys.argv[10], "rb") as f:
+            telnet_elf_bytes = f.read()
+    if len(sys.argv) >= 12:
+        with open(sys.argv[11], "rb") as f:
+            sh_elf_bytes = f.read()
 
     fat32_part = build_fat32_partition(part_sectors, linux_elf_bytes, dyn_elf_bytes,
-                                       shlib_so_bytes, libc_so_bytes)
+                                       shlib_so_bytes, libc_so_bytes, cc_elf_bytes,
+                                       vi_elf_bytes, telnet_elf_bytes, sh_elf_bytes)
 
     image = bytearray(total_size)
     image[0:512] = mbr_data

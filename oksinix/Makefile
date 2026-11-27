@@ -18,7 +18,8 @@ LDFLAGS := -m elf_i386 -T linker.ld -nostdlib
 
 ASM_SRCS := boot/boot.S \
             arch/x86/io.S \
-            arch/x86/isr.S
+            arch/x86/isr.S \
+            user/sh_embed.S
 
 C_SRCS   := arch/x86/gdt.c \
             arch/x86/pic.c \
@@ -44,13 +45,11 @@ C_SRCS   := arch/x86/gdt.c \
             fs/devfs.c \
             fs/fat32.c \
             user/init.c \
-            user/sh.c \
-            user/vi.c \
-            user/cc.c \
             lib/string.c \
             kernel/vm.c \
             kernel/net.c \
             kernel/sched.c \
+            kernel/sysctl.c \
             kernel/syscall.c \
             kernel/main.c
 
@@ -68,6 +67,15 @@ LIBC_ASM   := user/libc_syscall.o
 LIBC_SO    := user/libc.so.6
 DYN_OBJ    := user/linux_dyn.o
 DYN_ELF    := user/linux_dyn.elf
+CRT0_OBJ   := user/crt0.o
+CC_OBJ     := user/cc.o
+CC_ELF     := user/cc.elf
+VI_OBJ     := user/vi.o
+VI_ELF     := user/vi.elf
+TELNET_OBJ := user/telnet.o
+TELNET_ELF := user/telnet.elf
+SH_OBJ     := user/sh.o
+SH_ELF     := user/sh.elf
 BOOT_IMG   := oksinix.img
 USB_DISK   := usb_disk.img
 
@@ -114,8 +122,38 @@ $(DYN_OBJ): user/linux_dyn.c
 $(DYN_ELF): $(DYN_OBJ) $(SHLIB_SO) $(LIBC_SO)
 	$(LD) -m elf_i386 -pie -dynamic-linker /lib/ld-linux.so.2 --hash-style=sysv --strip-all -nostdlib -o $@ $(DYN_OBJ) $(SHLIB_SO) $(LIBC_SO)
 
-$(BOOT_IMG): $(MBR_BIN) $(KERNEL_BIN) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) scripts/mkdisk.py
-	python3 scripts/mkdisk.py $(MBR_BIN) $(KERNEL_BIN) $(BOOT_IMG) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO)
+$(CRT0_OBJ): user/crt0.S
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(CC_OBJ): user/cc.c
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -O2 -c $< -o $@
+
+$(CC_ELF): $(CRT0_OBJ) $(CC_OBJ) $(LIBC_ASM)
+	$(LD) -m elf_i386 -pie --hash-style=sysv --strip-all -nostdlib -o $@ $(CRT0_OBJ) $(CC_OBJ) $(LIBC_ASM)
+
+$(VI_OBJ): user/vi.c
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -O2 -c $< -o $@
+
+$(VI_ELF): $(CRT0_OBJ) $(VI_OBJ) $(LIBC_ASM)
+	$(LD) -m elf_i386 -pie --hash-style=sysv --strip-all -nostdlib -o $@ $(CRT0_OBJ) $(VI_OBJ) $(LIBC_ASM)
+
+$(TELNET_OBJ): user/telnet.c
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -O2 -c $< -o $@
+
+$(TELNET_ELF): $(CRT0_OBJ) $(TELNET_OBJ) $(LIBC_ASM)
+	$(LD) -m elf_i386 -pie --hash-style=sysv --strip-all -nostdlib -o $@ $(CRT0_OBJ) $(TELNET_OBJ) $(LIBC_ASM)
+
+$(SH_OBJ): user/sh.c
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -Os -c $< -o $@
+
+$(SH_ELF): $(CRT0_OBJ) $(SH_OBJ) $(LIBC_ASM)
+	$(LD) -m elf_i386 -pie --hash-style=sysv --strip-all -nostdlib -o $@ $(CRT0_OBJ) $(SH_OBJ) $(LIBC_ASM)
+
+user/sh_embed.o: user/sh_embed.S $(SH_ELF)
+	$(CC) $(ASFLAGS) -c user/sh_embed.S -o $@
+
+$(BOOT_IMG): $(MBR_BIN) $(KERNEL_BIN) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) $(CC_ELF) $(VI_ELF) $(TELNET_ELF) $(SH_ELF) scripts/mkdisk.py
+	python3 scripts/mkdisk.py $(MBR_BIN) $(KERNEL_BIN) $(BOOT_IMG) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) $(CC_ELF) $(VI_ELF) $(TELNET_ELF) $(SH_ELF)
 
 $(USB_DISK): $(BOOT_IMG)
 	cp $(BOOT_IMG) $(USB_DISK)
@@ -154,4 +192,4 @@ test: $(KERNEL_ELF) $(BOOT_IMG) $(USB_DISK)
 	python3 tests/test_qemu.py $(BOOT_IMG) $(USB_DISK) $(KERNEL_ELF)
 
 clean:
-	rm -f $(OBJS) *.img $(MBR_OBJ) $(MBR_BIN) $(LINUX_OBJ) $(LINUX_ELF) $(SHLIB_OBJ) $(SHLIB_SO) $(LIBC_OBJ) $(LIBC_ASM) $(LIBC_SO) $(DYN_OBJ) $(DYN_ELF) $(KERNEL_ELF) $(KERNEL_BIN) tests/*.ppm
+	rm -f $(OBJS) *.img $(MBR_OBJ) $(MBR_BIN) $(LINUX_OBJ) $(LINUX_ELF) $(SHLIB_OBJ) $(SHLIB_SO) $(LIBC_OBJ) $(LIBC_ASM) $(LIBC_SO) $(DYN_OBJ) $(DYN_ELF) $(CRT0_OBJ) $(CC_OBJ) $(CC_ELF) $(VI_OBJ) $(VI_ELF) $(TELNET_OBJ) $(TELNET_ELF) $(SH_OBJ) $(SH_ELF) $(KERNEL_ELF) $(KERNEL_BIN) tests/*.ppm

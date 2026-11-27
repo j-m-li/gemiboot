@@ -95,12 +95,13 @@ static int32_t dev_ttys0_write(struct vfs_node *node, uint32_t offset, uint32_t 
     return (int32_t)size;
 }
 
-/* /dev/kbd (13, 64) - PS/2 Keyboard raw event / scancode reader */
+/* /dev/kbd (13, 64) - PS/2 & USB Keyboard raw event / scancode reader */
 static int32_t dev_kbd_read(struct vfs_node *node, uint32_t offset, uint32_t size, uint8_t *buf)
 {
     struct key_event ev;
     (void)node;
     (void)offset;
+    xhci_poll();
     if (size < sizeof(struct key_event)) {
         if (size >= 1 && kbd_pop_event(&ev)) {
             buf[0] = ev.scancode;
