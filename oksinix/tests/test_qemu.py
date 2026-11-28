@@ -58,14 +58,58 @@ def start_mock_telnet_server():
     return port, srv, t
 
 
-def make_fat32_usb_image(out_path, label11, fname83, content_bytes, mbr_banner=None):
-    """Create a 128 KiB FAT32 USB disk image (with MBR partition at LBA 64)."""
-    total_sectors = 256
+def find_ccia_binary(tmpdir):
+    """Locate the ccia-i386 static-PIE compiler binary if available."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    oksinix_dir = os.path.dirname(script_dir)
+    repo_root = os.path.dirname(oksinix_dir)
+
+    candidates = []
+    env_bin = os.environ.get("CCIA_BIN")
+    if env_bin:
+        candidates.append(env_bin)
+    candidates.extend([
+        os.path.join(repo_root, "..", "ccia", "ccia-i386_stage3"),
+        os.path.join(oksinix_dir, "..", "ccia", "ccia-i386_stage3"),
+    ])
+    for path in candidates:
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+
+    # Fallback: extract ::ccia from gemiboot.img if present and mcopy is available
+    gemiboot_img = os.path.join(repo_root, "build", "gemiboot.img")
+    if os.path.isfile(gemiboot_img) and shutil.which("mcopy"):
+        extracted = os.path.join(tmpdir, "ccia_extracted")
+        res = subprocess.run(
+            ["mcopy", "-o", "-i", gemiboot_img, "::ccia", extracted],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0 and os.path.isfile(extracted) and os.path.getsize(extracted) > 0:
+            return extracted
+
+    return None
+
+
+def make_fat32_usb_image(out_path, label11, fname83, content_bytes, mbr_banner=None, extra_files=None):
+    """Create a FAT32 USB disk image (with MBR partition at LBA 64)."""
+    all_files = [(fname83, content_bytes)]
+    if extra_files:
+        all_files.extend(extra_files)
+
     part_lba = 64
-    part_secs = total_sectors - part_lba
     rsvd_sec = 32
     num_fats = 2
-    fat_sz = 4
+    if extra_files:
+        used_clus = sum(max(1, (len(data) + 511) // 512) for _, data in all_files)
+        data_clus = max(128, used_clus + 256)
+        fat_sz = max(4, ((data_clus + 3) * 4 + 511) // 512)
+        part_secs = rsvd_sec + num_fats * fat_sz + data_clus
+        total_sectors = part_lba + part_secs
+    else:
+        total_sectors = 256
+        part_secs = total_sectors - part_lba
+        fat_sz = 4
     img = bytearray(total_sectors * 512)
 
     # Sector 0: MBR with optional signature banner + FAT32 partition entry
@@ -94,24 +138,39 @@ def make_fat32_usb_image(out_path, label11, fname83, content_bytes, mbr_banner=N
     img[p0 + 510] = 0x55
     img[p0 + 511] = 0xAA
 
-    # FAT1 & FAT2: cluster 2 (root dir), cluster 3 (file)
+    # Build FAT cluster chains for root dir (cluster 2) and all files
+    fat_entries = [0x0FFFFFF8, 0x0FFFFFFF, 0x0FFFFFFF]
+    file_starts = []
+    for _, data in all_files:
+        start_c = len(fat_entries)
+        n_clus = max(1, (len(data) + 511) // 512)
+        for i in range(n_clus):
+            c = start_c + i
+            fat_entries.append((c + 1) if (i + 1 < n_clus) else 0x0FFFFFFF)
+        file_starts.append(start_c)
+
+    # Write FAT1 & FAT2
     for f in range(num_fats):
         foff = (part_lba + rsvd_sec + f * fat_sz) * 512
-        struct.pack_into("<IIII", img, foff, 0x0FFFFFF8, 0x0FFFFFFF, 0x0FFFFFFF, 0x0FFFFFFF)
+        for idx, val in enumerate(fat_entries):
+            struct.pack_into("<I", img, foff + idx * 4, val)
 
     data_lba = part_lba + rsvd_sec + num_fats * fat_sz
-    # Cluster 2 (root dir): volume label + 1 file entry
+    # Cluster 2 (root dir): volume label + file entries
     r_off = data_lba * 512
     img[r_off:r_off + 11] = label11
     img[r_off + 11] = 0x08
-    img[r_off + 32:r_off + 43] = fname83
-    img[r_off + 43] = 0x20
-    struct.pack_into("<H", img, r_off + 58, 3)
-    struct.pack_into("<I", img, r_off + 60, len(content_bytes))
+    dir_pos = 32
+    for (name83, data), start_c in zip(all_files, file_starts):
+        img[r_off + dir_pos:r_off + dir_pos + 11] = name83
+        img[r_off + dir_pos + 11] = 0x20
+        struct.pack_into("<H", img, r_off + dir_pos + 20, (start_c >> 16) & 0xFFFF)
+        struct.pack_into("<H", img, r_off + dir_pos + 26, start_c & 0xFFFF)
+        struct.pack_into("<I", img, r_off + dir_pos + 28, len(data))
+        dir_pos += 32
 
-    # Cluster 3 (file data)
-    f_off = (data_lba + 1) * 512
-    img[f_off:f_off + len(content_bytes)] = content_bytes
+        f_off = (data_lba + (start_c - 2)) * 512
+        img[f_off:f_off + len(data)] = data
 
     with open(out_path, "wb") as fp:
         fp.write(img)
@@ -120,10 +179,13 @@ def make_fat32_usb_image(out_path, label11, fname83, content_bytes, mbr_banner=N
 def send_hmp_cmd(sock, cmd, delay=0.06):
     sock.sendall((cmd + "\n").encode("ascii"))
     time.sleep(delay)
-    try:
-        sock.recv(4096)
-    except BlockingIOError:
-        pass
+    while True:
+        try:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+        except BlockingIOError:
+            break
 
 
 def send_keys_str(sock, text):
@@ -135,6 +197,7 @@ def send_keys_str(sock, text):
         "_": "shift-slash",
         ".": "dot",
         ":": "shift-dot",
+        "=": "shift-0",
         "!": "shift-bracket_right",
         ">": "shift-less",
         "y": "z",
@@ -151,7 +214,8 @@ def send_keys_str(sock, text):
             k = f"shift-{ch.lower()}"
         else:
             k = ch
-        send_hmp_cmd(sock, f"sendkey {k} 25", delay=0.05)
+        delay = 0.075 if k.startswith("shift-") else 0.055
+        send_hmp_cmd(sock, f"sendkey {k} 30", delay=delay)
 
 
 def wait_for_serial(serial_path, substring, timeout=6.0):
@@ -167,6 +231,23 @@ def wait_for_serial(serial_path, substring, timeout=6.0):
         data = f.read()
     raise RuntimeError(
         f"Timed out waiting for '{substring}' in serial log.\n--- Serial Output ---\n{data}"
+    )
+
+
+def wait_for_serial_after(serial_path, anchor, substring, timeout=15.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(serial_path):
+            with open(serial_path, "r", errors="replace") as f:
+                data = f.read()
+            idx = data.rfind(anchor)
+            if idx != -1 and substring in data[idx:]:
+                return data[idx:]
+        time.sleep(0.05)
+    with open(serial_path, "r", errors="replace") as f:
+        data = f.read()
+    raise RuntimeError(
+        f"Timed out waiting for '{substring}' after '{anchor}' in serial log.\n--- Serial Output ---\n{data[-4000:]}"
     )
 
 
@@ -228,6 +309,28 @@ def main():
         usb_disk3_path = os.path.join(tmpdir, "usb_disk3_test.img")
         usb_disk4_path = os.path.join(tmpdir, "usb_disk4_test.img")
 
+        ccia_bin_path = find_ccia_binary(tmpdir)
+        media2_extra = []
+        if ccia_bin_path:
+            with open(ccia_bin_path, "rb") as fp:
+                ccia_bytes = fp.read()
+            ccia_test_c = (
+                b"#ifndef VAL\n"
+                b"#define VAL 7\n"
+                b"#endif\n"
+                b"int add(int a, int b) {\n"
+                b"    return a + b;\n"
+                b"}\n"
+                b"int main(void) {\n"
+                b"    const char *s = \"hi\";\n"
+                b"    return add(VAL, s[0] == 'h' ? 1 : 0);\n"
+                b"}\n"
+            )
+            media2_extra = [
+                (b"CCIA       ", ccia_bytes),
+                (b"CCIA    C  ", ccia_test_c),
+            ]
+
         # Copy usb_disk.img into temporary test working copy so writes don't dirty repo image
         shutil.copyfile(base_disk_path, usb_disk_path)
         make_fat32_usb_image(
@@ -238,6 +341,7 @@ def main():
         make_fat32_usb_image(
             usb_disk3_path, b"MEDIA2     ", b"DISK2   TXT",
             b"Hello from USB Mass Storage /media2!\n",
+            extra_files=media2_extra if media2_extra else None,
         )
         make_fat32_usb_image(
             usb_disk4_path, b"MEDIA3     ", b"DISK3   TXT",
@@ -425,9 +529,56 @@ def main():
             send_keys_str(sock, "cc /mnt/HELLO.C\n")
             wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/mnt/CC.ELF\" in Ring 3")
             wait_for_serial(serial_log_path, "int main() {return 0;}")
+            send_keys_str(sock, "as -o /mnt/T.O /mnt/DOCS/HELLO.S\n")
+            wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/mnt/AS.ELF\" in Ring 3")
+            time.sleep(0.5)
+            send_keys_str(sock, "ld -o /mnt/T.ELF /mnt/T.O\n")
+            wait_for_serial(serial_log_path, "[ELF32] Launching Linux i386 binary \"/mnt/LD.ELF\" in Ring 3")
+            time.sleep(0.5)
+            send_keys_str(sock, "/mnt/T.ELF\n")
+            wait_for_serial(serial_log_path, "Hello from Oksinix as+ld!")
             send_keys_str(sock, "prottest\n")
             wait_for_serial(serial_log_path, "Hardware task protection test (Ring 3 / paging / TSS) PASSED.")
-            print("[PASS] 7/10 Linux x86 32-bit Ring-3 static (/mnt/LINUX.ELF, /mnt/CC.ELF), dynamic (/mnt/DYN.ELF + LIBTEST.SO + libc.so.6) & 'prottest' verified")
+            print("[PASS] 7/10 Linux x86 32-bit Ring-3 static (/mnt/LINUX.ELF, /mnt/CC.ELF, /mnt/AS.ELF + /mnt/LD.ELF), dynamic (/mnt/DYN.ELF + LIBTEST.SO + libc.so.6) & 'prottest' verified")
+
+            # 7b. Test standalone Ring-3 C90 compiler 'ccia' (/mnt/CCIA via 'ccia' & /media2/CCIA): -v, -E -DVAL=42, -S -DVAL=42, and /mnt/HELLO.C
+            if ccia_bin_path:
+                send_keys_str(sock, "ccia -v\n")
+                out = wait_for_serial_after(serial_log_path, '[SH] exec="ccia -v"', "exited with code 0")
+                if '[ELF32] Launching Linux i386 binary "/mnt/CCIA" in Ring 3' not in out or "ccia-i386 version" not in out:
+                    raise RuntimeError(f"Unexpected output from ccia -v (/mnt/CCIA):\n{out}")
+                send_keys_str(sock, "/media2/CCIA -v\n")
+                out = wait_for_serial_after(serial_log_path, '[SH] exec="/media2/CCIA -v"', "exited with code 0")
+                if '[ELF32] Launching Linux i386 binary "/media2/CCIA" in Ring 3' not in out or "ccia-i386 version" not in out:
+                    raise RuntimeError(f"Unexpected output from /media2/CCIA -v:\n{out}")
+                send_keys_str(sock, "/media2/CCIA -E -DVAL=42 /media2/CCIA.C -o /media2/CCIA.I\n")
+                wait_for_serial_after(serial_log_path, '[SH] exec="/media2/CCIA -E -DVAL=42 /media2/CCIA.C -o /media2/CCIA.I"', "exited with code 0")
+                send_keys_str(sock, "cat /media2/CCIA.I\n")
+                wait_for_serial_after(serial_log_path, '[SH] exec="cat /media2/CCIA.I"', "add ( 42 ,")
+                send_keys_str(sock, "/media2/CCIA -S -DVAL=42 /media2/CCIA.C -o /media2/CCIA.S\n")
+                wait_for_serial_after(serial_log_path, '[SH] exec="/media2/CCIA -S -DVAL=42 /media2/CCIA.C -o /media2/CCIA.S"', "exited with code 0")
+                send_keys_str(sock, "cat /media2/CCIA.S\n")
+                asm_out = wait_for_serial_after(serial_log_path, '[SH] exec="cat /media2/CCIA.S"', ".section .note.GNU-stack")
+                for expected in (".section .rodata", ".globl add", ".globl main", "movl $42, %eax", "call add@PLT"):
+                    if expected not in asm_out:
+                        raise RuntimeError(f"Missing '{expected}' in ccia -S output:\n{asm_out}")
+                send_keys_str(sock, "/media2/CCIA -S /mnt/HELLO.C -o /mnt/HELLO.S\n")
+                wait_for_serial_after(serial_log_path, '[SH] exec="/media2/CCIA -S /mnt/HELLO.C -o /mnt/HELLO.S"', "exited with code 0")
+                send_keys_str(sock, "cat /mnt/HELLO.S\n")
+                hello_asm = wait_for_serial_after(serial_log_path, '[SH] exec="cat /mnt/HELLO.S"', ".section .note.GNU-stack")
+                if ".globl main" not in hello_asm or "ret" not in hello_asm:
+                    raise RuntimeError(f"Expected compiled assembly for /mnt/HELLO.C, got:\n{hello_asm}")
+                send_keys_str(sock, "cd /mnt\n")
+                time.sleep(0.15)
+                send_keys_str(sock, "as HELLO.S\n")
+                wait_for_serial_after(serial_log_path, '[SH] exec="as HELLO.S"', "exited with code 0")
+                send_keys_str(sock, "as -o CCIA.O /media2/CCIA.S\n")
+                wait_for_serial_after(serial_log_path, '[SH] exec="as -o CCIA.O /media2/CCIA.S"', "exited with code 0")
+                send_keys_str(sock, "cd /\n")
+                time.sleep(0.15)
+                print("[PASS] 7b/14 Ring-3 C90 compiler 'ccia' (/mnt/CCIA & /media2/CCIA: -v, -E -DVAL=42, -S -DVAL=42, /mnt/HELLO.C -> /mnt/HELLO.S -> 'as HELLO.S' & 'as CCIA.S') verified")
+            else:
+                print("[SKIP] 7b/14 ccia binary not found (set CCIA_BIN or build ../ccia/ccia-i386_stage3)")
 
             # 8. Test xHCI USB Ethernet (RNDIS) DHCP, ARP + ICMP Echo ping to QEMU SLIRP gateway 10.0.2.2
             send_keys_str(sock, "net\n")

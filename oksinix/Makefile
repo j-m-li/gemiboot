@@ -76,6 +76,12 @@ TELNET_OBJ := user/telnet.o
 TELNET_ELF := user/telnet.elf
 SH_OBJ     := user/sh.o
 SH_ELF     := user/sh.elf
+AS_OBJ     := user/as.o
+AS_ELF     := user/as.elf
+LD_OBJ     := user/ld.o
+LD_ELF     := user/ld.elf
+CCIA_FILE  := $(firstword $(wildcard $(CCIA_BIN) ../../ccia/ccia-i386_stage3 ../ccia/ccia-i386_stage3))
+CCIA_ARG   := $(if $(CCIA_FILE),--ccia $(CCIA_FILE),)
 BOOT_IMG   := oksinix.img
 USB_DISK   := usb_disk.img
 
@@ -152,8 +158,20 @@ $(SH_ELF): $(CRT0_OBJ) $(SH_OBJ) $(LIBC_ASM)
 user/sh_embed.o: user/sh_embed.S $(SH_ELF)
 	$(CC) $(ASFLAGS) -c user/sh_embed.S -o $@
 
-$(BOOT_IMG): $(MBR_BIN) $(KERNEL_BIN) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) $(CC_ELF) $(VI_ELF) $(TELNET_ELF) $(SH_ELF) scripts/mkdisk.py
-	python3 scripts/mkdisk.py $(MBR_BIN) $(KERNEL_BIN) $(BOOT_IMG) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) $(CC_ELF) $(VI_ELF) $(TELNET_ELF) $(SH_ELF)
+$(AS_OBJ): user/as.c
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -Os -c $< -o $@
+
+$(AS_ELF): $(CRT0_OBJ) $(AS_OBJ) $(LIBC_ASM)
+	$(LD) -m elf_i386 -pie --hash-style=sysv --strip-all -nostdlib -o $@ $(CRT0_OBJ) $(AS_OBJ) $(LIBC_ASM)
+
+$(LD_OBJ): user/ld.c
+	$(CC) -m32 -std=c89 -pedantic -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -mno-sse -mno-mmx -mno-sse2 -mno-80387 -msoft-float -fPIC -Os -c $< -o $@
+
+$(LD_ELF): $(CRT0_OBJ) $(LD_OBJ) $(LIBC_ASM)
+	$(LD) -m elf_i386 -pie --hash-style=sysv --strip-all -nostdlib -o $@ $(CRT0_OBJ) $(LD_OBJ) $(LIBC_ASM)
+
+$(BOOT_IMG): $(MBR_BIN) $(KERNEL_BIN) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) $(CC_ELF) $(VI_ELF) $(TELNET_ELF) $(SH_ELF) $(AS_ELF) $(LD_ELF) $(CCIA_FILE) scripts/mkdisk.py
+	python3 scripts/mkdisk.py $(MBR_BIN) $(KERNEL_BIN) $(BOOT_IMG) $(LINUX_ELF) $(DYN_ELF) $(SHLIB_SO) $(LIBC_SO) $(CC_ELF) $(VI_ELF) $(TELNET_ELF) $(SH_ELF) $(AS_ELF) $(LD_ELF) $(CCIA_ARG)
 
 $(USB_DISK): $(BOOT_IMG)
 	cp $(BOOT_IMG) $(USB_DISK)
@@ -192,4 +210,4 @@ test: $(KERNEL_ELF) $(BOOT_IMG) $(USB_DISK)
 	python3 tests/test_qemu.py $(BOOT_IMG) $(USB_DISK) $(KERNEL_ELF)
 
 clean:
-	rm -f $(OBJS) *.img $(MBR_OBJ) $(MBR_BIN) $(LINUX_OBJ) $(LINUX_ELF) $(SHLIB_OBJ) $(SHLIB_SO) $(LIBC_OBJ) $(LIBC_ASM) $(LIBC_SO) $(DYN_OBJ) $(DYN_ELF) $(CRT0_OBJ) $(CC_OBJ) $(CC_ELF) $(VI_OBJ) $(VI_ELF) $(TELNET_OBJ) $(TELNET_ELF) $(SH_OBJ) $(SH_ELF) $(KERNEL_ELF) $(KERNEL_BIN) tests/*.ppm
+	rm -f $(OBJS) *.img $(MBR_OBJ) $(MBR_BIN) $(LINUX_OBJ) $(LINUX_ELF) $(SHLIB_OBJ) $(SHLIB_SO) $(LIBC_OBJ) $(LIBC_ASM) $(LIBC_SO) $(DYN_OBJ) $(DYN_ELF) $(CRT0_OBJ) $(CC_OBJ) $(CC_ELF) $(VI_OBJ) $(VI_ELF) $(TELNET_OBJ) $(TELNET_ELF) $(SH_OBJ) $(SH_ELF) $(AS_OBJ) $(AS_ELF) $(LD_OBJ) $(LD_ELF) $(KERNEL_ELF) $(KERNEL_BIN) tests/*.ppm

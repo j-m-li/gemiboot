@@ -693,7 +693,7 @@ static void sh_execute_line(char *line)
     }
 
     if (sh_strcmp(argv[0], "help") == 0) {
-        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net telnet memmap acpi keymap ps kill spawn schedtest prottest uname uptime clear vi cc shutdown\n");
+        sh_puts("Built-in commands: help ls cd pwd cat cp echo stat mkdir mount umount lsusb net telnet memmap acpi keymap ps kill spawn schedtest prottest uname uptime clear vi cc ccia as ld shutdown\n");
     } else if (sh_strcmp(argv[0], "net") == 0) {
         (void)sys_ctl(OKS_CTL_NET, (uint32_t)argc, (uint32_t)argv, 0U);
     } else if (sh_strcmp(argv[0], "telnet") == 0 || sh_strcmp(argv[0], "/bin/telnet") == 0) {
@@ -838,6 +838,21 @@ static void sh_execute_line(char *line)
             }
         } else {
             sh_puts("usage: cc <file.c>\n");
+        }
+    } else if (sh_strcmp(argv[0], "as") == 0 || sh_strcmp(argv[0], "/bin/as") == 0) {
+        argv[0] = "/mnt/AS.ELF";
+        if (sh_run_child("/mnt/AS.ELF", argv, NULL) == 127) {
+            sh_puts("as: /mnt/AS.ELF not found\n");
+        }
+    } else if (sh_strcmp(argv[0], "ld") == 0 || sh_strcmp(argv[0], "/bin/ld") == 0) {
+        argv[0] = "/mnt/LD.ELF";
+        if (sh_run_child("/mnt/LD.ELF", argv, NULL) == 127) {
+            sh_puts("ld: /mnt/LD.ELF not found\n");
+        }
+    } else if (sh_strcmp(argv[0], "ccia") == 0 || sh_strcmp(argv[0], "/bin/ccia") == 0) {
+        argv[0] = "/mnt/CCIA";
+        if (sh_run_child("/mnt/CCIA", argv, NULL) == 127) {
+            sh_puts("ccia: /mnt/CCIA not found\n");
         }
     } else if (sh_strcmp(argv[0], "exit") == 0) {
         sys_exit(0);

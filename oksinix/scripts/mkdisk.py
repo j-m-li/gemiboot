@@ -54,7 +54,8 @@ def make_dirent_lfn(long_name, name83, attr, cluster, size):
 
 def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
                           shlib_so_bytes=b"", libc_so_bytes=b"", cc_elf_bytes=b"",
-                          vi_elf_bytes=b"", telnet_elf_bytes=b"", sh_elf_bytes=b""):
+                          vi_elf_bytes=b"", telnet_elf_bytes=b"", sh_elf_bytes=b"",
+                          as_elf_bytes=b"", ld_elf_bytes=b"", ccia_elf_bytes=b""):
     part = bytearray(part_sectors * 512)
 
     bytes_per_sec = 512
@@ -110,12 +111,14 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
     fat_entries = [
         0x0FFFFFF8,  # Cluster 0: media descriptor
         0x0FFFFFFF,  # Cluster 1: EOC
-        0x0FFFFFFF,  # Cluster 2: Root directory
-        0x0FFFFFFF,  # Cluster 3: README.TXT
-        0x0FFFFFFF,  # Cluster 4: HELLO.TXT
-        0x0FFFFFFF,  # Cluster 5: DOCS directory
-        0x0FFFFFFF,  # Cluster 6: DOCS/NOTES.TXT
-        0x0FFFFFFF,  # Cluster 7: DOCS/Long_Filename_Example.txt
+        0x00000003,  # Cluster 2: Root directory (sector 0 -> Cluster 3)
+        0x0FFFFFFF,  # Cluster 3: Root directory (sector 1, EOC)
+        0x0FFFFFFF,  # Cluster 4: README.TXT
+        0x0FFFFFFF,  # Cluster 5: HELLO.C
+        0x0FFFFFFF,  # Cluster 6: DOCS directory
+        0x0FFFFFFF,  # Cluster 7: DOCS/NOTES.TXT
+        0x0FFFFFFF,  # Cluster 8: DOCS/Long_Filename_Example.txt
+        0x0FFFFFFF,  # Cluster 9: DOCS/HELLO.S
     ]
     def alloc_chain(blob):
         if not blob:
@@ -136,6 +139,18 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
     vi_start_clus = alloc_chain(vi_elf_bytes)
     telnet_start_clus = alloc_chain(telnet_elf_bytes)
     sh_start_clus = alloc_chain(sh_elf_bytes)
+    as_start_clus = alloc_chain(as_elf_bytes)
+    ld_start_clus = alloc_chain(ld_elf_bytes)
+    ccia_start_clus = alloc_chain(ccia_elf_bytes)
+
+    max_data_clus = part_sectors - (rsvd_sec_cnt + num_fats * fat_sz_32) + 2
+    if len(fat_entries) > max_data_clus:
+        raise RuntimeError(
+            f"FAT32 partition full: need {len(fat_entries)} clusters, only {max_data_clus} available"
+        )
+
+    struct.pack_into("<I", fsinfo, 492, len(fat_entries))
+    part[512:1024] = fsinfo
 
     for idx, val in enumerate(fat_entries):
         struct.pack_into("<I", fat, idx * 4, val)
@@ -155,13 +170,28 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
     hello_bytes = b"int main() {return 0;}\n"
     notes_bytes = b"Subdirectory file inside FAT32 /mnt/DOCS/NOTES.TXT\n"
     lfn_doc_bytes = b"FAT32 Long File Name (VFAT LFN) read test passed!\n"
+    hello_s_bytes = (
+        b".section .data\n"
+        b"msg: .ascii \"Hello from Oksinix as+ld!\\n\"\n"
+        b".section .text\n"
+        b".global _start\n"
+        b"_start:\n"
+        b"    movl $4, %eax\n"
+        b"    movl $1, %ebx\n"
+        b"    movl $msg, %ecx\n"
+        b"    movl $26, %edx\n"
+        b"    int $0x80\n"
+        b"    movl $1, %eax\n"
+        b"    xorl %ebx, %ebx\n"
+        b"    int $0x80\n"
+    )
 
-    # Populate Cluster 2 (Root Directory)
-    root_dir = bytearray(512)
+    # Populate Clusters 2..3 (Root Directory, 32 entries)
+    root_dir = bytearray(1024)
     root_dir[0:32] = make_dirent_83(b"OKSINIXFAT ", 0x08, 0, 0)
-    root_dir[32:64] = make_dirent_83(b"README  TXT", 0x20, 3, len(readme_bytes))
-    root_dir[64:96] = make_dirent_83(b"HELLO   C  ", 0x20, 4, len(hello_bytes))
-    root_dir[96:128] = make_dirent_83(b"DOCS       ", 0x10, 5, 0)
+    root_dir[32:64] = make_dirent_83(b"README  TXT", 0x20, 4, len(readme_bytes))
+    root_dir[64:96] = make_dirent_83(b"HELLO   C  ", 0x20, 5, len(hello_bytes))
+    root_dir[96:128] = make_dirent_83(b"DOCS       ", 0x10, 6, 0)
     dir_pos = 128
     if linux_elf_bytes:
         root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"LINUX   ELF", 0x20, elf_start_clus, len(linux_elf_bytes))
@@ -188,30 +218,45 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
     if sh_elf_bytes:
         root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"SH      ELF", 0x20, sh_start_clus, len(sh_elf_bytes))
         dir_pos += 32
-    part[clus_off(2):clus_off(2) + 512] = root_dir
+    if as_elf_bytes:
+        root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"AS      ELF", 0x20, as_start_clus, len(as_elf_bytes))
+        dir_pos += 32
+    if ld_elf_bytes:
+        root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"LD      ELF", 0x20, ld_start_clus, len(ld_elf_bytes))
+        dir_pos += 32
+    if ccia_elf_bytes:
+        root_dir[dir_pos:dir_pos + 32] = make_dirent_83(b"CCIA       ", 0x20, ccia_start_clus, len(ccia_elf_bytes))
+        dir_pos += 32
+    part[clus_off(2):clus_off(2) + 512] = root_dir[0:512]
+    part[clus_off(3):clus_off(3) + 512] = root_dir[512:1024]
 
-    # Populate Cluster 3 (README.TXT)
-    part[clus_off(3):clus_off(3) + len(readme_bytes)] = readme_bytes
+    # Populate Cluster 4 (README.TXT)
+    part[clus_off(4):clus_off(4) + len(readme_bytes)] = readme_bytes
 
-    # Populate Cluster 4 (HELLO.TXT)
-    part[clus_off(4):clus_off(4) + len(hello_bytes)] = hello_bytes
+    # Populate Cluster 5 (HELLO.C)
+    part[clus_off(5):clus_off(5) + len(hello_bytes)] = hello_bytes
 
-    # Populate Cluster 5 (DOCS Directory)
+    # Populate Cluster 6 (DOCS Directory)
     docs_dir = bytearray(512)
-    docs_dir[0:32] = make_dirent_83(b".          ", 0x10, 5, 0)
+    docs_dir[0:32] = make_dirent_83(b".          ", 0x10, 6, 0)
     docs_dir[32:64] = make_dirent_83(b"..         ", 0x10, 0, 0)
-    docs_dir[64:96] = make_dirent_83(b"NOTES   TXT", 0x20, 6, len(notes_bytes))
-    lfn_ents = make_dirent_lfn("Long_Filename_Example.txt", b"LONG_F~1TXT", 0x20, 7, len(lfn_doc_bytes))
+    docs_dir[64:96] = make_dirent_83(b"NOTES   TXT", 0x20, 7, len(notes_bytes))
+    lfn_ents = make_dirent_lfn("Long_Filename_Example.txt", b"LONG_F~1TXT", 0x20, 8, len(lfn_doc_bytes))
     docs_dir[96:96 + len(lfn_ents)] = lfn_ents
-    part[clus_off(5):clus_off(5) + 512] = docs_dir
+    hs_pos = 96 + len(lfn_ents)
+    docs_dir[hs_pos:hs_pos + 32] = make_dirent_83(b"HELLO   S  ", 0x20, 9, len(hello_s_bytes))
+    part[clus_off(6):clus_off(6) + 512] = docs_dir
 
-    # Populate Cluster 6 (DOCS/NOTES.TXT)
-    part[clus_off(6):clus_off(6) + len(notes_bytes)] = notes_bytes
+    # Populate Cluster 7 (DOCS/NOTES.TXT)
+    part[clus_off(7):clus_off(7) + len(notes_bytes)] = notes_bytes
 
-    # Populate Cluster 7 (DOCS/Long_Filename_Example.txt)
-    part[clus_off(7):clus_off(7) + len(lfn_doc_bytes)] = lfn_doc_bytes
+    # Populate Cluster 8 (DOCS/Long_Filename_Example.txt)
+    part[clus_off(8):clus_off(8) + len(lfn_doc_bytes)] = lfn_doc_bytes
 
-    # Populate Clusters for LINUX.ELF, DYN.ELF, and LIBTEST.SO
+    # Populate Cluster 9 (DOCS/HELLO.S)
+    part[clus_off(9):clus_off(9) + len(hello_s_bytes)] = hello_s_bytes
+
+    # Populate Clusters for userland ELF binaries & shared libraries
     if linux_elf_bytes:
         part[clus_off(elf_start_clus):clus_off(elf_start_clus) + len(linux_elf_bytes)] = linux_elf_bytes
     if dyn_elf_bytes:
@@ -228,6 +273,12 @@ def build_fat32_partition(part_sectors, linux_elf_bytes=b"", dyn_elf_bytes=b"",
         part[clus_off(telnet_start_clus):clus_off(telnet_start_clus) + len(telnet_elf_bytes)] = telnet_elf_bytes
     if sh_elf_bytes:
         part[clus_off(sh_start_clus):clus_off(sh_start_clus) + len(sh_elf_bytes)] = sh_elf_bytes
+    if as_elf_bytes:
+        part[clus_off(as_start_clus):clus_off(as_start_clus) + len(as_elf_bytes)] = as_elf_bytes
+    if ld_elf_bytes:
+        part[clus_off(ld_start_clus):clus_off(ld_start_clus) + len(ld_elf_bytes)] = ld_elf_bytes
+    if ccia_elf_bytes:
+        part[clus_off(ccia_start_clus):clus_off(ccia_start_clus) + len(ccia_elf_bytes)] = ccia_elf_bytes
 
     return part
 
@@ -271,34 +322,58 @@ def main():
     vi_elf_bytes = b""
     telnet_elf_bytes = b""
     sh_elf_bytes = b""
-    if len(sys.argv) >= 5:
-        with open(sys.argv[4], "rb") as f:
+    as_elf_bytes = b""
+    ld_elf_bytes = b""
+    ccia_elf_bytes = b""
+    pos_args = []
+    idx = 1
+    while idx < len(sys.argv):
+        if sys.argv[idx] == "--ccia" and idx + 1 < len(sys.argv):
+            with open(sys.argv[idx + 1], "rb") as f:
+                ccia_elf_bytes = f.read()
+            idx += 2
+        else:
+            pos_args.append(sys.argv[idx])
+            idx += 1
+
+    if len(pos_args) >= 4:
+        with open(pos_args[3], "rb") as f:
             linux_elf_bytes = f.read()
-    if len(sys.argv) >= 6:
-        with open(sys.argv[5], "rb") as f:
+    if len(pos_args) >= 5:
+        with open(pos_args[4], "rb") as f:
             dyn_elf_bytes = f.read()
-    if len(sys.argv) >= 7:
-        with open(sys.argv[6], "rb") as f:
+    if len(pos_args) >= 6:
+        with open(pos_args[5], "rb") as f:
             shlib_so_bytes = f.read()
-    if len(sys.argv) >= 8:
-        with open(sys.argv[7], "rb") as f:
+    if len(pos_args) >= 7:
+        with open(pos_args[6], "rb") as f:
             libc_so_bytes = f.read()
-    if len(sys.argv) >= 9:
-        with open(sys.argv[8], "rb") as f:
+    if len(pos_args) >= 8:
+        with open(pos_args[7], "rb") as f:
             cc_elf_bytes = f.read()
-    if len(sys.argv) >= 10:
-        with open(sys.argv[9], "rb") as f:
+    if len(pos_args) >= 9:
+        with open(pos_args[8], "rb") as f:
             vi_elf_bytes = f.read()
-    if len(sys.argv) >= 11:
-        with open(sys.argv[10], "rb") as f:
+    if len(pos_args) >= 10:
+        with open(pos_args[9], "rb") as f:
             telnet_elf_bytes = f.read()
-    if len(sys.argv) >= 12:
-        with open(sys.argv[11], "rb") as f:
+    if len(pos_args) >= 11:
+        with open(pos_args[10], "rb") as f:
             sh_elf_bytes = f.read()
+    if len(pos_args) >= 12:
+        with open(pos_args[11], "rb") as f:
+            as_elf_bytes = f.read()
+    if len(pos_args) >= 13:
+        with open(pos_args[12], "rb") as f:
+            ld_elf_bytes = f.read()
+    if len(pos_args) >= 14 and not ccia_elf_bytes:
+        with open(pos_args[13], "rb") as f:
+            ccia_elf_bytes = f.read()
 
     fat32_part = build_fat32_partition(part_sectors, linux_elf_bytes, dyn_elf_bytes,
                                        shlib_so_bytes, libc_so_bytes, cc_elf_bytes,
-                                       vi_elf_bytes, telnet_elf_bytes, sh_elf_bytes)
+                                       vi_elf_bytes, telnet_elf_bytes, sh_elf_bytes,
+                                       as_elf_bytes, ld_elf_bytes, ccia_elf_bytes)
 
     image = bytearray(total_size)
     image[0:512] = mbr_data
