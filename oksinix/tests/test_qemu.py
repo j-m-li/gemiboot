@@ -151,7 +151,7 @@ def send_keys_str(sock, text):
             k = f"shift-{ch.lower()}"
         else:
             k = ch
-        send_hmp_cmd(sock, f"sendkey {k}", delay=0.05)
+        send_hmp_cmd(sock, f"sendkey {k} 25", delay=0.05)
 
 
 def wait_for_serial(serial_path, substring, timeout=6.0):

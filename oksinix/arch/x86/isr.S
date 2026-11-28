@@ -97,6 +97,9 @@ isr_common_stub:
     xorl %eax, %eax
     movw %ds, %ax
     pushl %eax
+    xorl %eax, %eax
+    movw %gs, %ax
+    pushl %eax
 
     movw $0x10, %ax
     movw %ax, %ds
@@ -108,11 +111,12 @@ isr_common_stub:
     call isr_dispatch
     movl %eax, %esp
 
+    popl %edx
     popl %eax
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %fs
-    movw %ax, %gs
+    movw %dx, %gs
 
     popal
     addl $8, %esp

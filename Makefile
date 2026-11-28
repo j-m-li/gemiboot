@@ -169,6 +169,7 @@ $(DISK_IMG): $(MKDISK) $(MBR_BIN) $(VBR_BIN) $(IOSYS_BIN) $(BOOTIA32_EFI) $(BOOT
 	mcopy ./oksinix/user/cc.elf -i build/gemiboot.img ::cc.elf
 	mcopy ./oksinix/user/sh.elf -i build/gemiboot.img ::sh.elf
 	mcopy ./oksinix/user/vi.elf -i build/gemiboot.img ::vi.elf
+	mcopy ../ccia/ccia-i386_stage3 -i build/gemiboot.img ::ccia
 	mcopy ./oksinix/user/telnet.elf -i build/gemiboot.img ::telnet.elf
 	@echo "[DISK] Created bootable image $(DISK_IMG)"
 

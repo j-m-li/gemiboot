@@ -345,23 +345,62 @@ struct linux_siginfo {
 #define PROC_ZOMBIE  2
 #define MAX_PROCS    8
 
-struct linux_proc {
-    int             state;
-    int             pid;
-    int             ppid;
-    int             exit_code;
-    int             snap_slot;
-    bool_t          is_cloned_child;
-    uint32_t        load_low;
-    uint32_t        brk_start;
-    uint32_t        brk_cur;
-    uint32_t        mmap_cur;
-    struct isr_regs saved_regs;
-    uint32_t        saved_image_len;
-    uint32_t        saved_mmap_len;
-    char            cwd[VFS_MAX_PATH];
-    char            exe_path[VFS_MAX_PATH];
+struct linux_user_desc {
+    uint32_t entry_number;
+    uint32_t base_addr;
+    uint32_t limit;
+    uint32_t flags;
 };
+
+struct linux_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+struct linux_tls_entry {
+    bool_t   used;
+    uint32_t base;
+    uint32_t limit;
+    bool_t   limit_in_pages;
+};
+
+struct linux_proc {
+    int                    state;
+    int                    pid;
+    int                    ppid;
+    int                    exit_code;
+    int                    snap_slot;
+    bool_t                 is_cloned_child;
+    uint32_t               load_low;
+    uint32_t               brk_start;
+    uint32_t               brk_cur;
+    uint32_t               mmap_cur;
+    struct isr_regs        saved_regs;
+    uint32_t               saved_image_len;
+    uint32_t               saved_mmap_len;
+    struct linux_tls_entry tls[3];
+    char                   cwd[VFS_MAX_PATH];
+    char                   exe_path[VFS_MAX_PATH];
+};
+
+static void proc_apply_tls(const struct linux_proc *proc)
+{
+    int i;
+    gdt_clear_tls();
+    if (proc == NULL) {
+        return;
+    }
+    for (i = 0; i < 3; i++) {
+        if (proc->tls[i].used) {
+            (void)gdt_set_tls(GDT_TLS_MIN + i, proc->tls[i].base,
+                              proc->tls[i].limit, proc->tls[i].limit_in_pages);
+        }
+    }
+}
 
 static struct linux_proc proc_table[MAX_PROCS];
 static bool_t            snap_slot_used[SNAP_MAX_SLOTS];
@@ -1127,8 +1166,13 @@ static int load_elf32_into_proc(struct linux_proc *proc, const char *path,
     proc->brk_start = page_align_up(max_vaddr);
     proc->brk_cur   = proc->brk_start;
     proc->mmap_cur  = LINUX_MMAP_BASE;
+    memset(proc->tls, 0, sizeof(proc->tls));
+    gdt_clear_tls();
 
-    /* Perform dynamic linking if PT_DYNAMIC is present */
+    /* Perform kernel-side dynamic linking ONLY for dynamically linked ELFs (PT_INTERP or DT_NEEDED).
+     * Pure static-PIE binaries (ET_DYN without PT_INTERP/DT_NEEDED) self-relocate their own
+     * R_386_RELATIVE entries in _start / _dl_relocate_static_pie; applying them here would
+     * double-add load_bias and corrupt every relocated pointer! */
     if (dyn_vaddr != 0 && dyn_size > 0) {
         int num_mods = 1;
         int n_idx;
@@ -1141,27 +1185,29 @@ static int load_elf32_into_proc(struct linux_proc *proc, const char *path,
         dyn_mods[0].dyn_size  = dyn_size;
         parse_elf32_dynamic(&dyn_mods[0]);
 
-        if (dyn_mods[0].strtab != NULL) {
-            for (n_idx = 0; n_idx < dyn_mods[0].needed_cnt && num_mods < MAX_DYN_MODS; n_idx++) {
-                const char *soname = &dyn_mods[0].strtab[dyn_mods[0].needed_offs[n_idx]];
-                if (strcmp(soname, "ld-linux.so.2") == 0 ||
-                    strcmp(soname, "/lib/ld-linux.so.2") == 0) {
-                    continue;
-                }
-                if (load_elf32_shlib(soname, &shlib_cur, &dyn_mods[num_mods], NULL) == 0) {
-                    kprintf("[DYN] Loaded shared library \"%s\" at 0x%08x\n",
-                            soname, dyn_mods[num_mods].load_bias);
-                    num_mods++;
+        if (has_interp || dyn_mods[0].needed_cnt > 0) {
+            if (dyn_mods[0].strtab != NULL) {
+                for (n_idx = 0; n_idx < dyn_mods[0].needed_cnt && num_mods < MAX_DYN_MODS; n_idx++) {
+                    const char *soname = &dyn_mods[0].strtab[dyn_mods[0].needed_offs[n_idx]];
+                    if (strcmp(soname, "ld-linux.so.2") == 0 ||
+                        strcmp(soname, "/lib/ld-linux.so.2") == 0) {
+                        continue;
+                    }
+                    if (load_elf32_shlib(soname, &shlib_cur, &dyn_mods[num_mods], NULL) == 0) {
+                        kprintf("[DYN] Loaded shared library \"%s\" at 0x%08x\n",
+                                soname, dyn_mods[num_mods].load_bias);
+                        num_mods++;
+                    }
                 }
             }
-        }
 
-        /* Apply relocations to shared libraries first, then to main executable */
-        for (m_idx = num_mods - 1; m_idx >= 0; m_idx--) {
-            apply_elf32_reloc_table(&dyn_mods[m_idx], dyn_mods[m_idx].rel,
-                                    dyn_mods[m_idx].rel_sz, dyn_mods, num_mods);
-            apply_elf32_reloc_table(&dyn_mods[m_idx], dyn_mods[m_idx].jmprel,
-                                    dyn_mods[m_idx].jmprel_sz, dyn_mods, num_mods);
+            /* Apply relocations to shared libraries first, then to main executable */
+            for (m_idx = num_mods - 1; m_idx >= 0; m_idx--) {
+                apply_elf32_reloc_table(&dyn_mods[m_idx], dyn_mods[m_idx].rel,
+                                        dyn_mods[m_idx].rel_sz, dyn_mods, num_mods);
+                apply_elf32_reloc_table(&dyn_mods[m_idx], dyn_mods[m_idx].jmprel,
+                                        dyn_mods[m_idx].jmprel_sz, dyn_mods, num_mods);
+            }
         }
     }
 
@@ -1249,7 +1295,7 @@ static int load_elf32_into_proc(struct linux_proc *proc, const char *path,
     *ustack++ = AT_PHDR;   *ustack++ = phdr_vaddr;
     *ustack++ = AT_PHENT;  *ustack++ = (uint32_t)ehdr.e_phentsize;
     *ustack++ = AT_PHNUM;  *ustack++ = (uint32_t)ehdr.e_phnum;
-    *ustack++ = AT_BASE;   *ustack++ = (interp_base != 0) ? interp_base : load_bias;
+    *ustack++ = AT_BASE;   *ustack++ = interp_base;
     *ustack++ = AT_ENTRY;  *ustack++ = ehdr.e_entry + load_bias;
     *ustack++ = AT_UID;    *ustack++ = 0U;
     *ustack++ = AT_EUID;   *ustack++ = 0U;
@@ -1435,6 +1481,7 @@ static void handle_process_exit(int exit_code)
                 parent->snap_slot    = -1;
 
                 /* Resume parent in Ring 3 with eax = child_pid */
+                proc_apply_tls(parent);
                 elf_resume_frame     = parent->saved_regs;
                 elf_resume_frame.eax = (uint32_t)proc->pid;
                 tss_set_esp0((uint32_t)(uintptr_t)exec_kstack_top);
@@ -1445,6 +1492,7 @@ static void handle_process_exit(int exit_code)
     }
 
     /* Clean up Ring-3 address space, restore kernel CR3 & TSS ESP0, return to /bin/init */
+    gdt_clear_tls();
     elf_running = FALSE;
     user_stack_guard_armed = FALSE;
     sched_set_current_elf_vm(vm_get_kernel_pgdir(), elf_saved_esp0);
@@ -2518,8 +2566,136 @@ void syscall_dispatch(struct isr_regs *regs)
     }
 
     case LINUX_SYS_getpid:
+    case LINUX_SYS_gettid:
         ret = proc->pid;
         break;
+
+    case LINUX_SYS_getppid:
+        ret = proc->ppid;
+        break;
+
+    case LINUX_SYS_uname: {
+        struct linux_utsname *u = (struct linux_utsname *)(uintptr_t)arg1;
+        if (u == NULL || !vm_user_range_ok(elf_pgdir, arg1, (uint32_t)sizeof(*u), TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        memset(u, 0, sizeof(*u));
+        memcpy(u->sysname,  "Linux",   6U);
+        memcpy(u->nodename, "oksinix", 8U);
+        memcpy(u->release,  "6.1.0",   6U);
+        memcpy(u->version,  "#1",      3U);
+        memcpy(u->machine,  "i686",    5U);
+        ret = 0;
+        break;
+    }
+
+    case LINUX_SYS_readlink:
+    case LINUX_SYS_readlinkat: {
+        uint32_t path_va = (nr == LINUX_SYS_readlink) ? arg1 : arg2;
+        uint32_t buf_va  = (nr == LINUX_SYS_readlink) ? arg2 : arg3;
+        uint32_t bufsiz  = (nr == LINUX_SYS_readlink) ? arg3 : arg4;
+        char abs_path[VFS_MAX_PATH];
+        if (path_va == 0U || !vm_user_str_ok(elf_pgdir, path_va, VFS_MAX_PATH) ||
+            (bufsiz > 0U && !vm_user_range_ok(elf_pgdir, buf_va, bufsiz, TRUE))) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        resolve_user_path(proc->cwd, (const char *)(uintptr_t)path_va, abs_path, sizeof(abs_path));
+        if (strcmp(abs_path, "/proc/self/exe") == 0 && proc->exe_path[0] != '\0') {
+            uint32_t len = (uint32_t)strlen(proc->exe_path);
+            if (len > bufsiz) {
+                len = bufsiz;
+            }
+            if (len > 0U) {
+                memcpy((void *)(uintptr_t)buf_va, proc->exe_path, len);
+            }
+            ret = (int32_t)len;
+        } else {
+            ret = -LINUX_ENOENT;
+        }
+        break;
+    }
+
+    case LINUX_SYS_mprotect:
+        if (arg2 > 0U && !vm_user_range_ok(elf_pgdir, arg1, arg2, FALSE)) {
+            ret = -LINUX_ENOMEM;
+        } else {
+            ret = 0;
+        }
+        break;
+
+    case LINUX_SYS_sigprocmask:
+    case LINUX_SYS_rt_sigaction:
+    case LINUX_SYS_rt_sigprocmask:
+    case LINUX_SYS_set_robust_list:
+    case LINUX_SYS_futex:
+    case LINUX_SYS_futex_time64:
+        ret = 0;
+        break;
+
+    case LINUX_SYS_ugetrlimit: {
+        uint32_t *rlim = (uint32_t *)(uintptr_t)arg2;
+        if (rlim == NULL || !vm_user_range_ok(elf_pgdir, arg2, 8U, TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        if (arg1 == 3U) { /* RLIMIT_STACK */
+            rlim[0] = LINUX_STACK_SIZE;
+            rlim[1] = LINUX_STACK_SIZE;
+        } else if (arg1 == 7U) { /* RLIMIT_NOFILE */
+            rlim[0] = 32U;
+            rlim[1] = 32U;
+        } else {
+            rlim[0] = 0x01000000U;
+            rlim[1] = 0x01000000U;
+        }
+        ret = 0;
+        break;
+    }
+
+    case LINUX_SYS_prlimit64: {
+        uint32_t *old_rlim = (uint32_t *)(uintptr_t)arg4;
+        if (old_rlim != NULL) {
+            uint32_t lim = 0x01000000U;
+            if (!vm_user_range_ok(elf_pgdir, arg4, 16U, TRUE)) {
+                ret = -LINUX_EFAULT;
+                break;
+            }
+            if (arg2 == 3U) {
+                lim = LINUX_STACK_SIZE;
+            } else if (arg2 == 7U) {
+                lim = 32U;
+            }
+            old_rlim[0] = lim;
+            old_rlim[1] = 0U;
+            old_rlim[2] = lim;
+            old_rlim[3] = 0U;
+        }
+        ret = 0;
+        break;
+    }
+
+    case LINUX_SYS_getrandom: {
+        uint8_t *buf = (uint8_t *)(uintptr_t)arg1;
+        uint32_t len = arg2;
+        uint32_t seed = pit_get_ticks() ^ 0x9E3779B9UL;
+        uint32_t i;
+        if (len == 0U) {
+            ret = 0;
+            break;
+        }
+        if (buf == NULL || !vm_user_range_ok(elf_pgdir, arg1, len, TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        for (i = 0U; i < len; i++) {
+            seed = seed * 1664525UL + 1013904223UL;
+            buf[i] = (uint8_t)(seed >> 24);
+        }
+        ret = (int32_t)len;
+        break;
+    }
 
     case LINUX_SYS_getuid:
     case LINUX_SYS_getuid32:
@@ -2833,9 +3009,28 @@ void syscall_dispatch(struct isr_regs *regs)
         break;
     }
 
-    case LINUX_SYS_set_thread_area:
+    case LINUX_SYS_set_thread_area: {
+        struct linux_user_desc *ud = (struct linux_user_desc *)(uintptr_t)arg1;
+        int entry;
+        bool_t lim_pages;
+        if (ud == NULL || !vm_user_range_ok(elf_pgdir, arg1, (uint32_t)sizeof(*ud), TRUE)) {
+            ret = -LINUX_EFAULT;
+            break;
+        }
+        lim_pages = ((ud->flags & 0x10U) != 0U) ? TRUE : FALSE;
+        entry = gdt_set_tls((int)ud->entry_number, ud->base_addr, ud->limit, lim_pages);
+        if (entry < 0) {
+            ret = -LINUX_EINVAL;
+            break;
+        }
+        ud->entry_number = (uint32_t)entry;
+        proc->tls[entry - GDT_TLS_MIN].used           = TRUE;
+        proc->tls[entry - GDT_TLS_MIN].base           = ud->base_addr;
+        proc->tls[entry - GDT_TLS_MIN].limit          = ud->limit;
+        proc->tls[entry - GDT_TLS_MIN].limit_in_pages = lim_pages;
         ret = 0;
         break;
+    }
 
     case LINUX_SYS_set_tid_address:
         ret = proc->pid;

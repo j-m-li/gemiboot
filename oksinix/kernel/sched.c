@@ -199,6 +199,7 @@ void sched_init(void)
     top_addr &= ~0x0FUL;
     regs = (struct isr_regs *)(uintptr_t)(top_addr - (uint32_t)sizeof(struct isr_regs));
     memset(regs, 0, sizeof(*regs));
+    regs->gs     = KERNEL_DS;
     regs->ds     = KERNEL_DS;
     regs->cs     = KERNEL_CS;
     regs->eip    = (uint32_t)(uintptr_t)sched_task_trampoline;
@@ -366,6 +367,7 @@ int sched_spawn_ex(const char *name, sched_entry_t entry, void *arg, bool_t deta
     top_addr &= ~0x0FUL;
     regs = (struct isr_regs *)(uintptr_t)(top_addr - (uint32_t)sizeof(struct isr_regs));
     memset(regs, 0, sizeof(*regs));
+    regs->gs     = KERNEL_DS;
     regs->ds     = KERNEL_DS;
     regs->cs     = KERNEL_CS;
     regs->eip    = (uint32_t)(uintptr_t)sched_task_trampoline;
@@ -458,6 +460,7 @@ int sched_spawn_user_code(const char *name, const void *code, uint32_t code_len,
     top_addr &= ~0x0FUL;
     regs = (struct isr_regs *)(uintptr_t)(top_addr - (uint32_t)sizeof(struct isr_regs));
     memset(regs, 0, sizeof(*regs));
+    regs->gs       = USER_DS;
     regs->ds       = USER_DS;
     regs->ebx      = arg_val;
     regs->eip      = VM_UTASK_CODE_VA;

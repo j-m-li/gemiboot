@@ -114,17 +114,32 @@ cpu_enable_paging:
     movl %ecx, %cr0
     jmp .Lpaging_off
 .Lpaging_off:
-    /* Reset CR4 to CR4.PSE (bit 4) only: clears PAE, PGE, LA57, PCIDE, SMEP, SMAP from UEFI/OVMF */
+    /* Reset CR4 to CR4.PSE (bit 4), and enable OSFXSR|OSXMMEXCPT if CPU supports FXSR+SSE */
+    pushl %eax
+    pushl %ebx
+    pushl %edx
+    movl $1, %eax
+    cpuid
     movl $0x00000010, %ecx
+    andl $0x03000000, %edx
+    cmpl $0x03000000, %edx
+    jne .Lno_sse
+    orl $0x00000600, %ecx
+.Lno_sse:
+    popl %edx
+    popl %ebx
+    popl %eax
     movl %ecx, %cr4
     /* Load Page Directory physical address into CR3 */
     movl %eax, %cr3
-    /* Enable CR0.PG (bit 31) and CR0.WP (bit 16) */
+    /* Enable CR0.PG (bit 31), CR0.WP (bit 16), CR0.MP (bit 1); clear CR0.EM (bit 2) & CR0.TS (bit 3) */
     movl %cr0, %ecx
-    orl $0x80010000, %ecx
+    andl $0xFFFFFFF3, %ecx
+    orl $0x80010002, %ecx
     movl %ecx, %cr0
     jmp .Lpaging_flush
 .Lpaging_flush:
+    fninit
     ret
 
 .global cpu_load_cr3
@@ -245,11 +260,12 @@ linux_return_to_host:
 linux_resume_regs:
     cli
     movl 4(%esp), %esp
+    popl %edx
     popl %eax
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %fs
-    movw %ax, %gs
+    movw %dx, %gs
     popal
     addl $8, %esp
     iret

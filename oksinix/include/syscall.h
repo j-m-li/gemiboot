@@ -37,7 +37,9 @@
 #define LINUX_SYS_ioctl          54
 #define LINUX_SYS_fcntl          55
 #define LINUX_SYS_dup2           63
+#define LINUX_SYS_getppid        64
 #define LINUX_SYS_gettimeofday   78
+#define LINUX_SYS_readlink       85
 #define LINUX_SYS_reboot         88
 #define LINUX_SYS_mmap           90
 #define LINUX_SYS_munmap         91
@@ -49,13 +51,19 @@
 #define LINUX_SYS_wait4          114
 #define LINUX_SYS_fsync          118
 #define LINUX_SYS_clone          120
+#define LINUX_SYS_uname          122
+#define LINUX_SYS_mprotect       125
+#define LINUX_SYS_sigprocmask    126
 #define LINUX_SYS__llseek        140
 #define LINUX_SYS_readv          145
 #define LINUX_SYS_writev         146
 #define LINUX_SYS_sched_yield    158
 #define LINUX_SYS_nanosleep      162
+#define LINUX_SYS_rt_sigaction   174
+#define LINUX_SYS_rt_sigprocmask 175
 #define LINUX_SYS_getcwd         183
 #define LINUX_SYS_vfork          190
+#define LINUX_SYS_ugetrlimit     191
 #define LINUX_SYS_mmap2          192
 #define LINUX_SYS_ftruncate64    194
 #define LINUX_SYS_stat64         195
@@ -66,6 +74,8 @@
 #define LINUX_SYS_geteuid32      201
 #define LINUX_SYS_getegid32      202
 #define LINUX_SYS_fcntl64        221
+#define LINUX_SYS_gettid         224
+#define LINUX_SYS_futex          240
 #define LINUX_SYS_set_thread_area 243
 #define LINUX_SYS_exit_group     252
 #define LINUX_SYS_set_tid_address 258
@@ -74,8 +84,12 @@
 #define LINUX_SYS_openat         295
 #define LINUX_SYS_fstatat        300
 #define LINUX_SYS_unlinkat       301
+#define LINUX_SYS_readlinkat     305
 #define LINUX_SYS_faccessat      307
+#define LINUX_SYS_set_robust_list 311
 #define LINUX_SYS_dup3           330
+#define LINUX_SYS_prlimit64      340
+#define LINUX_SYS_getrandom      355
 #define LINUX_SYS_socket         359
 #define LINUX_SYS_bind           361
 #define LINUX_SYS_connect        362
@@ -85,6 +99,7 @@
 #define LINUX_SYS_recvfrom       371
 #define LINUX_SYS_statx          383
 #define LINUX_SYS_clock_gettime64 403
+#define LINUX_SYS_futex_time64   422
 
 /* Oksinix kernel control syscall (for standalone Ring-3 system utilities) */
 #define OKSINIX_SYS_ctl          500

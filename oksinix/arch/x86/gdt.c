@@ -8,7 +8,7 @@
 #include "io.h"
 #include "string.h"
 
-#define GDT_ENTRIES 6
+#define GDT_ENTRIES 9
 
 /* x86 32-bit Task State Segment (104 bytes) */
 struct tss32 {
@@ -69,6 +69,28 @@ uint32_t tss_get_esp0(void)
     return kernel_tss.esp0;
 }
 
+int gdt_set_tls(int entry_number, uint32_t base, uint32_t limit, bool_t limit_in_pages)
+{
+    uint8_t gran = limit_in_pages ? 0xC0U : 0x40U;
+
+    if (entry_number == -1) {
+        entry_number = GDT_TLS_MIN;
+    }
+    if (entry_number < GDT_TLS_MIN || entry_number > GDT_TLS_MAX) {
+        return -1;
+    }
+    gdt_set_gate(entry_number, base, limit, 0xF2U, gran);
+    return entry_number;
+}
+
+void gdt_clear_tls(void)
+{
+    int i;
+    for (i = GDT_TLS_MIN; i <= GDT_TLS_MAX; i++) {
+        gdt_set_gate(i, 0U, 0xFFFFFFFFUL, 0xF2U, 0xCFU);
+    }
+}
+
 void gdt_init(void)
 {
     uint32_t base_addr = (uint32_t)(uintptr_t)&gdt_table[0][0];
@@ -87,6 +109,7 @@ void gdt_init(void)
     gdt_set_gate(3, 0, 0xFFFFFFFFUL, 0xFA, 0xCF);         /* 0x18: User code (DPL 3) */
     gdt_set_gate(4, 0, 0xFFFFFFFFUL, 0xF2, 0xCF);         /* 0x20: User data (DPL 3) */
     gdt_set_gate(5, tss_base, tss_limit, 0x89, 0x00);     /* 0x28: 32-bit Available TSS */
+    gdt_clear_tls();                                       /* 0x30..0x40: User TLS entries */
 
     gdt_ptr[0] = limit;
     gdt_ptr[1] = (uint16_t)(base_addr & 0xFFFFU);

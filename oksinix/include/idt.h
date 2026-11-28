@@ -16,6 +16,7 @@
 #define IRQ12    44
 
 struct isr_regs {
+    uint32_t gs;
     uint32_t ds;
     uint32_t edi;
     uint32_t esi;
